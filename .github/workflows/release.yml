@@ -1,0 +1,52 @@
+name: Publish npm package
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: Verify release tag matches package version
+        run: node -e "const p=require('./package.json'); if (process.env.GITHUB_REF_NAME !== 'v'+p.version) { throw new Error('Release tag must be v'+p.version) }"
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: npm pack --dry-run
+      - name: Publish once
+        shell: bash
+        run: |
+          set +e
+          package_spec="$(node -p "require('./package.json').name + '@' + require('./package.json').version")"
+          lookup="$(npm view "$package_spec" dist.shasum --json 2>&1)"
+          lookup_status=$?
+          set -e
+          if [ "$lookup_status" -eq 0 ]; then
+            published_shasum="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]))' "$lookup")"
+            tarball="$(npm pack --ignore-scripts --silent)"
+            local_shasum="$(node -e "const fs=require('node:fs'); const crypto=require('node:crypto'); process.stdout.write(crypto.createHash('sha1').update(fs.readFileSync(process.argv[1])).digest('hex'))" "$tarball")"
+            if [ "$published_shasum" != "$local_shasum" ]; then
+              echo "Published $package_spec does not match this release artifact." >&2
+              exit 1
+            fi
+            echo "This exact package version is already published; nothing to do."
+            exit 0
+          fi
+          if ! grep -q "E404" <<<"$lookup"; then
+            echo "$lookup" >&2
+            exit "$lookup_status"
+          fi
+          npm publish
