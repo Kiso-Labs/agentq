@@ -24,7 +24,7 @@ The supervisor is intentionally provider-neutral. It:
 1. Recovers stale leases at startup and on a bounded recurring cadence.
 2. Claims tasks while global and queue capacity are available.
 3. Provisions a worktree under a per-repository lock.
-4. Starts a gated launcher and durably records its random process identity.
+4. Starts a gated launcher, durably records its random process identity, and places Windows launches in a kill-on-close Job Object.
 5. Releases the selected executor and persists normalized events and heartbeats.
 6. Observes cancellation requests from any process.
 7. Runs verification and finalizes the branch.

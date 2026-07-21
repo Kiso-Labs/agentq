@@ -64,20 +64,40 @@ const settle = async () => {
   await Bun.sleep(80);
 };
 
+const waitForFrame = async (
+  frame: () => string | undefined,
+  expected: string,
+  timeoutMs = 2_000,
+): Promise<string> => {
+  const deadline = performance.now() + timeoutMs;
+  for (;;) {
+    const current = frame() ?? "";
+    if (current.includes(expected)) return current;
+    if (performance.now() >= deadline) {
+      throw new Error(`Timed out waiting for frame text: ${expected}\n\n${current}`);
+    }
+    await Bun.sleep(10);
+  }
+};
+
 afterEach(() => {
   cleanup();
 });
 
 describe("AgentqApp", () => {
   test("renders a branded dashboard with queue, task, details, and live activity", async () => {
+    const controller = createController({
+      listEvents: mock(async () => {
+        await Bun.sleep(120);
+        return [event()];
+      }),
+    });
     const view = render(
-      <AgentqApp controller={createController()} dimensions={{ columns: 128, rows: 30 }} />,
+      <AgentqApp controller={controller} dimensions={{ columns: 128, rows: 30 }} />,
     );
 
     expect(view.lastFrame()).toContain("Loading workspace");
-    await settle();
-
-    const frame = view.lastFrame() ?? "";
+    const frame = await waitForFrame(view.lastFrame, "Running the focused regression test");
     expect(frame).toContain("AGENTQ");
     expect(frame).toContain("QUEUES");
     expect(frame).toContain("TASKS");

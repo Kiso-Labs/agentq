@@ -261,19 +261,47 @@ describe("spawnProcess", () => {
     expect(await Bun.file(identity.path).exists()).toBe(false);
   });
 
+  test("publishes concurrent provider release gates only after their tokens are complete", async () => {
+    const directory = await temporaryDirectory();
+    const script = join(directory, "released.ts");
+    await writeFile(script, `await Bun.write(process.argv[2], "released");\n`);
+    const sentinels = Array.from({ length: 8 }, (_, index) =>
+      join(directory, `released-${index}.txt`),
+    );
+    const children = sentinels.map((sentinel) =>
+      spawnProcess({
+        command: process.execPath,
+        args: [script, sentinel],
+        cwd: directory,
+        env: { ...process.env },
+        gated: true,
+        identityDirectory: join(directory, "identities"),
+      }),
+    );
+
+    await Promise.all(children.map((child) => child.identity));
+    expect(await Promise.all(sentinels.map((sentinel) => Bun.file(sentinel).exists()))).toEqual(
+      Array.from({ length: sentinels.length }, () => false),
+    );
+    await Promise.all(children.map((child) => child.release()));
+    const completions = await Promise.all(children.map((child) => child.completion));
+
+    expect(completions.every((completion) => completion.exitCode === 0)).toBe(true);
+    expect(await Promise.all(sentinels.map((sentinel) => Bun.file(sentinel).text()))).toEqual(
+      Array.from({ length: sentinels.length }, () => "released"),
+    );
+  });
+
   test.skipIf(process.platform === "win32")(
-    "cleans same-group background descendants before reporting normal completion",
+    "fails closed when the process identity sidecar cannot refresh its lease",
     async () => {
       const directory = await temporaryDirectory();
-      const script = join(directory, "background.ts");
+      const identities = join(directory, "identities");
+      const pidFile = join(directory, "provider.pid");
+      const script = join(directory, "identity-failure.ts");
       await writeFile(
         script,
-        [
-          'import { spawn } from "node:child_process";',
-          'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });',
-          "console.log(child.pid);",
-          "child.unref();",
-        ].join("\n"),
+        `await Bun.write(${JSON.stringify(pidFile)}, String(process.pid)); await Bun.sleep(30_000);\n`,
       );
 
       const child = spawnProcess({
@@ -282,22 +310,71 @@ describe("spawnProcess", () => {
         cwd: directory,
         env: { ...process.env },
         gated: true,
-        identityDirectory: join(directory, "identities"),
+        identityDirectory: identities,
         cancelGraceMs: 100,
       });
       await child.identity;
       await child.release();
-      const descendantPid = Number(
-        (await lines(child.stdout)[Symbol.asyncIterator]().next()).value,
-      );
-      const completion = await child.completion;
 
-      expect(completion.exitCode).toBe(0);
-      expect(completion.error).toBeUndefined();
-      expect(() => process.kill(descendantPid, 0)).toThrow();
-      await child.cancel("already complete");
+      const deadline = Date.now() + 2_000;
+      while (!(await Bun.file(pidFile).exists())) {
+        if (Date.now() >= deadline) throw new Error("Provider did not start");
+        await Bun.sleep(10);
+      }
+      await Bun.sleep(350);
+      await chmod(identities, 0o500);
+
+      let completion: Awaited<typeof child.completion>;
+      try {
+        completion = await Promise.race([
+          child.completion,
+          Bun.sleep(3_000).then(() => {
+            throw new Error("Provider survived an identity heartbeat failure");
+          }),
+        ]);
+      } finally {
+        await chmod(identities, 0o700);
+        await child.cancel("test cleanup").catch(() => undefined);
+      }
+
+      const providerPid = Number(await Bun.file(pidFile).text());
+      expect(completion.signal).toBe("SIGKILL");
+      expect(() => process.kill(providerPid, 0)).toThrow();
     },
   );
+
+  test("cleans background descendants before reporting normal completion", async () => {
+    const directory = await temporaryDirectory();
+    const script = join(directory, "background.ts");
+    await writeFile(
+      script,
+      [
+        'import { spawn } from "node:child_process";',
+        'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });',
+        "console.log(child.pid);",
+        "child.unref();",
+      ].join("\n"),
+    );
+
+    const child = spawnProcess({
+      command: process.execPath,
+      args: [script],
+      cwd: directory,
+      env: { ...process.env },
+      gated: true,
+      identityDirectory: join(directory, "identities"),
+      cancelGraceMs: 100,
+    });
+    await child.identity;
+    await child.release();
+    const descendantPid = Number((await lines(child.stdout)[Symbol.asyncIterator]().next()).value);
+    const completion = await child.completion;
+
+    expect(completion.exitCode).toBe(0);
+    expect(completion.error).toBeUndefined();
+    expect(() => process.kill(descendantPid, 0)).toThrow();
+    await child.cancel("already complete");
+  });
 
   test.skipIf(process.platform === "win32")(
     "cancels the POSIX process group, including descendants",

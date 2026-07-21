@@ -159,4 +159,23 @@ describe.skipIf(process.platform === "win32")("DelegatedTaskIntake", () => {
     expect(await Bun.file(join(directory, "unknown-0000")).exists()).toBe(true);
     app.close();
   });
+
+  test("serializes cleanup with concurrent supervisor drains", async () => {
+    const { app, parent, queue } = await setup();
+    const intake = new DelegatedTaskIntake(app);
+    const runId = "run_cleanup_race";
+    const directory = await intake.register(runId, queue.id, parent.id);
+    for (let index = 0; index < 256; index += 1) {
+      await writeFile(
+        join(directory, `response-${index.toString(16).padStart(32, "0")}.json`),
+        "{}",
+      );
+    }
+
+    await expect(
+      Promise.all([intake.drain(), intake.cleanup(runId), intake.drain()]),
+    ).resolves.toHaveLength(3);
+    expect(await exists(directory)).toBe(false);
+    app.close();
+  });
 });

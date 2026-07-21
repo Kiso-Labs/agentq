@@ -503,7 +503,12 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     const providerPid = Number(await readFile(orphanPidFile, "utf8"));
     expect(() => process.kill(providerPid, 0)).toThrow();
     expect(app.store.getRun(claim.run.id)?.status).toBe("interrupted");
-    expect(app.store.getTask(task.id)?.status).toBe("succeeded");
+    const recoveredTask = app.store.getTask(task.id);
+    if (recoveredTask?.status !== "succeeded") {
+      throw new Error(
+        `Replacement task did not succeed: ${JSON.stringify(app.store.listRuns({ taskId: task.id }))}`,
+      );
+    }
     await orphan.completion;
     app.close();
   });

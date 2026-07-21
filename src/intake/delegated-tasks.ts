@@ -92,7 +92,7 @@ export class DelegatedTaskIntake {
   private readonly stagingDirectory: string;
   private readonly maxChildrenPerRun: number;
   private readonly maxDelegationDepth: number;
-  private draining: Promise<void> | undefined;
+  private operationTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly app: AgentQApp,
@@ -147,30 +147,31 @@ export class DelegatedTaskIntake {
   }
 
   async cleanup(runId: string): Promise<void> {
-    const registration =
-      this.registrations.get(runId) ?? (await this.loadDurableRegistration(runId));
-    if (!registration) return;
+    await this.serialize(async () => {
+      const registration =
+        this.registrations.get(runId) ?? (await this.loadDurableRegistration(runId));
+      if (!registration) return;
 
-    await this.drainRegistration(registration);
-    if (await this.hasPendingRequests(registration)) return;
+      await this.drainRegistration(registration);
+      if (await this.hasPendingRequests(registration)) return;
 
-    this.registrations.delete(runId);
-    await removeOwnedEntries(registration.directory, true);
-    await rmdir(registration.directory).catch(() => undefined);
-    await unlink(join(registration.stagingDirectory, REGISTRATION_FILE)).catch(() => undefined);
-    await removeOwnedEntries(registration.stagingDirectory, false);
-    await rmdir(registration.stagingDirectory).catch(() => undefined);
+      this.registrations.delete(runId);
+      await removeOwnedEntries(registration.directory, true);
+      await rmdir(registration.directory).catch(() => undefined);
+      await unlink(join(registration.stagingDirectory, REGISTRATION_FILE)).catch(() => undefined);
+      await removeOwnedEntries(registration.stagingDirectory, false);
+      await rmdir(registration.stagingDirectory).catch(() => undefined);
+    });
   }
 
   async drain(): Promise<void> {
-    if (this.draining) return await this.draining;
-    const operation = this.drainRegistered();
-    this.draining = operation;
-    try {
-      await operation;
-    } finally {
-      if (this.draining === operation) this.draining = undefined;
-    }
+    await this.serialize(() => this.drainRegistered());
+  }
+
+  private async serialize(operation: () => Promise<void>): Promise<void> {
+    const result = this.operationTail.then(operation);
+    this.operationTail = result.catch(() => undefined);
+    await result;
   }
 
   private taskDepth(taskId: string): number {

@@ -168,7 +168,7 @@ SQLite runs in WAL mode with foreign keys, a busy timeout, atomic claims, fenced
 - Claude Code runs in `acceptEdits` mode with an explicit coding-tool allowlist. Claude Code does not provide the same filesystem sandbox as Codex.
 - Dangerous provider bypass flags are never enabled automatically.
 - Child processes receive argument arrays rather than interpolated shell commands.
-- Cancellation targets the complete process group, escalating from graceful termination to forced kill.
+- Process cleanup targets the complete lifecycle-owned tree: POSIX process groups and Windows Job Objects.
 - Provider credentials remain in the providers' own credential stores.
 - Verification commands are trusted queue configuration and run through the platform shell inside the isolated worktree.
 
