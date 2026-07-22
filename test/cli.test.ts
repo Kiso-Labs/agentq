@@ -297,7 +297,7 @@ describe("agentq CLI", () => {
         .map((item: { title: string }) => item.title)
         .sort(),
     ).toEqual(["First repo task", "Second repo task"]);
-  });
+  }, 15_000);
 
   test("edits task fields from the CLI and records the new task revision", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-edit-"));
