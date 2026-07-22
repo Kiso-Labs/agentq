@@ -6,6 +6,14 @@ agentq is a single local control plane with four separable layers.
 
 `AgentQStore` owns the SQLite schema and all state transitions. Queue creation, task insertion, task claims, run completion, retries, cancellation, and event append operations cross explicit transactions. A task claim creates its run record and random supervisor lease in the same `BEGIN IMMEDIATE` transaction that changes the task from `queued` to `starting`. Lease tokens fence late writes from a recovered owner.
 
+Queues carry a canonical repository key derived from Git's common directory. Queue names are case-insensitively unique within that key, not across the entire database. This lets separate repositories reuse natural names such as `app`, while linked Git worktrees resolve to the same repository scope. When agentq starts inside Git, `AgentQApp` scopes the TUI, ordinary queue/task listings, queue-name resolution, and unqualified supervisor claims to that repository. `queue list --all`, `task list --all`, and `run --all` deliberately remove that filter. Queue edits can replace the display name, base ref, default provider, concurrency, maximum attempts, verification commands, and auto-commit policy, but never the canonical repository key or path.
+
+An operator edit can replace only a task's title, instructions, acceptance criteria, provider, or priority. The edit transaction requires both a non-active editable status (`queued`, `failed`, `interrupted`, or `cancelled`) and, when supplied by the CLI or TUI, the expected `updated_at` version. It rejects stale writes and appends a `task.edited` audit event atomically. Active and succeeded tasks cannot be edited.
+
+Every claim serializes those five specification fields into an immutable snapshot on the new run record. The claimed executor receives the same values. A later edit therefore affects a future claim without changing the recorded input for an earlier attempt.
+
+Worktree cleanup is allowed only after a task reaches a terminal state. Once Git removal succeeds, one store transaction clears the run's retained path and any matching resume pointer and appends `task.worktree_removed`. Repeated cleanup therefore cannot operate on a stale path, and a removed provider session is no longer advertised as resumable.
+
 The state machine is:
 
 ```text
@@ -50,4 +58,12 @@ The original checkout is never used as an agent working directory.
 
 ## User interfaces
 
-The Commander CLI, JSON commands, and Ink TUI all call the same `AgentQApp` service. The TUI has no private in-memory queue state; it renders durable snapshots and append-only events. In-process notifications make local updates immediate, while periodic polling discovers changes committed by other CLI/supervisor processes.
+The Commander CLI, JSON commands, and Ink TUI all call the same `AgentQApp` service. Queue creation and updates, task mutations and worktree cleanup, provider login, integration installation, diagnostics, and repository-scope changes therefore share validation and side effects across both surfaces. The TUI has no private durable queue state; it renders store snapshots and append-only events. In-process notifications make local updates immediate, while periodic polling discovers changes committed by other CLI/supervisor processes.
+
+The Ink dashboard exposes three focusable panes for queues, tasks, and task details/live activity. Direct pane keys (`1`/`2`/`3`), cyclic focus, arrow or `j`/`k` selection, focused-pane resizing (`[`/`]`), pane-size reset (`0`), zoom (`z`), and contextual help (`?`) all operate on that durable view. `:` opens an action center containing queue and task operations, doctor and provider login, Codex/Claude integration, scope, refresh, help, and exit. Frequent actions also have contextual direct keys.
+
+Queue create and edit use a complete form for name, repository/base, provider, concurrency, attempt limit, verification, and auto-commit configuration. Task and queue forms share large, individually bordered input fields; a focus-following viewport keeps the active control visible when the terminal cannot fit the complete form. Repository is selectable only during creation and is rendered read-only during editing. Task add and edit forms persist through the same service methods as their CLI equivalents; task edit saves include the version captured when the form opened, preserving optimistic concurrency.
+
+The UI models system work as explicit flows instead of shelling out behind a dashboard refresh. Queue removal, cancellation, retry, integration, and worktree cleanup enter confirmation state; cleanup additionally selects safe or forced removal. Doctor results can be rerun. Provider login suspends Ink, gives the official Codex or Claude Code CLI ownership of the terminal, then restores the dashboard and reruns diagnostics. Integration records and displays each created, updated, or unchanged instruction file. Attempt history has its own read-only view.
+
+Repository scope is mutable UI context. `AgentQApp.setAllRepositories()` changes queue resolution and snapshots, while the supervisor receives a getter for `activeRepositoryKey`; each claim evaluates that getter so toggling local/all scope changes worker eligibility without restarting either process.

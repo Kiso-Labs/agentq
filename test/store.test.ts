@@ -18,6 +18,160 @@ interface CountRow {
   count: number;
 }
 
+function createVersion3Database(path: string): void {
+  const database = new Database(path, { create: true, readwrite: true, strict: true });
+  const at = "2026-07-20T12:00:00.000Z";
+  try {
+    database.run("PRAGMA foreign_keys = ON");
+    database.run(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      )
+    `);
+    database.run(`
+      CREATE TABLE queues (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        repo_path TEXT NOT NULL,
+        base_ref TEXT NOT NULL,
+        default_provider TEXT NOT NULL CHECK (default_provider IN ('codex', 'claude')),
+        concurrency INTEGER NOT NULL CHECK (concurrency > 0),
+        max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+        verify_commands TEXT NOT NULL,
+        auto_commit INTEGER NOT NULL CHECK (auto_commit IN (0, 1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `);
+    database.run(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        queue_id TEXT NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        instructions TEXT NOT NULL,
+        acceptance_criteria TEXT NOT NULL,
+        provider TEXT NOT NULL CHECK (provider IN ('codex', 'claude')),
+        priority INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (
+          status IN (
+            'queued', 'starting', 'running', 'cancelling',
+            'succeeded', 'failed', 'interrupted', 'cancelled'
+          )
+        ),
+        source_kind TEXT NOT NULL CHECK (source_kind IN ('manual', 'agent', 'api')),
+        parent_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+        idempotency_key TEXT,
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        current_run_id TEXT,
+        cancel_requested_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        resume_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL
+      )
+    `);
+    database.run(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+        provider TEXT NOT NULL CHECK (provider IN ('codex', 'claude')),
+        status TEXT NOT NULL CHECK (
+          status IN (
+            'starting', 'running', 'cancelling',
+            'succeeded', 'failed', 'interrupted', 'cancelled'
+          )
+        ),
+        base_sha TEXT,
+        branch_name TEXT,
+        worktree_path TEXT,
+        provider_session_id TEXT,
+        pid INTEGER,
+        started_at TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL,
+        finished_at TEXT,
+        exit_code INTEGER,
+        summary TEXT,
+        error TEXT,
+        log_path TEXT,
+        owner_token TEXT,
+        owner_pid INTEGER,
+        process_token TEXT,
+        process_start_marker TEXT,
+        process_identity_path TEXT,
+        UNIQUE(task_id, attempt_no)
+      )
+    `);
+    database.run(`
+      CREATE TABLE task_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+        kind TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )
+    `);
+    for (const [version, name] of [
+      [1, "initial_schema"],
+      [2, "run_leases_and_resume_intent"],
+      [3, "provider_process_identity"],
+    ] as const) {
+      database
+        .query("INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)")
+        .run(version, name, at);
+    }
+    database
+      .query(`
+        INSERT INTO queues(
+          id, name, repo_path, base_ref, default_provider, concurrency,
+          max_attempts, verify_commands, auto_commit, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run("queue_v3", "Build", "/repos/legacy", "main", "codex", 2, 3, "[]", 1, at, at);
+    database
+      .query(`
+        INSERT INTO tasks(
+          id, queue_id, title, instructions, acceptance_criteria, provider, priority,
+          status, source_kind, attempt_count, created_at, updated_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        "task_v3",
+        "queue_v3",
+        "Legacy task",
+        "Preserve me",
+        '["Still present"]',
+        "codex",
+        7,
+        "failed",
+        "manual",
+        1,
+        at,
+        at,
+        at,
+      );
+    database
+      .query(`
+        INSERT INTO runs(
+          id, task_id, attempt_no, provider, status, started_at, heartbeat_at,
+          finished_at, exit_code, summary
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run("run_v3", "task_v3", 1, "codex", "failed", at, at, at, 1, "Legacy run");
+    database
+      .query(`
+        INSERT INTO task_events(task_id, run_id, kind, payload, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `)
+      .run("task_v3", "run_v3", "assistant", '{"text":"legacy event"}', at);
+  } finally {
+    database.close();
+  }
+}
+
 describe("AgentQStore", () => {
   let stateDirectory: string;
   let databasePath: string;
@@ -50,7 +204,7 @@ describe("AgentQStore", () => {
 
   test("creates and migrates a WAL database idempotently", () => {
     const first = open();
-    const queue = first.createQueue({ name: "build", repoPath: "/repo" });
+    const queue = first.createQueue({ name: "build", repoKey: "repo", repoPath: "/repo" });
     expect(queue.baseRef).toBe("HEAD");
 
     const second = open();
@@ -64,10 +218,46 @@ describe("AgentQStore", () => {
       expect(
         inspection.query<CountRow, []>("SELECT COUNT(*) AS count FROM schema_migrations").get()
           ?.count,
-      ).toBe(3);
+      ).toBe(4);
     } finally {
       inspection.close();
     }
+  });
+
+  test("migrates v3 queues without losing related tasks, runs, events, or foreign keys", () => {
+    databasePath = join(stateDirectory, "agentq-v3.sqlite");
+    createVersion3Database(databasePath);
+
+    const store = open();
+    expect(store.getQueue("queue_v3")).toMatchObject({
+      id: "queue_v3",
+      name: "Build",
+      repoKey: "/repos/legacy",
+      repoPath: "/repos/legacy",
+    });
+    expect(store.getTask("task_v3")).toMatchObject({
+      title: "Legacy task",
+      acceptanceCriteria: ["Still present"],
+    });
+    expect(store.getRun("run_v3")).toMatchObject({ id: "run_v3", summary: "Legacy run" });
+    expect(store.getRun("run_v3")?.taskSnapshot).toBeUndefined();
+    expect(store.listEvents({ taskId: "task_v3" })[0]).toMatchObject({
+      runId: "run_v3",
+      payload: { text: "legacy event" },
+    });
+
+    const inspection = new Database(databasePath);
+    try {
+      inspection.run("PRAGMA foreign_keys = ON");
+      expect(inspection.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      inspection.close();
+    }
+
+    expect(store.deleteTask("task_v3")).toBe(true);
+    expect(store.getRun("run_v3")).toBeUndefined();
+    expect(store.listEvents({ taskId: "task_v3" })).toEqual([]);
+    expect(store.deleteQueue("queue_v3")).toBe(true);
   });
 
   test("initializes a fresh database safely across concurrent processes", async () => {
@@ -100,7 +290,11 @@ describe("AgentQStore", () => {
 
   test("enforces delegated child quotas atomically across concurrent writers", async () => {
     const store = open();
-    const queue = store.createQueue({ name: "delegation-quota", repoPath: "/repo" });
+    const queue = store.createQueue({
+      name: "delegation-quota",
+      repoKey: "repo",
+      repoPath: "/repo",
+    });
     const parent = store.addTask({ queue: queue.id, title: "Parent" });
     const storeUrl = new URL("../src/store/index.ts", import.meta.url).href;
     const children = Array.from({ length: 4 }, (_, index) => {
@@ -154,6 +348,7 @@ describe("AgentQStore", () => {
     const store = open();
     const queue = store.createQueue({
       name: "features",
+      repoKey: "features-repo",
       repoPath: "/repo/features",
       baseRef: "main",
       defaultProvider: "claude",
@@ -176,7 +371,9 @@ describe("AgentQStore", () => {
       verifyCommands: ["bun test"],
       autoCommit: false,
     });
-    expect(() => store.createQueue({ name: "PRODUCT", repoPath: "/other" })).toThrow(AgentQError);
+    expect(() =>
+      store.createQueue({ name: "PRODUCT", repoKey: "features-repo", repoPath: "/other" }),
+    ).toThrow(AgentQError);
 
     const raw = new Database(databasePath);
     raw.query("UPDATE queues SET verify_commands = ? WHERE id = ?").run("not-json", queue.id);
@@ -191,9 +388,56 @@ describe("AgentQStore", () => {
     }
   });
 
+  test("supports same-named queues across repositories without ambiguous resolution", () => {
+    const store = open();
+    const first = store.createQueue({ name: "Build", repoKey: "repo-a", repoPath: "/repos/a" });
+    const second = store.createQueue({
+      name: "build",
+      repoKey: "repo-b",
+      repoPath: "/repos/b",
+    });
+
+    expect(store.listQueues("repo-a")).toEqual([first]);
+    expect(store.listQueues("repo-b")).toEqual([second]);
+    expect(store.listQueues("REPO-A")).toEqual([]);
+    expect(store.getQueue("BUILD", "repo-a")?.id).toBe(first.id);
+    expect(store.getQueue("build", "repo-b")?.id).toBe(second.id);
+    expect(store.getQueue(first.id, "repo-b")).toBeUndefined();
+    try {
+      store.getQueue("build");
+      throw new Error("Expected an unscoped duplicate queue name to be ambiguous");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentQError);
+      expect((error as AgentQError).code).toBe("QUEUE_AMBIGUOUS");
+    }
+
+    expect(store.updateQueue("build", { concurrency: 4 }, "repo-a").concurrency).toBe(4);
+    expect(store.getQueue(first.id)?.concurrency).toBe(4);
+    expect(store.getQueue(second.id)?.concurrency).toBe(1);
+    expect(() =>
+      store.createQueue({ name: "BUILD", repoKey: "repo-a", repoPath: "/repos/a-copy" }),
+    ).toThrow(AgentQError);
+    expect(store.deleteQueue("build", "repo-b")).toBe(true);
+    expect(store.getQueue(second.id)).toBeUndefined();
+    expect(store.getQueue("build")?.id).toBe(first.id);
+  });
+
+  test("scopes task lists and claims before applying cross-repository priority", () => {
+    const store = open();
+    const first = store.createQueue({ name: "work", repoKey: "repo-a", repoPath: "/repos/a" });
+    const second = store.createQueue({ name: "WORK", repoKey: "repo-b", repoPath: "/repos/b" });
+    const local = store.addTask({ queue: first.id, title: "Local task", priority: 1 });
+    const foreign = store.addTask({ queue: second.id, title: "Foreign task", priority: 100 });
+
+    expect(store.listTasks({ repoKey: "repo-a" }).map((task) => task.id)).toEqual([local.id]);
+    expect(store.listTasks({ repoKey: "repo-b" }).map((task) => task.id)).toEqual([foreign.id]);
+    expect(store.claimNextTask({ repoKey: "repo-a" })?.task.id).toBe(local.id);
+    expect(store.claimNextTask({ queue: "work", repoKey: "repo-b" })?.task.id).toBe(foreign.id);
+  });
+
   test("removes only empty queues and preserves tasks in every lifecycle state", () => {
     const store = open();
-    const queue = store.createQueue({ name: "not-empty", repoPath: "/repo" });
+    const queue = store.createQueue({ name: "not-empty", repoKey: "repo", repoPath: "/repo" });
     const task = store.addTask({ queue: queue.id, title: "must survive queue removal" });
     const claim = store.claimNextTask({ queue: queue.id });
     if (!claim) throw new Error("Expected claim");
@@ -218,7 +462,7 @@ describe("AgentQStore", () => {
 
   test("serializes queue removal with a task added by another writer", async () => {
     const store = open();
-    const queue = store.createQueue({ name: "delete-race", repoPath: "/repo" });
+    const queue = store.createQueue({ name: "delete-race", repoKey: "repo", repoPath: "/repo" });
     const openedMarker = join(stateDirectory, "delete-opened");
     const goMarker = join(stateDirectory, "delete-go");
     const callMarker = join(stateDirectory, "delete-calling");
@@ -315,7 +559,11 @@ describe("AgentQStore", () => {
 
   test("serializes task removal with a claim made by another writer", async () => {
     const store = open();
-    const queue = store.createQueue({ name: "task-delete-race", repoPath: "/repo" });
+    const queue = store.createQueue({
+      name: "task-delete-race",
+      repoKey: "repo",
+      repoPath: "/repo",
+    });
     const task = store.addTask({ queue: queue.id, title: "claimed during removal" });
     const openedMarker = join(stateDirectory, "task-delete-opened");
     const goMarker = join(stateDirectory, "task-delete-go");
@@ -392,7 +640,7 @@ describe("AgentQStore", () => {
   test("adds tasks transactionally and deduplicates idempotency keys across connections", () => {
     const first = open();
     const second = open();
-    const queue = first.createQueue({ name: "bugs", repoPath: "/repo" });
+    const queue = first.createQueue({ name: "bugs", repoKey: "repo", repoPath: "/repo" });
 
     const parent = first.addTask({
       queue: queue.name,
@@ -433,17 +681,175 @@ describe("AgentQStore", () => {
       acceptanceCriteria: ["Regression test added"],
       provider: "claude",
     });
-    const otherQueue = first.createQueue({ name: "other", repoPath: "/repo/other" });
+    const otherQueue = first.createQueue({
+      name: "other",
+      repoKey: "other-repo",
+      repoPath: "/repo/other",
+    });
     expect(() =>
       first.addTask({ queue: otherQueue.id, title: "Wrong queue", parentTaskId: parent.id }),
     ).toThrow("same queue");
     expect(() => first.addTask({ queue: queue.id, title: "", priority: 0 })).toThrow(AgentQError);
   });
 
+  test("edits only operator-owned task fields and appends one atomic audit event", () => {
+    const store = open();
+    const queue = store.createQueue({ name: "edit", repoKey: "repo", repoPath: "/repo" });
+    const task = store.addTask({ queue: queue.id, title: "Before", instructions: "Old" });
+
+    const edited = store.editTask(
+      task.id,
+      {
+        title: "After",
+        instructions: "New instructions",
+        acceptanceCriteria: ["Tests pass", "Behavior documented"],
+        provider: "claude",
+        priority: 9,
+      },
+      task.updatedAt,
+    );
+
+    expect(edited).toMatchObject({
+      title: "After",
+      instructions: "New instructions",
+      acceptanceCriteria: ["Tests pass", "Behavior documented"],
+      provider: "claude",
+      priority: 9,
+      status: "queued",
+    });
+    expect(edited.updatedAt).not.toBe(task.updatedAt);
+    expect(store.listEvents({ taskId: task.id })).toEqual([
+      expect.objectContaining({
+        taskId: task.id,
+        kind: "task.edited",
+        payload: expect.objectContaining({
+          fields: ["title", "instructions", "acceptanceCriteria", "provider", "priority"],
+        }),
+      }),
+    ]);
+  });
+
+  test("rejects stale, active, and succeeded task edits without partial changes or events", () => {
+    const store = open();
+    const queue = store.createQueue({ name: "edit-guards", repoKey: "repo", repoPath: "/repo" });
+    const task = store.addTask({ queue: queue.id, title: "Original" });
+    const firstEdit = store.editTask(task.id, { title: "Fresh" }, task.updatedAt);
+
+    try {
+      store.editTask(task.id, { title: "Stale" }, task.updatedAt);
+      throw new Error("Expected stale task edit to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentQError);
+      expect((error as AgentQError).code).toBe("TASK_EDIT_CONFLICT");
+    }
+    expect(store.getTask(task.id)?.title).toBe("Fresh");
+    expect(store.listEvents({ taskId: task.id })).toHaveLength(1);
+    store.completeTaskManually(task.id, "Done testing stale edits");
+
+    const active = store.addTask({ queue: queue.id, title: "Active" });
+    expect(store.claimNextTask({ queue: queue.id })?.task.id).toBe(active.id);
+    for (const blockedStatus of ["starting", "running", "cancelling", "succeeded"] as const) {
+      store.updateTask(active.id, { status: blockedStatus });
+      try {
+        store.editTask(active.id, { title: `Changed while ${blockedStatus}` });
+        throw new Error(`Expected ${blockedStatus} task edit to fail`);
+      } catch (error) {
+        expect(error).toBeInstanceOf(AgentQError);
+        expect((error as AgentQError).code).toBe("TASK_NOT_EDITABLE");
+      }
+    }
+    expect(store.getTask(active.id)?.title).toBe("Active");
+    expect(store.listEvents({ taskId: active.id })).toEqual([]);
+    expect(firstEdit.title).toBe("Fresh");
+  });
+
+  test("allows edits in every retryable non-active status", () => {
+    const store = open();
+    const queue = store.createQueue({ name: "editable", repoKey: "repo", repoPath: "/repo" });
+
+    for (const status of ["queued", "failed", "interrupted", "cancelled"] as const) {
+      const task = store.addTask({ queue: queue.id, title: `${status} before` });
+      if (status !== "queued") store.updateTask(task.id, { status });
+      const current = store.getTask(task.id);
+      if (!current) throw new Error("Expected task");
+      expect(
+        store.editTask(task.id, { title: `${status} after` }, current.updatedAt),
+      ).toMatchObject({
+        title: `${status} after`,
+        status,
+      });
+    }
+  });
+
+  test("snapshots each claimed task specification independently of later edits", () => {
+    const store = open();
+    const queue = store.createQueue({
+      name: "snapshots",
+      repoKey: "repo",
+      repoPath: "/repo",
+      maxAttempts: 1,
+    });
+    const task = store.addTask({
+      queue: queue.id,
+      title: "Original title",
+      instructions: "Original instructions",
+      acceptanceCriteria: ["Original criterion"],
+      provider: "codex",
+      priority: 2,
+    });
+    const first = store.claimNextTask({ queue: queue.id });
+    if (!first) throw new Error("Expected first claim");
+    expect(first.run.taskSnapshot).toEqual({
+      title: "Original title",
+      instructions: "Original instructions",
+      acceptanceCriteria: ["Original criterion"],
+      provider: "codex",
+      priority: 2,
+    });
+    store.finishRun(first.run.id, { status: "failed", error: "Needs revision" });
+
+    const failed = store.getTask(task.id);
+    if (!failed) throw new Error("Expected failed task");
+    store.editTask(
+      task.id,
+      {
+        title: "Revised title",
+        instructions: "Revised instructions",
+        acceptanceCriteria: ["Revised criterion"],
+        provider: "claude",
+        priority: 8,
+      },
+      failed.updatedAt,
+    );
+    expect(store.getRun(first.run.id)?.taskSnapshot).toEqual(first.run.taskSnapshot);
+
+    store.requeueTask(task.id);
+    const second = store.claimNextTask({ queue: queue.id });
+    if (!second) throw new Error("Expected second claim");
+    expect(second.run.taskSnapshot).toEqual({
+      title: "Revised title",
+      instructions: "Revised instructions",
+      acceptanceCriteria: ["Revised criterion"],
+      provider: "claude",
+      priority: 8,
+    });
+    expect(store.getRun(first.run.id)?.taskSnapshot).toEqual({
+      title: "Original title",
+      instructions: "Original instructions",
+      acceptanceCriteria: ["Original criterion"],
+      provider: "codex",
+      priority: 2,
+    });
+  });
+
   test("enforces delegated child limits atomically after idempotency lookup", () => {
     const first = open();
     const second = open();
-    const queue = first.createQueue({ name: "delegation-limit", repoPath: "/repo" });
+    const queue = first.createQueue({
+      name: "delegation-limit",
+      repoKey: "repo",
+      repoPath: "/repo",
+    });
     const parent = first.addTask({ queue: queue.id, title: "Parent" });
     const child = first.addTask(
       {
@@ -482,12 +888,14 @@ describe("AgentQStore", () => {
     const second = open();
     const serial = first.createQueue({
       name: "serial",
+      repoKey: "serial-repo",
       repoPath: "/repo/serial",
       concurrency: 1,
       maxAttempts: 2,
     });
     const parallel = first.createQueue({
       name: "parallel",
+      repoKey: "parallel-repo",
       repoPath: "/repo/parallel",
       concurrency: 2,
     });
@@ -553,6 +961,7 @@ describe("AgentQStore", () => {
     const second = open();
     const queue = first.createQueue({
       name: "global-cap",
+      repoKey: "repo",
       repoPath: "/repo",
       concurrency: 4,
     });
@@ -570,7 +979,7 @@ describe("AgentQStore", () => {
   test("manual completion cannot race an active claim", () => {
     const first = open();
     const second = open();
-    const queue = first.createQueue({ name: "manual-race", repoPath: "/repo" });
+    const queue = first.createQueue({ name: "manual-race", repoKey: "repo", repoPath: "/repo" });
     const task = first.addTask({ queue: queue.id, title: "claim wins" });
     const claim = second.claimNextTask({ queue: queue.id });
     expect(claim).toBeDefined();
@@ -591,7 +1000,7 @@ describe("AgentQStore", () => {
 
   test("does not resurrect a run that becomes terminal during an active transition", async () => {
     const store = open();
-    const queue = store.createQueue({ name: "run-race", repoPath: "/repo" });
+    const queue = store.createQueue({ name: "run-race", repoKey: "repo", repoPath: "/repo" });
     const task = store.addTask({ queue: queue.id, title: "finish once" });
     const claim = store.claimNextTask({ queue: queue.id });
     if (!claim) throw new Error("Expected claim");
@@ -672,7 +1081,12 @@ describe("AgentQStore", () => {
 
   test("serializes claims made by separate Bun supervisor processes", async () => {
     const store = open();
-    const queue = store.createQueue({ name: "processes", repoPath: "/repo", concurrency: 1 });
+    const queue = store.createQueue({
+      name: "processes",
+      repoKey: "repo",
+      repoPath: "/repo",
+      concurrency: 1,
+    });
     store.addTask({ queue: queue.id, title: "only one active claim" });
 
     const storeUrl = new URL("../src/store/index.ts", import.meta.url).href;
@@ -707,7 +1121,7 @@ describe("AgentQStore", () => {
 
   test("persists cancellation flags and safely requeues terminal tasks", () => {
     const store = open();
-    const queue = store.createQueue({ name: "cancel", repoPath: "/repo" });
+    const queue = store.createQueue({ name: "cancel", repoKey: "repo", repoPath: "/repo" });
     const queued = store.addTask({ queue: queue.id, title: "queued" });
     const cancelledQueued = store.requestCancellation(queued.id, "2026-07-21T11:00:00Z");
     expect(cancelledQueued).toMatchObject({
@@ -734,7 +1148,12 @@ describe("AgentQStore", () => {
 
   test("fences run ownership and releases graceful shutdowns without spending an attempt", () => {
     const store = open();
-    const queue = store.createQueue({ name: "leases", repoPath: "/repo", maxAttempts: 1 });
+    const queue = store.createQueue({
+      name: "leases",
+      repoKey: "repo",
+      repoPath: "/repo",
+      maxAttempts: 1,
+    });
     const task = store.addTask({ queue: queue.id, title: "leased task" });
     const claim = store.claimNextTask({
       queue: queue.id,
@@ -762,7 +1181,7 @@ describe("AgentQStore", () => {
 
   test("stores resume intent atomically until a resumed provider is running", () => {
     const store = open();
-    const queue = store.createQueue({ name: "resume-intent", repoPath: "/repo" });
+    const queue = store.createQueue({ name: "resume-intent", repoKey: "repo", repoPath: "/repo" });
     const task = store.addTask({ queue: queue.id, title: "resume me", provider: "codex" });
     const first = store.claimNextTask({ queue: queue.id });
     if (!first) throw new Error("Expected initial claim");
@@ -784,16 +1203,36 @@ describe("AgentQStore", () => {
     if (!resumed) throw new Error("Expected resumed claim");
     expect(resumed.task.resumeRunId).toBe(first.run.id);
 
-    store.markRunRunning(resumed.run.id, {}, resumed.leaseToken);
+    store.markRunRunning(
+      resumed.run.id,
+      {
+        providerSessionId: "session-2",
+        worktreePath: "/tmp/worktree-2",
+        branchName: "agentq/resume/task-a2",
+        baseSha: "def456",
+      },
+      resumed.leaseToken,
+    );
     expect(
       store.consumeResumeIntent(task.id, resumed.run.id, first.run.id, resumed.leaseToken)
         .resumeRunId,
     ).toBeUndefined();
+
+    store.finishRun(
+      resumed.run.id,
+      { status: "failed", error: "switch providers" },
+      resumed.leaseToken,
+    );
+    const queuedAgain = store.requeueTask(task.id, undefined, resumed.run.id);
+    expect(queuedAgain.resumeRunId).toBe(resumed.run.id);
+    const changedProvider = store.editTask(task.id, { provider: "claude" }, queuedAgain.updatedAt);
+    expect(changedProvider.resumeRunId).toBeUndefined();
+    expect(() => store.requeueTask(task.id, undefined, first.run.id)).toThrow("cannot be resumed");
   });
 
   test("rechecks the heartbeat while atomically fencing eligible stale runs", () => {
     const store = open();
-    const queue = store.createQueue({ name: "recovery-fence", repoPath: "/repo" });
+    const queue = store.createQueue({ name: "recovery-fence", repoKey: "repo", repoPath: "/repo" });
     const task = store.addTask({ queue: queue.id, title: "still owned" });
     const claim = store.claimNextTask({
       queue: queue.id,
@@ -815,7 +1254,11 @@ describe("AgentQStore", () => {
 
   test("fences stale ownership before making a replacement task claimable", () => {
     const store = open();
-    const queue = store.createQueue({ name: "two-phase-recovery", repoPath: "/repo" });
+    const queue = store.createQueue({
+      name: "two-phase-recovery",
+      repoKey: "repo",
+      repoPath: "/repo",
+    });
     const task = store.addTask({ queue: queue.id, title: "cleanup first" });
     const claim = store.claimNextTask({
       queue: queue.id,
@@ -849,6 +1292,7 @@ describe("AgentQStore", () => {
     const store = open();
     const queue = store.createQueue({
       name: "recovery",
+      repoKey: "repo",
       repoPath: "/repo",
       concurrency: 2,
       maxAttempts: 2,
@@ -884,7 +1328,7 @@ describe("AgentQStore", () => {
 
   test("stores ordered JSON events and maintains foreign-key cleanup", () => {
     const store = open();
-    const queue = store.createQueue({ name: "events", repoPath: "/repo" });
+    const queue = store.createQueue({ name: "events", repoKey: "repo", repoPath: "/repo" });
     const task = store.addTask({ queue: queue.id, title: "emit events" });
     const claim = store.claimNextTask();
     if (!claim) throw new Error("Expected claim");
@@ -926,7 +1370,7 @@ describe("AgentQStore", () => {
 
   test("enables foreign keys on every store connection", () => {
     const store = open();
-    const queue = store.createQueue({ name: "foreign-keys", repoPath: "/repo" });
+    const queue = store.createQueue({ name: "foreign-keys", repoKey: "repo", repoPath: "/repo" });
     const task = store.addTask({ queue: queue.id, title: "task" });
     expect(() => store.appendEvent({ taskId: task.id, runId: "missing", kind: "invalid" })).toThrow(
       AgentQError,

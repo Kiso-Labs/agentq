@@ -1,6 +1,5 @@
 #!/usr/bin/env bun
 
-import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { Command, CommanderError, InvalidArgumentError } from "commander";
 import { z } from "zod";
@@ -8,13 +7,13 @@ import { AgentQApp } from "./app.ts";
 import { AgentQError, errorMessage } from "./core/errors.ts";
 import { resolvePaths } from "./core/paths.ts";
 import { type AddTaskInput, PROVIDERS, type Provider, TASK_STATUSES } from "./core/types.ts";
-import { createExecutorMap } from "./executors/index.ts";
+import { findRepositoryContext } from "./git/repository.ts";
 import { hasDelegatedTaskIntake, submitDelegatedTask } from "./intake/delegated-tasks.ts";
-import { type IntegrationTarget, installIntegration } from "./integrations/instructions.ts";
-import { resolveCommandInvocation } from "./process/index.ts";
+import type { IntegrationTarget } from "./integrations/instructions.ts";
 import { Supervisor } from "./supervisor/supervisor.ts";
 import { renderAgentq } from "./ui/index.tsx";
 import { sanitizeTerminalText } from "./ui/sanitize.ts";
+import type { UiQueuePatch } from "./ui/types.ts";
 
 const version = typeof AGENTQ_VERSION === "string" ? AGENTQ_VERSION : "0.1.0";
 const program = new Command();
@@ -36,7 +35,7 @@ const queue = program.command("queue").description("Create and manage task queue
 queue
   .command("create")
   .description("Create a queue backed by a Git repository")
-  .argument("<name>", "unique queue name")
+  .argument("<name>", "queue name (unique within its repository)")
   .option("-r, --repo <path>", "Git repository", process.cwd())
   .option("-b, --base <ref>", "base branch or ref (defaults to current branch)")
   .option("-p, --provider <provider>", "default provider: codex or claude", parseProvider, "codex")
@@ -66,12 +65,55 @@ queue
   });
 
 queue
+  .command("edit")
+  .description("Edit mutable queue configuration")
+  .argument("<queue>", "queue name or id")
+  .option("--name <name>", "replace the queue name")
+  .option("-b, --base <ref>", "replace the base branch or ref")
+  .option("-p, --provider <provider>", "replace the default provider", parseProvider)
+  .option("-c, --concurrency <number>", "replace parallel task capacity", positiveInteger)
+  .option("--max-attempts <number>", "replace maximum attempts per task", positiveInteger)
+  .option("--verify <command>", "replace verification commands; repeatable", collectOptional)
+  .option("--clear-verify", "remove all verification commands")
+  .option("--auto-commit", "commit successful task changes")
+  .option("--no-auto-commit", "leave successful task changes uncommitted")
+  .option("--json", "print machine-readable JSON")
+  .action(async (queueRef, options) => {
+    if (options.verify && options.clearVerify) {
+      throw new AgentQError(
+        "Use either --verify or --clear-verify, not both",
+        "INVALID_QUEUE_EDIT",
+        2,
+      );
+    }
+    const patch: UiQueuePatch = {
+      name: options.name as string | undefined,
+      baseRef: options.base as string | undefined,
+      defaultProvider: options.provider as Provider | undefined,
+      concurrency: options.concurrency as number | undefined,
+      maxAttempts: options.maxAttempts as number | undefined,
+      verifyCommands: options.clearVerify ? [] : (options.verify as string[] | undefined),
+      autoCommit: options.autoCommit as boolean | undefined,
+    };
+    if (Object.values(patch).every((value) => value === undefined)) {
+      throw new AgentQError("Specify at least one queue field to edit", "EMPTY_QUEUE_EDIT", 2);
+    }
+    await withApp(async (app) => {
+      const current = await app.getQueue(queueRef);
+      const edited = await app.updateQueue(current.id, patch);
+      print(edited, options.json, `Updated queue ${human(edited.name)}`);
+    });
+  });
+
+queue
   .command("list")
   .alias("ls")
   .description("List queues")
+  .option("--all", "include queues from every repository")
   .option("--json", "print machine-readable JSON")
   .action(async (options) => {
     await withApp(async (app) => {
+      if (options.all) await app.setAllRepositories(true);
       const queues = await app.listQueues();
       if (options.json) return printJson(queues);
       if (queues.length === 0)
@@ -173,13 +215,15 @@ task
   .description("List tasks")
   .option("-q, --queue <queue>", "filter by queue")
   .option("-s, --status <status>", "filter by status; repeatable", collectStatus, [])
+  .option("--all", "include tasks from every repository")
   .option("--json", "print machine-readable JSON")
   .action(async (options) => {
     await withApp(async (app) => {
-      const tasks = app.store.listTasks({
-        queue: options.queue,
-        statuses: options.status.length > 0 ? options.status : undefined,
-      });
+      if (options.all) await app.setAllRepositories(true);
+      const queueId = options.queue ? (await app.getQueue(options.queue)).id : undefined;
+      const listed = await app.listTasks(queueId);
+      const statuses = new Set<string>(options.status);
+      const tasks = statuses.size > 0 ? listed.filter((item) => statuses.has(item.status)) : listed;
       if (options.json) return printJson(tasks);
       if (tasks.length === 0) return console.log("No matching tasks.");
       console.log("ID\tSTATUS\tPROVIDER\tQUEUE\tTITLE");
@@ -202,6 +246,42 @@ task
       const runs = app.store.listRuns({ taskId });
       const events = app.store.listEvents({ taskId, limit: 100 });
       print({ ...found, runs, events }, options.json);
+    });
+  });
+
+task
+  .command("edit")
+  .description("Edit a queued or retryable task")
+  .argument("<task-id>")
+  .option("--title <title>", "replace the task title")
+  .option("--instructions <text>", "replace the complete task instructions")
+  .option("-p, --provider <provider>", "replace the provider", parseProvider)
+  .option("--priority <number>", "replace the scheduling priority", integer)
+  .option("--accept <criterion>", "replace acceptance criteria; repeatable", collectOptional)
+  .option("--clear-acceptance", "remove all acceptance criteria")
+  .option("--json", "print machine-readable JSON")
+  .action(async (taskId, options) => {
+    if (options.accept && options.clearAcceptance) {
+      throw new AgentQError(
+        "Use either --accept or --clear-acceptance, not both",
+        "INVALID_TASK_EDIT",
+        2,
+      );
+    }
+    const patch = {
+      title: options.title as string | undefined,
+      instructions: options.instructions as string | undefined,
+      acceptanceCriteria: options.clearAcceptance ? [] : (options.accept as string[] | undefined),
+      provider: options.provider as Provider | undefined,
+      priority: options.priority as number | undefined,
+    };
+    if (Object.values(patch).every((value) => value === undefined)) {
+      throw new AgentQError("Specify at least one task field to edit", "EMPTY_TASK_EDIT", 2);
+    }
+    await withApp(async (app) => {
+      const current = await app.getTask(taskId);
+      const edited = await app.editTask(taskId, patch, current.updatedAt);
+      print(edited, options.json, `Updated ${taskId}: ${human(edited.title)}`);
     });
   });
 
@@ -291,7 +371,7 @@ task
 
 task
   .command("clean")
-  .description("Remove a retained task worktree")
+  .description("Remove a retained worktree from a terminal task")
   .argument("<task-id>")
   .option("--force", "discard uncommitted worktree changes")
   .option("--yes", "confirm removal")
@@ -300,20 +380,8 @@ task
     if (!options.yes)
       throw new AgentQError("Worktree removal requires --yes", "CONFIRMATION_REQUIRED", 2);
     await withApp(async (app) => {
-      const found = await app.getTask(taskId);
-      if (["starting", "running", "cancelling"].includes(found.status)) {
-        throw new AgentQError("Cannot clean a running task", "TASK_IS_RUNNING");
-      }
-      const run = app.store.listRuns({ taskId }).find((candidate) => candidate.worktreePath);
-      if (!run?.worktreePath)
-        throw new AgentQError("Task has no retained worktree", "WORKTREE_NOT_FOUND");
-      const queue = await app.getQueue(found.queueId);
-      await app.worktrees.remove(queue.repoPath, run.worktreePath, options.force);
-      print(
-        { taskId, removedWorktree: run.worktreePath },
-        options.json,
-        `Removed ${human(run.worktreePath)}`,
-      );
+      const result = await app.cleanTask(taskId, { force: options.force });
+      print(result, options.json, `Removed ${human(result.removedWorktree)}`);
     });
   });
 
@@ -321,16 +389,20 @@ program
   .command("run")
   .description("Run the foreground parallel-agent supervisor")
   .argument("[queue]", "optional queue name or id")
+  .option("--all", "run queues from every repository")
   .option("--once", "drain currently runnable tasks, then exit")
   .option("-c, --concurrency <number>", "global concurrent agents", positiveInteger)
   .action(async (queueRef, options) => {
     await withApp(async (app) => {
+      if (options.all) await app.setAllRepositories(true);
+      console.log(`agentq supervisor started${queueRef ? ` for ${human(queueRef)}` : ""}`);
+      const queueId = queueRef ? (await app.getQueue(queueRef)).id : undefined;
       const controller = signalController();
       const supervisor = new Supervisor(app, {
-        queue: queueRef,
+        queue: queueId,
+        repoKey: queueId ? undefined : app.activeRepositoryKey,
         maxConcurrency: options.concurrency,
       });
-      console.log(`agentq supervisor started${queueRef ? ` for ${human(queueRef)}` : ""}`);
       await supervisor.run({ once: options.once, signal: controller.signal });
     });
   });
@@ -381,18 +453,7 @@ provider
   .description("Run the official provider authentication flow")
   .argument("<provider>", "codex or claude", parseProvider)
   .action(async (providerName: Provider) => {
-    const executor = createExecutorMap().get(providerName);
-    const health = await executor?.probe();
-    if (!health?.available || !health.binary) {
-      throw new AgentQError(
-        health?.message ?? `${providerName} executable is unavailable`,
-        "PROVIDER_UNAVAILABLE",
-      );
-    }
-    const args = providerName === "codex" ? ["login"] : ["auth", "login"];
-    const exitCode = await runInteractive(health.binary, args);
-    if (exitCode !== 0)
-      throw new AgentQError(`${providerName} login exited with code ${exitCode}`, "LOGIN_FAILED");
+    await withApp((app) => app.loginProvider(providerName));
   });
 
 program
@@ -402,10 +463,12 @@ program
   .option("-r, --repo <path>", "repository to update", process.cwd())
   .option("--json", "print machine-readable JSON")
   .action(async (target: IntegrationTarget, options) => {
-    const results = await installIntegration(options.repo, target);
-    if (options.json) printJson(results);
-    else
-      for (const result of results) console.log(`${human(result.action)}: ${human(result.file)}`);
+    await withApp(async (app) => {
+      const results = await app.installIntegration(target, options.repo);
+      if (options.json) printJson(results);
+      else
+        for (const result of results) console.log(`${human(result.action)}: ${human(result.file)}`);
+    });
   });
 
 async function launchUi(): Promise<void> {
@@ -418,13 +481,17 @@ async function launchUi(): Promise<void> {
   }
   await withApp(async (app) => {
     const controller = signalController();
-    const supervisor = new Supervisor(app);
+    const supervisor = new Supervisor(app, { repoKey: () => app.activeRepositoryKey });
     const running = supervisor.run({ signal: controller.signal });
     const supervised = running.then(
       () => ({ kind: "supervisor" as const }),
       (error: unknown) => ({ kind: "supervisor-error" as const, error }),
     );
-    const instance = renderAgentq(app);
+    const instance = renderAgentq(app, {
+      scopeLabel: app.repositoryContext
+        ? `${app.repositoryContext.displayName} · ${app.repositoryContext.rootPath}`
+        : "all repositories",
+    });
     try {
       const outcome = await Promise.race([
         instance.waitUntilExit().then(() => ({ kind: "ui" as const })),
@@ -449,6 +516,7 @@ async function withApp<T>(operation: (app: AgentQApp) => Promise<T>): Promise<T>
     stateDir ? { ...process.env, AGENTQ_STATE_DIR: resolve(stateDir) } : process.env,
   );
   const app = await AgentQApp.create(paths);
+  await app.setRepositoryScope(await findRepositoryContext(process.cwd()));
   activeApp = app;
   try {
     return await operation(app);
@@ -505,6 +573,10 @@ function collect(value: string, previous: string[]): string[] {
   return [...previous, value];
 }
 
+function collectOptional(value: string, previous: string[] | undefined): string[] {
+  return [...(previous ?? []), value];
+}
+
 function collectStatus(value: string, previous: string[]): string[] {
   if (!TASK_STATUSES.includes(value as (typeof TASK_STATUSES)[number])) {
     throw new InvalidArgumentError(`Expected one of: ${TASK_STATUSES.join(", ")}`);
@@ -546,19 +618,6 @@ function signalController(): AbortController {
     { once: true },
   );
   return controller;
-}
-
-async function runInteractive(command: string, args: string[]): Promise<number> {
-  return await new Promise<number>((resolvePromise, reject) => {
-    const invocation = resolveCommandInvocation(command, args, process.env);
-    const child = spawn(invocation.command, invocation.args, {
-      stdio: "inherit",
-      env: process.env,
-      windowsHide: false,
-    });
-    child.once("error", reject);
-    child.once("exit", (code) => resolvePromise(code ?? 1));
-  });
 }
 
 process.once("exit", () => activeApp?.close());

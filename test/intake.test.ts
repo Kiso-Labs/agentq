@@ -24,7 +24,8 @@ async function setup() {
     locksDir: join(stateDir, "locks"),
   };
   const app = await AgentQApp.create(paths);
-  const queue = app.store.createQueue({ name: "intake", repoPath: join(root, "repo") });
+  const repoPath = join(root, "repo");
+  const queue = app.store.createQueue({ name: "intake", repoKey: repoPath, repoPath });
   const parent = app.store.addTask({ queue: queue.id, title: "Parent" });
   return { app, parent, queue, stateDir };
 }

@@ -27,6 +27,8 @@ const HARD_STALE_MULTIPLIER = 20;
 
 export interface SupervisorOptions {
   queue?: string;
+  /** Restrict claims to queues owned by one canonical Git repository. */
+  repoKey?: string | (() => string | undefined);
   maxConcurrency?: number;
   pollIntervalMs?: number;
   heartbeatIntervalMs?: number;
@@ -111,6 +113,10 @@ export class Supervisor {
         while (!this.stopping && this.active.size < maxConcurrency) {
           const claim = this.app.store.claimNextTask({
             queue: this.options.queue,
+            repoKey:
+              typeof this.options.repoKey === "function"
+                ? this.options.repoKey()
+                : this.options.repoKey,
             ownerToken: `${this.ownerPrefix}-${randomUUID()}`,
             ownerPid: process.pid,
             maxConcurrency,

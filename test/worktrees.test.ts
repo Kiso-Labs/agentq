@@ -88,6 +88,7 @@ describe("WorktreeManager", () => {
     const queue: Queue = {
       id: "queue_1",
       name: "Bugs",
+      repoKey: repo,
       repoPath: repo,
       baseRef: "main",
       defaultProvider: "codex",
@@ -131,6 +132,7 @@ describe("WorktreeManager", () => {
     const queue = (id: string, name: string, repoPath: string): Queue => ({
       id,
       name,
+      repoKey: repoPath,
       repoPath,
       baseRef: "main",
       defaultProvider: "codex",
@@ -174,6 +176,7 @@ describe("WorktreeManager", () => {
     const queue: Queue = {
       id: "queue_abcdef123456",
       name: "修复",
+      repoKey: repo,
       repoPath: repo,
       baseRef: "main",
       defaultProvider: "codex",
@@ -210,6 +213,7 @@ describe("WorktreeManager", () => {
     const queue: Queue = {
       id: "queue_identity",
       name: "identity",
+      repoKey: repo,
       repoPath: repo,
       baseRef: "main",
       defaultProvider: "codex",

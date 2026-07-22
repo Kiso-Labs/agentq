@@ -7,6 +7,7 @@ import {
   type AddTaskInput,
   type CreateQueueInput,
   canCompleteTaskManually,
+  canRetryTask,
   isTaskActive,
   PROVIDERS,
   type Provider,
@@ -17,6 +18,7 @@ import {
   TASK_STATUSES,
   type Task,
   type TaskEvent,
+  type TaskSpecSnapshot,
   type TaskStatus,
 } from "../core/types.ts";
 import { migrate } from "./migrations.ts";
@@ -24,6 +26,7 @@ import type {
   AddTaskOptions,
   AppendEventInput,
   ClaimOptions,
+  EditTaskInput,
   EventFilter,
   FenceStaleRunsInput,
   FinishedRun,
@@ -51,6 +54,7 @@ const MAX_LIST_LIMIT = 10_000;
 interface QueueRow {
   id: unknown;
   name: unknown;
+  repo_key: unknown;
   repo_path: unknown;
   base_ref: unknown;
   default_provider: unknown;
@@ -100,6 +104,7 @@ interface RunRow {
   process_identity_path: unknown;
   owner_token: unknown;
   owner_pid: unknown;
+  task_snapshot: unknown;
   started_at: unknown;
   heartbeat_at: unknown;
   finished_at: unknown;
@@ -125,6 +130,7 @@ interface CountRow {
 const QUEUE_COLUMNS = `
   q.id,
   q.name,
+  q.repo_key,
   q.repo_path,
   q.base_ref,
   q.default_provider,
@@ -174,6 +180,7 @@ const RUN_COLUMNS = `
   r.process_identity_path,
   r.owner_token,
   r.owner_pid,
+  r.task_snapshot,
   r.started_at,
   r.heartbeat_at,
   r.finished_at,
@@ -274,6 +281,30 @@ function jsonObject(
   }
 }
 
+function taskSpecSnapshot(
+  value: unknown,
+  entity: string,
+  id: string,
+  column: string,
+): TaskSpecSnapshot | undefined {
+  if (value === null || value === undefined) return undefined;
+  const parsed = jsonObject(value, entity, id, column);
+  const acceptanceCriteria = parsed.acceptanceCriteria;
+  if (
+    !Array.isArray(acceptanceCriteria) ||
+    !acceptanceCriteria.every((item) => typeof item === "string")
+  ) {
+    return corrupt(entity, id, column, "a task specification snapshot");
+  }
+  return {
+    title: stringValue(parsed.title, entity, id, `${column}.title`),
+    instructions: stringValue(parsed.instructions, entity, id, `${column}.instructions`),
+    acceptanceCriteria: [...acceptanceCriteria],
+    provider: enumValue(parsed.provider, PROVIDERS, entity, id, `${column}.provider`),
+    priority: integerValue(parsed.priority, entity, id, `${column}.priority`),
+  };
+}
+
 function enumValue<const T extends readonly string[]>(
   value: unknown,
   allowed: T,
@@ -292,6 +323,7 @@ function mapQueue(row: QueueRow): Queue {
   return {
     id,
     name: stringValue(row.name, "queue", id, "name"),
+    repoKey: stringValue(row.repo_key, "queue", id, "repo_key"),
     repoPath: stringValue(row.repo_path, "queue", id, "repo_path"),
     baseRef: stringValue(row.base_ref, "queue", id, "base_ref"),
     defaultProvider: enumValue(row.default_provider, PROVIDERS, "queue", id, "default_provider"),
@@ -350,6 +382,7 @@ function mapTask(row: TaskRow): Task {
 
 function mapRun(row: RunRow): Run {
   const id = rowId(row, "run");
+  const snapshot = taskSpecSnapshot(row.task_snapshot, "run", id, "task_snapshot");
   const optional = <K extends keyof Run>(
     key: K,
     value: Run[K] | undefined,
@@ -379,6 +412,7 @@ function mapRun(row: RunRow): Run {
       optionalString(row.process_identity_path, "run", id, "process_identity_path"),
     ),
     ...optional("ownerPid", optionalInteger(row.owner_pid, "run", id, "owner_pid")),
+    ...optional("taskSnapshot", snapshot),
     startedAt: stringValue(row.started_at, "run", id, "started_at"),
     heartbeatAt: stringValue(row.heartbeat_at, "run", id, "heartbeat_at"),
     ...optional("finishedAt", optionalString(row.finished_at, "run", id, "finished_at")),
@@ -434,6 +468,16 @@ function timestamp(value: string | undefined, field = "timestamp"): string {
     throw new AgentQError(`${field} must be a valid timestamp`, "INVALID_INPUT", 2);
   }
   return new Date(milliseconds).toISOString();
+}
+
+function nextUpdatedAt(previous: string): string {
+  const now = isoNow();
+  const previousMilliseconds = Date.parse(previous);
+  const nowMilliseconds = Date.parse(now);
+  if (Number.isFinite(previousMilliseconds) && nowMilliseconds <= previousMilliseconds) {
+    return new Date(previousMilliseconds + 1).toISOString();
+  }
+  return now;
 }
 
 function pagination(limit: number | undefined, offset: number | undefined): [number, number] {
@@ -541,6 +585,7 @@ export class AgentQStore {
   createQueue(input: CreateQueueInput): Queue {
     const id = makeId("queue");
     const name = nonEmpty(input.name, "queue name");
+    const repoKey = nonEmpty(input.repoKey, "repoKey");
     const repoPath = nonEmpty(input.repoPath, "repoPath");
     const baseRef = nonEmpty(input.baseRef ?? "HEAD", "baseRef");
     const defaultProvider = input.defaultProvider ?? "codex";
@@ -553,16 +598,30 @@ export class AgentQStore {
       this.#database
         .query<
           unknown,
-          [string, string, string, string, Provider, number, number, string, number, string, string]
+          [
+            string,
+            string,
+            string,
+            string,
+            string,
+            Provider,
+            number,
+            number,
+            string,
+            number,
+            string,
+            string,
+          ]
         >(`
           INSERT INTO queues(
-            id, name, repo_path, base_ref, default_provider, concurrency,
+            id, name, repo_key, repo_path, base_ref, default_provider, concurrency,
             max_attempts, verify_commands, auto_commit, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           id,
           name,
+          repoKey,
           repoPath,
           baseRef,
           defaultProvider,
@@ -574,37 +633,65 @@ export class AgentQStore {
           now,
         );
     } catch (error) {
-      constraint(error, `A queue named "${name}" already exists`, "QUEUE_EXISTS");
+      constraint(
+        error,
+        `A queue named "${name}" already exists in repository ${repoKey}`,
+        "QUEUE_EXISTS",
+      );
     }
 
     return this.#requireQueue(id);
   }
 
-  getQueue(idOrName: string): Queue | undefined {
+  getQueue(idOrName: string, repoKey?: string): Queue | undefined {
+    const scope = repoKey === undefined ? undefined : nonEmpty(repoKey, "repoKey");
     const byId = this.#database
       .query<QueueRow, [string]>(`SELECT ${QUEUE_COLUMNS} FROM queues q WHERE q.id = ?`)
       .get(idOrName);
-    if (byId) return mapQueue(byId);
+    if (byId) {
+      const queue = mapQueue(byId);
+      return scope === undefined || queue.repoKey === scope ? queue : undefined;
+    }
 
-    const byName = this.#database
-      .query<QueueRow, [string]>(
-        `SELECT ${QUEUE_COLUMNS} FROM queues q WHERE q.name = ? COLLATE NOCASE`,
-      )
-      .get(idOrName);
-    return byName ? mapQueue(byName) : undefined;
+    const bindings: string[] = [idOrName];
+    const scopeClause = scope === undefined ? "" : "AND q.repo_key = ?";
+    if (scope !== undefined) bindings.push(scope);
+    const matches = this.#database
+      .query<QueueRow, string[]>(`
+        SELECT ${QUEUE_COLUMNS}
+        FROM queues q
+        WHERE q.name = ? COLLATE NOCASE ${scopeClause}
+        ORDER BY q.id
+        LIMIT 2
+      `)
+      .all(...bindings);
+    if (matches.length > 1) {
+      throw new AgentQError(
+        `Queue name "${idOrName}" exists in multiple repositories; specify a repository scope or queue id`,
+        "QUEUE_AMBIGUOUS",
+        2,
+      );
+    }
+    return matches[0] ? mapQueue(matches[0]) : undefined;
   }
 
-  listQueues(): Queue[] {
+  listQueues(repoKey?: string): Queue[] {
+    const scope = repoKey === undefined ? undefined : nonEmpty(repoKey, "repoKey");
+    const where = scope === undefined ? "" : "WHERE q.repo_key = ?";
+    const bindings = scope === undefined ? [] : [scope];
     return this.#database
-      .query<QueueRow, []>(
-        `SELECT ${QUEUE_COLUMNS} FROM queues q ORDER BY q.name COLLATE NOCASE, q.id`,
+      .query<QueueRow, string[]>(
+        `SELECT ${QUEUE_COLUMNS}
+         FROM queues q
+         ${where}
+         ORDER BY q.name COLLATE NOCASE, q.id`,
       )
-      .all()
+      .all(...bindings)
       .map(mapQueue);
   }
 
-  updateQueue(idOrName: string, patch: UpdateQueueInput): Queue {
-    const queue = this.#requireQueue(idOrName);
+  updateQueue(idOrName: string, patch: UpdateQueueInput, repoKey?: string): Queue {
+    const queue = this.#requireQueue(idOrName, repoKey);
     const fields: string[] = [];
     const values: Binding[] = [];
 
@@ -614,6 +701,7 @@ export class AgentQStore {
     };
 
     if (patch.name !== undefined) set("name", nonEmpty(patch.name, "queue name"));
+    if (patch.repoKey !== undefined) set("repo_key", nonEmpty(patch.repoKey, "repoKey"));
     if (patch.repoPath !== undefined) set("repo_path", nonEmpty(patch.repoPath, "repoPath"));
     if (patch.baseRef !== undefined) set("base_ref", nonEmpty(patch.baseRef, "baseRef"));
     if (patch.defaultProvider !== undefined) set("default_provider", patch.defaultProvider);
@@ -641,15 +729,19 @@ export class AgentQStore {
         .query<unknown, Binding[]>(`UPDATE queues SET ${fields.join(", ")} WHERE id = ?`)
         .run(...values);
     } catch (error) {
-      constraint(error, `A queue named "${patch.name}" already exists`, "QUEUE_EXISTS");
+      constraint(
+        error,
+        `A queue named "${patch.name ?? queue.name}" already exists in that repository`,
+        "QUEUE_EXISTS",
+      );
     }
 
     return this.#requireQueue(queue.id);
   }
 
-  deleteQueue(idOrName: string): boolean {
+  deleteQueue(idOrName: string, repoKey?: string): boolean {
     const remove = this.#database.transaction(() => {
-      const queue = this.getQueue(idOrName);
+      const queue = this.getQueue(idOrName, repoKey);
       if (!queue) return false;
 
       const task = this.#database
@@ -802,7 +894,11 @@ export class AgentQStore {
 
     if (filter.queue !== undefined) {
       where.push("t.queue_id = ?");
-      values.push(this.#requireQueue(filter.queue).id);
+      values.push(this.#requireQueue(filter.queue, filter.repoKey).id);
+    }
+    if (filter.repoKey !== undefined) {
+      where.push("q.repo_key = ?");
+      values.push(nonEmpty(filter.repoKey, "repoKey"));
     }
     if (filter.status !== undefined && filter.statuses !== undefined) {
       throw new AgentQError("Use either status or statuses, not both", "INVALID_INPUT", 2);
@@ -888,6 +984,98 @@ export class AgentQStore {
       );
     }
     return this.#requireTask(id);
+  }
+
+  editTask(id: string, patch: EditTaskInput, expectedUpdatedAt?: string): Task {
+    const fields: string[] = [];
+    const values: Binding[] = [];
+    const editedFields: string[] = [];
+    const set = (field: string, column: string, value: Binding) => {
+      editedFields.push(field);
+      fields.push(`${column} = ?`);
+      values.push(value);
+    };
+
+    if (patch.title !== undefined) set("title", "title", nonEmpty(patch.title, "task title"));
+    if (patch.instructions !== undefined) {
+      set("instructions", "instructions", patch.instructions);
+    }
+    if (patch.acceptanceCriteria !== undefined) {
+      set(
+        "acceptanceCriteria",
+        "acceptance_criteria",
+        JSON.stringify(stringArrayInput(patch.acceptanceCriteria, "acceptanceCriteria")),
+      );
+    }
+    if (patch.provider !== undefined) {
+      // A queued resume is provider-specific. Preserve it only when an edit
+      // keeps the provider unchanged; switching providers must start fresh.
+      fields.push("resume_run_id = CASE WHEN provider = ? THEN resume_run_id ELSE NULL END");
+      values.push(patch.provider);
+      set("provider", "provider", patch.provider);
+    }
+    if (patch.priority !== undefined) {
+      set("priority", "priority", integerInput(patch.priority, "priority"));
+    }
+    if (fields.length === 0) {
+      throw new AgentQError("A task edit must change at least one field", "INVALID_INPUT", 2);
+    }
+    const expected =
+      expectedUpdatedAt === undefined
+        ? undefined
+        : nonEmpty(expectedUpdatedAt, "expectedUpdatedAt");
+
+    const edit = this.#database.transaction(() => {
+      const before = this.#requireTask(id);
+      const editedAt = nextUpdatedAt(before.updatedAt);
+      const updateFields = [...fields, "updated_at = ?"];
+      const bindings: Binding[] = [...values, editedAt, id];
+      const versionClause = expected === undefined ? "" : "AND updated_at = ?";
+      if (expected !== undefined) bindings.push(expected);
+
+      let changed: number;
+      try {
+        changed = this.#database
+          .query<unknown, Binding[]>(`
+            UPDATE tasks
+            SET ${updateFields.join(", ")}
+            WHERE id = ?
+              AND current_run_id IS NULL
+              AND status IN ('queued', 'failed', 'interrupted', 'cancelled')
+              ${versionClause}
+          `)
+          .run(...bindings).changes;
+      } catch (error) {
+        constraint(error, "Task edit contains an invalid value", "INVALID_TASK");
+      }
+
+      if (changed !== 1) {
+        const current = this.#requireTask(id);
+        if (
+          current.currentRunId ||
+          !["queued", "failed", "interrupted", "cancelled"].includes(current.status)
+        ) {
+          throw new AgentQError(
+            `Task ${id} cannot be edited while it is ${current.status}`,
+            "TASK_NOT_EDITABLE",
+          );
+        }
+        throw new AgentQError(
+          `Task ${id} changed after editing began; reload it and try again`,
+          "TASK_EDIT_CONFLICT",
+        );
+      }
+
+      this.appendEvent({
+        taskId: id,
+        kind: "task.edited",
+        payload: { fields: editedFields, previousUpdatedAt: before.updatedAt },
+        createdAt: editedAt,
+      });
+      return this.#requireTask(id);
+    });
+
+    return edit.immediate();
   }
 
   completeTaskManually(id: string, summary: string, at?: string): Task {
@@ -1000,13 +1188,19 @@ export class AgentQStore {
   requeueTask(id: string, at?: string, resumeRunId: string | null = null): Task {
     const requeue = this.#database.transaction(() => {
       const task = this.#requireTask(id);
-      if (["starting", "running", "cancelling"].includes(task.status) || task.currentRunId) {
-        throw new AgentQError(`Cannot requeue active task ${id}`, "TASK_ACTIVE");
+      const canRequeue =
+        resumeRunId === null ? canRetryTask(task.status) : !isTaskActive(task.status);
+      if (!canRequeue || task.currentRunId) {
+        throw new AgentQError(
+          `Cannot requeue task ${id} while it is ${task.status}`,
+          "TASK_NOT_RETRYABLE",
+        );
       }
       if (resumeRunId !== null) {
         const resumeRun = this.#requireRun(resumeRunId);
         if (
           resumeRun.taskId !== task.id ||
+          resumeRun.provider !== task.provider ||
           !resumeRun.providerSessionId ||
           !resumeRun.worktreePath
         ) {
@@ -1055,11 +1249,16 @@ export class AgentQStore {
 
   claimNextTask(options: ClaimOptions = {}): TaskClaim | undefined {
     const claim = this.#database.transaction(() => {
+      const repoKey =
+        options.repoKey === undefined ? undefined : nonEmpty(options.repoKey, "repoKey");
       const queueId =
-        options.queue === undefined ? undefined : this.#requireQueue(options.queue).id;
+        options.queue === undefined ? undefined : this.#requireQueue(options.queue, repoKey).id;
       const now = timestamp(options.now, "claim timestamp");
       const queueClause = queueId === undefined ? "" : "AND t.queue_id = ?";
-      const bindings: Binding[] = queueId === undefined ? [] : [queueId];
+      const repoClause = repoKey === undefined ? "" : "AND q.repo_key = ?";
+      const bindings: Binding[] = [];
+      if (queueId !== undefined) bindings.push(queueId);
+      if (repoKey !== undefined) bindings.push(repoKey);
       const maxConcurrency =
         options.maxConcurrency === undefined
           ? undefined
@@ -1083,6 +1282,7 @@ export class AgentQStore {
             AND t.cancel_requested_at IS NULL
             AND t.attempt_count < q.max_attempts
             ${queueClause}
+            ${repoClause}
             ${globalClause}
             AND (
               SELECT COUNT(*)
@@ -1118,18 +1318,35 @@ export class AgentQStore {
         options.ownerToken === undefined ? null : nonEmpty(options.ownerToken, "ownerToken");
       const ownerPid =
         options.ownerPid === undefined ? null : integerInput(options.ownerPid, "ownerPid", 1);
+      const snapshot: TaskSpecSnapshot = {
+        title: task.title,
+        instructions: task.instructions,
+        acceptanceCriteria: [...task.acceptanceCriteria],
+        provider: task.provider,
+        priority: task.priority,
+      };
 
       this.#database
         .query<
           unknown,
-          [string, string, number, Provider, string | null, number | null, string, string]
+          [string, string, number, Provider, string | null, number | null, string, string, string]
         >(`
           INSERT INTO runs(
             id, task_id, attempt_no, provider, status, owner_token, owner_pid,
-            started_at, heartbeat_at
-          ) VALUES (?, ?, ?, ?, 'starting', ?, ?, ?, ?)
+            task_snapshot, started_at, heartbeat_at
+          ) VALUES (?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?)
         `)
-        .run(runId, task.id, attemptNo, task.provider, ownerToken, ownerPid, now, now);
+        .run(
+          runId,
+          task.id,
+          attemptNo,
+          task.provider,
+          ownerToken,
+          ownerPid,
+          JSON.stringify(snapshot),
+          now,
+          now,
+        );
 
       const changed = this.#database
         .query<unknown, [number, string, string, string]>(`
@@ -1198,6 +1415,55 @@ export class AgentQStore {
       `)
       .all(...values)
       .map(mapRun);
+  }
+
+  recordWorktreeRemoval(
+    runId: string,
+    expectedWorktreePath: string,
+    force = false,
+    at?: string,
+  ): Run {
+    const record = this.#database.transaction(() => {
+      const run = this.#requireRun(runId);
+      const worktreePath = nonEmpty(expectedWorktreePath, "worktreePath");
+      if (!run.worktreePath) return run;
+      if (run.worktreePath !== worktreePath) {
+        throw new AgentQError(`Run ${runId} retained a different worktree`, "WORKTREE_CHANGED");
+      }
+
+      const removedAt = timestamp(at, "worktree removal timestamp");
+      const changed = this.#database
+        .query<unknown, [string, string]>(`
+          UPDATE runs
+          SET worktree_path = NULL
+          WHERE id = ? AND worktree_path = ?
+        `)
+        .run(runId, worktreePath).changes;
+      if (changed !== 1) {
+        throw new AgentQError(
+          `Run ${runId} worktree changed before cleanup completed`,
+          "WORKTREE_CHANGED",
+        );
+      }
+
+      const task = this.#requireTask(run.taskId);
+      this.#database
+        .query<unknown, [string, string, string]>(`
+          UPDATE tasks
+          SET resume_run_id = NULL, updated_at = ?
+          WHERE id = ? AND resume_run_id = ?
+        `)
+        .run(nextUpdatedAt(task.updatedAt), task.id, run.id);
+      this.appendEvent({
+        taskId: run.taskId,
+        runId,
+        kind: "task.worktree_removed",
+        payload: { worktreePath, force },
+        createdAt: removedAt,
+      });
+      return this.#requireRun(runId);
+    });
+    return record.immediate();
   }
 
   updateRun(id: string, patch: UpdateRunInput, leaseToken?: string): Run {
@@ -1661,8 +1927,8 @@ export class AgentQStore {
     };
   }
 
-  #requireQueue(idOrName: string): Queue {
-    const queue = this.getQueue(idOrName);
+  #requireQueue(idOrName: string, repoKey?: string): Queue {
+    const queue = this.getQueue(idOrName, repoKey);
     if (!queue) throw new AgentQError(`Queue ${idOrName} does not exist`, "QUEUE_NOT_FOUND");
     return queue;
   }

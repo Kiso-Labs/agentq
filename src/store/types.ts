@@ -16,6 +16,7 @@ export type UpdateQueueInput = Partial<
   Pick<
     Queue,
     | "name"
+    | "repoKey"
     | "repoPath"
     | "baseRef"
     | "defaultProvider"
@@ -26,8 +27,13 @@ export type UpdateQueueInput = Partial<
   >
 >;
 
+export type EditTaskInput = Partial<
+  Pick<Task, "title" | "instructions" | "acceptanceCriteria" | "provider" | "priority">
+>;
+
 export interface TaskFilter {
   queue?: string;
+  repoKey?: string;
   status?: TaskStatus | readonly TaskStatus[];
   /** Alias used by CLI callers that construct a list of statuses. */
   statuses?: readonly TaskStatus[];
@@ -54,6 +60,7 @@ export interface UpdateTaskInput {
 
 export interface ClaimOptions {
   queue?: string;
+  repoKey?: string;
   now?: string;
   ownerToken?: string;
   ownerPid?: number;

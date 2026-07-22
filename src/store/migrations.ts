@@ -5,7 +5,15 @@ import { isoNow } from "../core/paths.ts";
 interface Migration {
   version: number;
   name: string;
+  foreignKeysOff?: boolean;
   up(database: Database): void;
+}
+
+interface ForeignKeyViolationRow {
+  table: string;
+  rowid: number | null;
+  parent: string;
+  fkid: number;
 }
 
 const migrations: readonly Migration[] = [
@@ -149,6 +157,56 @@ const migrations: readonly Migration[] = [
       database.run("ALTER TABLE runs ADD COLUMN process_identity_path TEXT");
     },
   },
+  {
+    version: 4,
+    name: "repo_scoped_queues_and_task_snapshots",
+    // SQLite cannot drop the anonymous UNIQUE constraint from the v1 queues
+    // table. Rebuilding the parent table with foreign-key enforcement disabled
+    // on this connection preserves child rows while replacing that constraint.
+    foreignKeysOff: true,
+    up(database) {
+      database.run(`
+        CREATE TABLE queues_v4 (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL COLLATE NOCASE,
+          repo_key TEXT NOT NULL,
+          repo_path TEXT NOT NULL,
+          base_ref TEXT NOT NULL,
+          default_provider TEXT NOT NULL CHECK (default_provider IN ('codex', 'claude')),
+          concurrency INTEGER NOT NULL CHECK (concurrency > 0),
+          max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+          verify_commands TEXT NOT NULL,
+          auto_commit INTEGER NOT NULL CHECK (auto_commit IN (0, 1)),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(repo_key, name)
+        )
+      `);
+      database.run(`
+        INSERT INTO queues_v4(
+          id, name, repo_key, repo_path, base_ref, default_provider, concurrency,
+          max_attempts, verify_commands, auto_commit, created_at, updated_at
+        )
+        SELECT
+          id, name, repo_path, repo_path, base_ref, default_provider, concurrency,
+          max_attempts, verify_commands, auto_commit, created_at, updated_at
+        FROM queues
+      `);
+      database.run("DROP TABLE queues");
+      database.run("ALTER TABLE queues_v4 RENAME TO queues");
+      database.run("ALTER TABLE runs ADD COLUMN task_snapshot TEXT");
+
+      const violation = database
+        .query<ForeignKeyViolationRow, []>("PRAGMA foreign_key_check")
+        .get();
+      if (violation) {
+        throw new AgentQError(
+          `Database migration would break ${violation.table} foreign key ${violation.fkid}`,
+          "MIGRATION_FOREIGN_KEY_VIOLATION",
+        );
+      }
+    },
+  },
 ];
 
 interface VersionRow {
@@ -193,6 +251,11 @@ export function migrate(database: Database): void {
         .run(migration.version, migration.name, isoNow());
     });
 
-    apply.immediate();
+    if (migration.foreignKeysOff) database.run("PRAGMA foreign_keys = OFF");
+    try {
+      apply.immediate();
+    } finally {
+      if (migration.foreignKeysOff) database.run("PRAGMA foreign_keys = ON");
+    }
   }
 }

@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { access, chmod, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { AgentQError, errorMessage } from "./core/errors.ts";
@@ -8,16 +9,31 @@ import {
   type CreateQueueInput,
   canCancelTask,
   canRetryTask,
+  isTaskTerminal,
+  type Provider,
   type ProviderHealth,
   type Queue,
+  type Run,
   type Task,
   type TaskEvent,
 } from "./core/types.ts";
 import { createExecutorMap } from "./executors/index.ts";
 import { runCommand, runGit } from "./git/command.ts";
+import {
+  findRepositoryContext,
+  type RepositoryContext,
+  resolveRepositoryContext,
+} from "./git/repository.ts";
 import { WorktreeManager } from "./git/worktrees.ts";
+import {
+  type IntegrationResult,
+  type IntegrationTarget,
+  installIntegration as writeIntegration,
+} from "./integrations/instructions.ts";
+import { resolveCommandInvocation } from "./process/index.ts";
 import { AgentQStore } from "./store/index.ts";
-import type { UiController } from "./ui/types.ts";
+import type { EditTaskInput } from "./store/types.ts";
+import type { UiContext, UiController, UiQueuePatch } from "./ui/types.ts";
 
 export interface DoctorCheck {
   name: string;
@@ -31,6 +47,8 @@ export class AgentQApp implements UiController {
   readonly store: AgentQStore;
   readonly worktrees: WorktreeManager;
   private readonly listeners = new Set<() => void>();
+  private scope?: RepositoryContext;
+  private showAllRepositories = false;
 
   private constructor(paths: AgentQPaths, store: AgentQStore) {
     this.paths = paths;
@@ -73,8 +91,53 @@ export class AgentQApp implements UiController {
     }
   }
 
-  async createQueue(input: CreateQueueInput): Promise<Queue> {
-    const repoPath = await this.worktrees.resolveRepo(input.repoPath);
+  get repositoryContext(): RepositoryContext | undefined {
+    return this.scope;
+  }
+
+  get allRepositories(): boolean {
+    return this.showAllRepositories || !this.scope;
+  }
+
+  get activeRepositoryKey(): string | undefined {
+    return this.allRepositories ? undefined : this.scope?.repoKey;
+  }
+
+  async setRepositoryScope(scope?: RepositoryContext): Promise<void> {
+    this.scope = scope;
+    this.showAllRepositories = !scope;
+    if (scope) await this.adoptLegacyRepositoryKeys();
+    this.notify();
+  }
+
+  uiContext(): UiContext {
+    const all = this.allRepositories;
+    return {
+      label: all ? "all repositories" : `${this.scope?.displayName} · ${this.scope?.rootPath}`,
+      ...(this.scope ? { repositoryPath: this.scope.rootPath } : {}),
+      all,
+      canToggle: Boolean(this.scope),
+    };
+  }
+
+  setAllRepositories(all: boolean): void {
+    if (!all && !this.scope) {
+      throw new AgentQError(
+        "Cannot switch to repository-only queues outside a Git repository",
+        "REPOSITORY_SCOPE_UNAVAILABLE",
+        2,
+      );
+    }
+    this.showAllRepositories = all;
+    this.notify();
+  }
+
+  async createQueue(
+    input: Omit<CreateQueueInput, "repoKey"> & { repoKey?: string },
+  ): Promise<Queue> {
+    const repository = await resolveRepositoryContext(input.repoPath);
+    await this.adoptLegacyRepositoryKeys();
+    const repoPath = repository.rootPath;
     let baseRef = input.baseRef;
     if (!baseRef) {
       const branch = await runGit(repoPath, ["symbolic-ref", "--quiet", "--short", "HEAD"], {
@@ -83,23 +146,39 @@ export class AgentQApp implements UiController {
       baseRef = branch.stdout.trim() || "HEAD";
     }
     await runGit(repoPath, ["rev-parse", "--verify", `${baseRef}^{commit}`]);
-    const queue = this.store.createQueue({ ...input, repoPath, baseRef });
+    const queue = this.store.createQueue({
+      ...input,
+      repoPath,
+      repoKey: repository.repoKey,
+      baseRef,
+    });
     this.notify();
     return queue;
   }
 
-  async listQueues(): Promise<Queue[]> {
-    return this.store.listQueues();
+  async listQueues(options: { all?: boolean } = {}): Promise<Queue[]> {
+    return this.store.listQueues(options.all ? undefined : this.activeRepositoryKey);
   }
 
-  async getQueue(idOrName: string): Promise<Queue> {
-    const queue = this.store.getQueue(idOrName);
+  async getQueue(idOrName: string, options: { all?: boolean } = {}): Promise<Queue> {
+    const queue = this.store.getQueue(idOrName, options.all ? undefined : this.activeRepositoryKey);
     if (!queue) throw new AgentQError(`Queue not found: ${idOrName}`, "QUEUE_NOT_FOUND");
     return queue;
   }
 
+  async updateQueue(idOrName: string, patch: UiQueuePatch): Promise<Queue> {
+    const queue = await this.getQueue(idOrName);
+    if (patch.baseRef !== undefined) {
+      await runGit(queue.repoPath, ["rev-parse", "--verify", `${patch.baseRef}^{commit}`]);
+    }
+    const updated = this.store.updateQueue(queue.id, patch);
+    this.notify();
+    return updated;
+  }
+
   async deleteQueue(idOrName: string): Promise<void> {
-    if (!this.store.deleteQueue(idOrName)) {
+    const queue = await this.getQueue(idOrName);
+    if (!this.store.deleteQueue(queue.id)) {
       throw new AgentQError(`Queue not found: ${idOrName}`, "QUEUE_NOT_FOUND");
     }
     this.notify();
@@ -113,11 +192,12 @@ export class AgentQApp implements UiController {
     const sourceKind = input.sourceKind ?? (parentTaskId ? "agent" : "manual");
     const queue = input.queue || process.env.AGENTQ_QUEUE;
     if (!queue) throw new AgentQError("A queue is required", "QUEUE_REQUIRED");
+    const resolvedQueue = await this.getQueue(queue);
 
     const task = this.store.addTask(
       {
         ...input,
-        queue,
+        queue: resolvedQueue.id,
         parentTaskId,
         sourceKind,
       },
@@ -133,8 +213,21 @@ export class AgentQApp implements UiController {
     return task;
   }
 
-  async listTasks(queueId?: string): Promise<Task[]> {
-    return this.store.listTasks(queueId ? { queue: queueId } : undefined);
+  async listTasks(queueId?: string, options: { all?: boolean } = {}): Promise<Task[]> {
+    const repoKey = options.all ? undefined : this.activeRepositoryKey;
+    const queue = queueId
+      ? await this.getQueue(queueId, options.all ? { all: true } : {})
+      : undefined;
+    return this.store.listTasks({
+      ...(queue ? { queue: queue.id } : {}),
+      ...(repoKey ? { repoKey } : {}),
+    });
+  }
+
+  async editTask(taskId: string, patch: EditTaskInput, expectedUpdatedAt?: string): Promise<Task> {
+    const task = this.store.editTask(taskId, patch, expectedUpdatedAt);
+    this.notify();
+    return task;
   }
 
   async listEvents(
@@ -142,6 +235,11 @@ export class AgentQApp implements UiController {
     options?: { afterId?: number; limit?: number },
   ): Promise<TaskEvent[]> {
     return this.store.listEvents({ taskId, afterId: options?.afterId, limit: options?.limit });
+  }
+
+  async listRuns(taskId: string): Promise<Run[]> {
+    await this.getTask(taskId);
+    return this.store.listRuns({ taskId });
   }
 
   async cancelTask(taskId: string): Promise<void> {
@@ -169,29 +267,44 @@ export class AgentQApp implements UiController {
   }
 
   async resumeTask(taskId: string): Promise<void> {
-    await this.getTask(taskId);
-    const previous = this.store
-      .listRuns({ taskId })
-      .find((run) => run.providerSessionId && run.worktreePath && run.branchName && run.baseSha);
-    if (!previous?.providerSessionId || !previous.worktreePath) {
-      throw new AgentQError(
-        "No resumable provider session and worktree were retained for this task",
-        "RUN_NOT_RESUMABLE",
-      );
+    const initialTask = await this.getTask(taskId);
+    const queue = this.store.getQueue(initialTask.queueId);
+    if (!queue) {
+      throw new AgentQError(`Queue not found: ${initialTask.queueId}`, "QUEUE_NOT_FOUND");
     }
-    try {
-      await access(previous.worktreePath);
-    } catch {
-      throw new AgentQError(
-        `The retained worktree no longer exists: ${previous.worktreePath}`,
-        "WORKTREE_NOT_FOUND",
-      );
-    }
-    this.store.requeueTask(taskId, undefined, previous.id);
-    this.store.appendEvent({
-      taskId,
-      kind: "task.resume_requested",
-      payload: { previousRunId: previous.id },
+
+    await this.worktrees.withRepositoryLock(queue.repoPath, async () => {
+      const task = await this.getTask(taskId);
+      const previous = this.store
+        .listRuns({ taskId })
+        .find(
+          (run) =>
+            run.provider === task.provider &&
+            run.providerSessionId &&
+            run.worktreePath &&
+            run.branchName &&
+            run.baseSha,
+        );
+      if (!previous?.providerSessionId || !previous.worktreePath) {
+        throw new AgentQError(
+          "No resumable provider session and worktree were retained for this task",
+          "RUN_NOT_RESUMABLE",
+        );
+      }
+      try {
+        await access(previous.worktreePath);
+      } catch {
+        throw new AgentQError(
+          `The retained worktree no longer exists: ${previous.worktreePath}`,
+          "WORKTREE_NOT_FOUND",
+        );
+      }
+      this.store.requeueTask(taskId, undefined, previous.id);
+      this.store.appendEvent({
+        taskId,
+        kind: "task.resume_requested",
+        payload: { previousRunId: previous.id },
+      });
     });
     this.notify();
   }
@@ -199,6 +312,101 @@ export class AgentQApp implements UiController {
   async completeManualTask(taskId: string, summary = "Completed manually"): Promise<void> {
     this.store.completeTaskManually(taskId, summary);
     this.notify();
+  }
+
+  async cleanTask(
+    taskId: string,
+    options: { force?: boolean } = {},
+  ): Promise<{ taskId: string; removedWorktree: string }> {
+    const initialTask = await this.getTask(taskId);
+    const queue = this.store.getQueue(initialTask.queueId);
+    if (!queue) {
+      throw new AgentQError(`Queue not found: ${initialTask.queueId}`, "QUEUE_NOT_FOUND");
+    }
+    const force = options.force ?? false;
+    const result = await this.worktrees.withRepositoryLock(
+      queue.repoPath,
+      async ({ removeWorktree }) => {
+        const task = await this.getTask(taskId);
+        if (!isTaskTerminal(task.status)) {
+          throw new AgentQError(
+            `Cannot clean task ${taskId} while it is ${task.status}; cancel queued work first`,
+            "TASK_ACTIVE",
+          );
+        }
+        const run = this.store.listRuns({ taskId }).find((candidate) => candidate.worktreePath);
+        if (!run?.worktreePath) {
+          throw new AgentQError(`Task ${taskId} has no retained worktree`, "WORKTREE_NOT_FOUND");
+        }
+        await removeWorktree(run.worktreePath, force);
+        this.store.recordWorktreeRemoval(run.id, run.worktreePath, force);
+        return { taskId, removedWorktree: run.worktreePath };
+      },
+    );
+    this.notify();
+    return result;
+  }
+
+  async loginProvider(provider: Provider): Promise<void> {
+    const executor = createExecutorMap().get(provider);
+    if (!executor) {
+      throw new AgentQError(`Unsupported provider: ${provider}`, "PROVIDER_UNSUPPORTED", 2);
+    }
+    const health = await executor.probe();
+    if (!health.available || !health.binary) {
+      throw new AgentQError(
+        `${provider === "codex" ? "Codex" : "Claude Code"} CLI is unavailable: ${health.message}`,
+        "PROVIDER_UNAVAILABLE",
+        2,
+      );
+    }
+
+    const providerArgs = provider === "codex" ? ["login"] : ["auth", "login"];
+    const invocation = resolveCommandInvocation(health.binary, providerArgs);
+    const exitCode = await new Promise<number>((resolve, reject) => {
+      const child = spawn(invocation.command, invocation.args, {
+        env: process.env,
+        stdio: "inherit",
+        windowsHide: false,
+      });
+      child.once("error", reject);
+      child.once("exit", (code, signal) => {
+        if (signal) {
+          reject(
+            new AgentQError(
+              `${provider} login was interrupted by ${signal}`,
+              "PROVIDER_LOGIN_INTERRUPTED",
+            ),
+          );
+          return;
+        }
+        resolve(code ?? 1);
+      });
+    });
+    if (exitCode !== 0) {
+      throw new AgentQError(
+        `${provider} login exited with code ${exitCode}`,
+        "PROVIDER_LOGIN_FAILED",
+        exitCode,
+      );
+    }
+    this.notify();
+  }
+
+  async installIntegration(
+    target: IntegrationTarget,
+    repoPath?: string,
+  ): Promise<IntegrationResult[]> {
+    const requestedPath = repoPath ?? this.scope?.rootPath;
+    if (!requestedPath) {
+      throw new AgentQError(
+        "A Git repository path is required outside a repository",
+        "REPOSITORY_REQUIRED",
+        2,
+      );
+    }
+    const repository = await resolveRepositoryContext(requestedPath);
+    return writeIntegration(repository.rootPath, target);
   }
 
   async doctor(): Promise<DoctorCheck[]> {
@@ -245,6 +453,17 @@ export class AgentQApp implements UiController {
       detail: "Each attempt uses a dedicated Git branch and worktree.",
     });
     return checks;
+  }
+
+  private async adoptLegacyRepositoryKeys(): Promise<void> {
+    const legacyQueues = this.store
+      .listQueues()
+      .filter((queue) => queue.repoKey === queue.repoPath);
+    for (const queue of legacyQueues) {
+      const repository = await findRepositoryContext(queue.repoPath);
+      if (!repository || repository.repoKey === queue.repoKey) continue;
+      this.store.updateQueue(queue.id, { repoKey: repository.repoKey });
+    }
   }
 }
 

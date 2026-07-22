@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { access, mkdir, realpath } from "node:fs/promises";
-import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { AgentQError } from "../core/errors.ts";
 import type { AgentQPaths, Queue, Task } from "../core/types.ts";
 import { runCommand, runGit } from "./command.ts";
@@ -18,6 +18,11 @@ export interface VerificationResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+}
+
+export interface LockedRepository {
+  repoRoot: string;
+  removeWorktree(worktreePath: string, force?: boolean): Promise<void>;
 }
 
 function slug(value: string): string {
@@ -39,6 +44,22 @@ async function pathExists(path: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function canonicalMissingPath(path: string): Promise<string> {
+  let ancestor = resolve(path);
+  const missingSegments: string[] = [];
+  while (true) {
+    try {
+      return resolve(await realpath(ancestor), ...missingSegments.reverse());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = dirname(ancestor);
+      if (parent === ancestor) throw error;
+      missingSegments.push(basename(ancestor));
+      ancestor = parent;
+    }
   }
 }
 
@@ -236,25 +257,64 @@ export class WorktreeManager {
     return results;
   }
 
-  async remove(repoPath: string, worktreePath: string, force = false): Promise<void> {
+  async withRepositoryLock<T>(
+    repoPath: string,
+    operation: (repository: LockedRepository) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
     const repoRoot = await this.resolveRepo(repoPath);
-    const commonDir = await this.resolveCommonDir(repoRoot);
-    const [managedRoot, candidate] = await Promise.all([
-      realpath(this.paths.worktreesDir),
-      realpath(worktreePath),
-    ]);
+    const commonDir = await this.resolveCommonDir(repoRoot, signal);
+    return withRepoLock(
+      this.paths.locksDir,
+      commonDir,
+      () =>
+        operation({
+          repoRoot,
+          removeWorktree: (worktreePath, force = false) =>
+            this.removeFromResolvedRepository(repoRoot, worktreePath, force, signal),
+        }),
+      { signal },
+    );
+  }
+
+  async remove(repoPath: string, worktreePath: string, force = false): Promise<void> {
+    await this.withRepositoryLock(repoPath, ({ removeWorktree }) =>
+      removeWorktree(worktreePath, force),
+    );
+  }
+
+  private async removeFromResolvedRepository(
+    repoRoot: string,
+    worktreePath: string,
+    force: boolean,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const managedRoot = await realpath(this.paths.worktreesDir);
+    let candidate: string;
+    try {
+      candidate = await realpath(worktreePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      candidate = await canonicalMissingPath(worktreePath);
+      if (!inside(managedRoot, candidate)) {
+        throw new AgentQError(
+          "Refusing to reconcile a worktree outside agentq's managed root",
+          "INVALID_WORKTREE",
+        );
+      }
+      await runGit(repoRoot, ["worktree", "prune"], { signal });
+      return;
+    }
     if (!inside(managedRoot, candidate)) {
       throw new AgentQError(
         "Refusing to remove a worktree outside agentq's managed root",
         "INVALID_WORKTREE",
       );
     }
-    await withRepoLock(this.paths.locksDir, commonDir, async () => {
-      const args = ["worktree", "remove"];
-      if (force) args.push("--force");
-      args.push(candidate);
-      await runGit(repoRoot, args);
-      await runGit(repoRoot, ["worktree", "prune"]);
-    });
+    const args = ["worktree", "remove"];
+    if (force) args.push("--force");
+    args.push(candidate);
+    await runGit(repoRoot, args, { signal });
+    await runGit(repoRoot, ["worktree", "prune"], { signal });
   }
 }

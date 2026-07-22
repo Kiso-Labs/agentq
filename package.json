@@ -52,7 +52,7 @@
   "license": "MIT",
   "dependencies": {
     "@anthropic-ai/claude-code": "^2.1.216",
-    "@openai/codex": "^0.144.6",
+    "@openai/codex": "^0.145.0",
     "commander": "^15.0.0",
     "ink": "^7.1.1",
     "react": "^19.2.8",

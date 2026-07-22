@@ -70,6 +70,7 @@ export type RunStatus = (typeof RUN_STATUSES)[number];
 export interface Queue {
   id: string;
   name: string;
+  repoKey: string;
   repoPath: string;
   baseRef: string;
   defaultProvider: Provider;
@@ -79,6 +80,14 @@ export interface Queue {
   autoCommit: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface TaskSpecSnapshot {
+  title: string;
+  instructions: string;
+  acceptanceCriteria: string[];
+  provider: Provider;
+  priority: number;
 }
 
 export interface Task {
@@ -118,6 +127,7 @@ export interface Run {
   processStartMarker?: string;
   processIdentityPath?: string;
   ownerPid?: number;
+  taskSnapshot?: TaskSpecSnapshot;
   startedAt: string;
   heartbeatAt: string;
   finishedAt?: string;
@@ -138,6 +148,7 @@ export interface TaskEvent {
 
 export interface CreateQueueInput {
   name: string;
+  repoKey: string;
   repoPath: string;
   baseRef?: string;
   defaultProvider?: Provider;

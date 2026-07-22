@@ -31,6 +31,7 @@ function makeInput(cwd: string, overrides: Partial<ExecutorRunInput> = {}): Exec
   const queue: Queue = {
     id: "queue-1",
     name: "bugs",
+    repoKey: cwd,
     repoPath: cwd,
     baseRef: "main",
     defaultProvider: "codex",

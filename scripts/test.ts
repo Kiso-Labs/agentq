@@ -4,6 +4,8 @@ const testFiles = [
   "test/store.test.ts",
   "test/intake.test.ts",
   "test/worktrees.test.ts",
+  "test/repository.test.ts",
+  "test/app.test.ts",
   "test/ui.test.tsx",
   "test/instructions.test.ts",
   "test/supervisor.test.ts",
