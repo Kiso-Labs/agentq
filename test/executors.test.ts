@@ -198,7 +198,7 @@ describe("ClaudeStreamParser", () => {
   });
 });
 
-async function fakeProviderBinary(directory: string): Promise<string> {
+async function fakeProviderScript(directory: string): Promise<string> {
   const script = join(directory, "fake-provider.ts");
   await writeFile(
     script,
@@ -252,12 +252,17 @@ async function npmCommandShim(directory: string, target: string): Promise<string
   return shim;
 }
 
+async function fakeProviderBinary(directory: string): Promise<string> {
+  const target = await fakeProviderScript(directory);
+  return process.platform === "win32" ? npmCommandShim(directory, target) : target;
+}
+
 describe("CLI executors", () => {
   test.skipIf(process.platform !== "win32")(
     "launches npm .cmd provider shims without treating arguments as shell input",
     async () => {
       const directory = await temporaryDirectory();
-      const target = await fakeProviderBinary(directory);
+      const target = await fakeProviderScript(directory);
       const binary = await npmCommandShim(directory, target);
       const capture = join(directory, "capture.json");
       const injectedFile = join(directory, "command-injection.txt");
