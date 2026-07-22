@@ -135,13 +135,13 @@ The dashboard works in wide, medium, and narrow terminals. Its controls are:
 - `↑`, `↓`, `j`, and `k` move through the focused queue or task list.
 - `[` and `]` shrink or grow the focused pane, `0` restores the default pane sizes, and `z` toggles a focused-pane zoom.
 - `:` opens the action center, which exposes every queue, task, provider, integration, scope, refresh, help, and quit action in one place. Use `↑`, `↓`, `j`, or `k` to select, `Enter` to run, and `:` or `Esc` to close it.
-- `n` creates a queue. `e` edits the selected queue when the queue pane is focused, or the selected task otherwise. `x` removes the selected queue or cleans a terminal task's retained worktree.
+- `n` creates a queue. `e` edits the selected queue when the queue pane is focused, or the selected task otherwise. `x` deletes the selected queue or inactive task, and `X` cleans a terminal task's retained worktree.
 - Task shortcuts are `a` add, `c` cancel, `r` retry, `s` resume, `d` manually complete, and `v` view attempts.
 - `f` cycles the task-status filter, `g` toggles local/all-repository scope, `R` refreshes, `?` opens keyboard help, and `q` quits. `Esc` closes help, forms, results, and confirmation prompts.
 
 Queue creation collects the name, repository path, optional base ref, provider, planning model and instructions, implementation model and instructions, concurrency, maximum attempts, verification commands, and auto-commit policy. Enter multiple verification commands separated by `;`; a blank stage model uses the provider default. Queue editing exposes the same settings while showing its repository as read-only. Task and queue forms use large, individually bordered fields with a focus-following viewport on shorter terminals, so inputs remain comfortable instead of collapsing into compact rows. In all forms, use `Tab` and `Shift+Tab` to move between fields, arrow keys to change selectors, `Ctrl+N` to insert a newline in a multiline field, `Ctrl+U` to clear the current editable field, `Ctrl+S` to save, and `Esc` to cancel.
 
-Destructive and consequential actions are explicit. Queue removal, task cancellation or retry, and provider-instruction installation require confirmation (`y`/`Enter` accepts; `n`/`Esc` cancels). Worktree cleanup also asks whether to use safe or force removal; press `f` or an arrow key to toggle that choice. The doctor screen uses `R` to rerun checks, `c` for real Codex login, and `l` for real Claude Code login. agentq temporarily yields the terminal to the official provider CLI, then restores Ink and refreshes the checks. Integration can target Codex, Claude Code, or both and reports each instruction file as created, updated, or unchanged. Attempt and integration-result screens close with `v`/`Esc` and `Enter`/`Esc`, respectively.
+Destructive and consequential actions are explicit. Task and queue deletion, task cancellation or retry, and provider-instruction installation require confirmation (`y`/`Enter` accepts; `n`/`Esc` cancels). Worktree cleanup also asks whether to use safe or force removal; press `f` or an arrow key to toggle that choice. Active work and retained worktrees block deletion, so cancel or finish active tasks and clean retained worktrees before deleting them. The doctor screen uses `R` to rerun checks, `c` for real Codex login, and `l` for real Claude Code login. agentq temporarily yields the terminal to the official provider CLI, then restores Ink and refreshes the checks. Integration can target Codex, Claude Code, or both and reports each instruction file as created, updated, or unchanged. Attempt and integration-result screens close with `v`/`Esc` and `Enter`/`Esc`, respectively.
 
 ## Adding tasks from Codex or Claude Code
 
@@ -207,6 +207,12 @@ An empty planner response or any Git-visible planner worktree change fails the p
 
 agentq never merges, pushes, or opens pull requests automatically.
 
+## Deleting tasks and queues safely
+
+Task and queue deletion require explicit confirmation in the Ink UI or `--yes` in the CLI. Deleting a task removes its attempts, events, and local logs. Deleting a queue atomically removes the queue and all of its inactive tasks, attempts, events, and local logs.
+
+Deletion refuses active work and any task that still has a retained worktree. Cancel or finish active tasks first, then run `agentq task clean <id> --yes` for each retained worktree before retrying deletion. This guard keeps agentq from orphaning an agent process or silently discarding an inspection/resume worktree. Both delete commands support `--json` for automation.
+
 ## Commands
 
 ```text
@@ -219,7 +225,7 @@ agentq queue create <name>          create a repository-backed queue
 agentq queue edit <queue>           change mutable queue configuration
 agentq queue list [--all]           list scoped queues or every repository
 agentq queue show <queue>           show queue and tasks
-agentq queue remove <queue> --yes   remove an empty queue
+agentq queue remove <queue> --yes   delete a queue and its inactive task history
 
 agentq task add                     add a task manually or with --stdin-json
 agentq task edit <id>               revise fields on a queued or retryable task
@@ -231,6 +237,7 @@ agentq task retry <id>              retry in a fresh session/worktree
 agentq task resume <id>             continue the latest retained agent stage/worktree
 agentq task complete <id>           mark non-running work complete manually
 agentq task clean <id> --yes        remove a terminal task's retained worktree
+agentq task remove <id> --yes       delete an inactive task and its history
 
 agentq run [queue] [--all]          run scoped queues or every repository
 agentq run [queue] --once            drain runnable work and exit

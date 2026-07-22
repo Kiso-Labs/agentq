@@ -36,4 +36,4 @@ Run phase, planner output, separate provider session IDs, and the four queue wor
 
 ## Git behavior
 
-Successful task changes may be committed on a dedicated local branch. Existing or resumed worktrees are identity-checked before use, and cleanup refuses paths outside agentq's managed worktree root. agentq never pushes, merges, deletes the source branch, or opens a pull request automatically. `task clean --force --yes` is the explicit destructive worktree cleanup operation.
+Successful task changes may be committed on a dedicated local branch. Existing or resumed worktrees are identity-checked before use, and cleanup refuses paths outside agentq's managed worktree root. Task and queue deletion is transactionally rejected while any affected task is active or retains a worktree; operators must use the explicit cleanup flow before deleting durable history. agentq never pushes, merges, deletes the source branch, or opens a pull request automatically. `task clean --force --yes` is the explicit destructive worktree cleanup operation.
