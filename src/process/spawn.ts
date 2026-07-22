@@ -61,6 +61,7 @@ interface WindowsJob {
 }
 
 const IDENTITY_HEARTBEAT_MS = 250;
+const IDENTITY_STARTUP_TIMEOUT_MS = process.platform === "win32" ? 10_000 : 3_000;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x0000_2000;
 const PROCESS_TERMINATE = 0x0000_0001;
@@ -451,7 +452,9 @@ async function waitForLauncherIdentity(
   token: string,
   path: string,
 ): Promise<ProcessIdentity> {
-  const deadline = Date.now() + 3_000;
+  // A cold PowerShell startup is needed to establish a Windows process start
+  // marker and can exceed three seconds on otherwise healthy CI/user machines.
+  const deadline = Date.now() + IDENTITY_STARTUP_TIMEOUT_MS;
   for (;;) {
     const lease = await readIdentityLease(path);
     if (

@@ -18,9 +18,14 @@ const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories
-      .splice(0)
-      .map((directory) => rm(directory, { force: true, recursive: true })),
+    temporaryDirectories.splice(0).map((directory) =>
+      rm(directory, {
+        force: true,
+        recursive: true,
+        maxRetries: 5,
+        retryDelay: 100,
+      }),
+    ),
   );
 });
 
@@ -282,19 +287,24 @@ describe("spawnProcess", () => {
       gated: true,
       identityDirectory: join(directory, "identities"),
     });
-    const identity = await child.identity;
-    if (!identity) throw new Error("Expected a gated process identity");
+    try {
+      const identity = await child.identity;
+      if (!identity) throw new Error("Expected a gated process identity");
 
-    await Bun.sleep(350);
-    expect(await Bun.file(sentinel).exists()).toBe(false);
-    expect(await matchesProcessIdentity(identity)).toBe(true);
-    expect(await matchesProcessIdentity({ ...identity, token: randomUUID() })).toBe(false);
+      await Bun.sleep(350);
+      expect(await Bun.file(sentinel).exists()).toBe(false);
+      expect(await matchesProcessIdentity(identity)).toBe(true);
+      expect(await matchesProcessIdentity({ ...identity, token: randomUUID() })).toBe(false);
 
-    await child.release();
-    expect((await child.completion).exitCode).toBe(0);
-    expect(await Bun.file(sentinel).text()).toBe("started");
-    expect(await Bun.file(identity.path).exists()).toBe(false);
-  });
+      await child.release();
+      expect((await child.completion).exitCode).toBe(0);
+      expect(await Bun.file(sentinel).text()).toBe("started");
+      expect(await Bun.file(identity.path).exists()).toBe(false);
+    } finally {
+      await child.cancel("test cleanup").catch(() => undefined);
+      await child.completion.catch(() => undefined);
+    }
+  }, 15_000);
 
   test("publishes concurrent provider release gates only after their tokens are complete", async () => {
     const directory = await temporaryDirectory();
