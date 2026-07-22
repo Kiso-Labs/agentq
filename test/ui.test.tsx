@@ -1418,11 +1418,10 @@ describe("AgentqApp", () => {
         dimensions={{ columns: 120, rows: 24 }}
       />,
     );
-    await settle();
+    const frame = await waitForFrame(view.lastFrame, "Agent output");
 
     expect(sanitizeTerminalText(dangerousTitle)).toBe("Visible red next");
     expect(sanitizeTerminalText(dangerousEvent)).toBe("Agent output");
-    const frame = view.lastFrame() ?? "";
     expect(frame).toContain("Visible red next");
     expect(frame).toContain("safe instructions");
     expect(frame).toContain("Agent output");
