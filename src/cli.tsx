@@ -204,7 +204,8 @@ queue
 
 queue
   .command("remove")
-  .description("Remove an empty queue")
+  .alias("rm")
+  .description("Delete a queue and all inactive tasks and history")
   .argument("<queue>")
   .option("--yes", "confirm removal")
   .option("--json", "print machine-readable JSON")
@@ -341,6 +342,23 @@ task
       const current = await app.getTask(taskId);
       const edited = await app.editTask(taskId, patch, current.updatedAt);
       print(edited, options.json, `Updated ${taskId}: ${human(edited.title)}`);
+    });
+  });
+
+task
+  .command("remove")
+  .alias("rm")
+  .description("Delete an inactive task, attempts, logs, and events")
+  .argument("<task-id>")
+  .option("--yes", "confirm deletion")
+  .option("--json", "print machine-readable JSON")
+  .action(async (taskId, options) => {
+    if (!options.yes) {
+      throw new AgentQError("Task removal requires --yes", "CONFIRMATION_REQUIRED", 2);
+    }
+    await withApp(async (app) => {
+      await app.deleteTask(taskId);
+      print({ removed: true, task: taskId }, options.json, `Removed task ${human(taskId)}`);
     });
   });
 

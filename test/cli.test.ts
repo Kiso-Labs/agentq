@@ -197,6 +197,28 @@ describe("agentq CLI", () => {
     expect(JSON.parse(retried.stdout).status).toBe("queued");
     const completed = await cli(stateDir, ["task", "complete", task.id, "--json"]);
     expect(JSON.parse(completed.stdout).status).toBe("succeeded");
+
+    const unconfirmedTaskRemoval = await cli(stateDir, ["task", "remove", task.id, "--json"]);
+    expect(unconfirmedTaskRemoval.exitCode).toBe(2);
+    expect(unconfirmedTaskRemoval.stderr).toContain("Task removal requires --yes");
+    const removedTask = await cli(stateDir, ["task", "remove", task.id, "--yes", "--json"]);
+    expect(JSON.parse(removedTask.stdout)).toEqual({ removed: true, task: task.id });
+
+    const queuedForCascade = await cli(stateDir, [
+      "task",
+      "add",
+      "Cascade me",
+      "--queue",
+      "work",
+      "--json",
+    ]);
+    const queuedTaskId = (JSON.parse(queuedForCascade.stdout) as { id: string }).id;
+    const removedQueue = await cli(stateDir, ["queue", "remove", "work", "--yes", "--json"]);
+    expect(JSON.parse(removedQueue.stdout)).toEqual({ removed: true, queue: "work" });
+    const missingTask = await cli(stateDir, ["task", "show", queuedTaskId, "--json"]);
+    expect(missingTask.exitCode).toBe(1);
+    expect(missingTask.stderr).toContain("Task not found");
+
     const removed = await cli(stateDir, ["queue", "remove", "empty", "--yes", "--json"]);
     expect(JSON.parse(removed.stdout)).toEqual({ removed: true, queue: "empty" });
   });
