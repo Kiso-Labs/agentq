@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -10,8 +10,16 @@ import { WorktreeManager } from "../src/git/worktrees.ts";
 
 const roots: string[] = [];
 
+// Git worktree setup is noticeably slower on Windows CI. Keep the timeout local
+// to this integration-test file so a healthy Git process is not killed midway.
+setDefaultTimeout(15_000);
+
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await Promise.all(
+    roots
+      .splice(0)
+      .map((root) => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })),
+  );
 });
 
 async function fixture() {
