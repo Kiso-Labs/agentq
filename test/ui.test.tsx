@@ -1229,6 +1229,8 @@ describe("AgentqApp", () => {
     await settle();
     view.stdin.write("a");
     await settle();
+    expect(view.lastFrame()).not.toContain("main▏");
+    expect(view.lastFrame()).toContain("←→ choose");
 
     const fields = [
       "Queue",
@@ -1252,6 +1254,7 @@ describe("AgentqApp", () => {
       }
     }
     expect(view.lastFrame()).toContain("esc cancel");
+    expect(view.lastFrame()).toContain("ctrl+s submit");
   });
 
   test("scrolls the large edit-task fields with focus and keeps multiline fields tall", async () => {
@@ -1281,6 +1284,40 @@ describe("AgentqApp", () => {
         await settle();
       }
     }
+    expect(view.lastFrame()).toContain("ctrl+s save");
+    expect(view.lastFrame()).toContain("esc cancel");
+  });
+
+  test("keeps the input tail and primary actions visible while typing long task text", async () => {
+    const view = render(
+      <AgentqApp controller={createController()} dimensions={{ columns: 44, rows: 16 }} />,
+    );
+    await settle();
+    view.stdin.write("a");
+    await settle();
+
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write(`${"title-".repeat(20)}TITLETAIL`);
+    await settle();
+    expect(view.lastFrame()).toContain("TITLETAIL");
+
+    view.stdin.write("\u0015");
+    await settle();
+    view.stdin.write(`${"界".repeat(27)}UNICODETAIL`);
+    await settle();
+    expect(view.lastFrame()).toContain("UNICODETAIL");
+
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write(`${"instruction-".repeat(30)}INSTRUCTIONTAIL`);
+    await settle();
+    const frame = view.lastFrame() ?? "";
+    expect(frame).toContain("INSTRUCTIONTAIL");
+    expect(frame).toContain("ctrl+s submit");
+    expect(frame).toContain("esc cancel");
   });
 
   test("scrolls the large create-queue fields with focus", async () => {
@@ -1310,6 +1347,8 @@ describe("AgentqApp", () => {
         await settle();
       }
     }
+    expect(view.lastFrame()).toContain("ctrl+s save");
+    expect(view.lastFrame()).toContain("esc cancel");
   });
 
   test("scrolls every editable queue field and presents repository as a bordered read-only field", async () => {

@@ -1,5 +1,6 @@
 import { Box, Text, useApp, useInput, useWindowSize } from "ink";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import stringWidth from "string-width";
 import {
   canCancelTask,
   canCompleteTaskManually,
@@ -660,6 +661,7 @@ interface FormField {
   focused?: boolean;
   focusable?: boolean;
   multiline?: boolean;
+  textInput?: boolean;
 }
 
 interface FormScreenProps {
@@ -673,6 +675,75 @@ interface FormScreenProps {
 }
 
 const formFieldHeight = (field: FormField): number => (field.multiline ? 6 : 4);
+
+const formGraphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+const splitFormGraphemes = (value: string): string[] =>
+  Array.from(formGraphemes.segment(value), ({ segment }) => segment);
+
+const takeFormTail = (value: string, width: number): string => {
+  const tail: string[] = [];
+  let used = 0;
+  for (const grapheme of splitFormGraphemes(value).reverse()) {
+    const graphemeWidth = stringWidth(grapheme);
+    if (used + graphemeWidth > width) break;
+    tail.push(grapheme);
+    used += graphemeWidth;
+  }
+  return tail.reverse().join("");
+};
+
+const wrapFormValue = (value: string, width: number): string[] => {
+  const lines: string[] = [];
+  for (const logicalLine of value.split("\n")) {
+    const graphemes = splitFormGraphemes(logicalLine);
+    if (graphemes.length === 0) {
+      lines.push("");
+      continue;
+    }
+
+    let line = "";
+    let used = 0;
+    for (const grapheme of graphemes) {
+      const graphemeWidth = stringWidth(grapheme);
+      if (line && used + graphemeWidth > width) {
+        lines.push(line);
+        line = "";
+        used = 0;
+      }
+      line += grapheme;
+      used += graphemeWidth;
+    }
+    if (line) lines.push(line);
+  }
+  return lines;
+};
+
+const focusedFormValue = (value: string, width: number, height: number): string => {
+  const wrapped = wrapFormValue(value, width);
+  const clipped = wrapped.length > height;
+  const visible = wrapped.slice(-height);
+  if (visible.length === 0) visible.push("");
+
+  const marker = "…";
+  const cursor = "▏";
+  const markerWidth = stringWidth(marker);
+  const cursorWidth = stringWidth(cursor);
+  if (clipped && visible.length === 1) {
+    const contentWidth = Math.max(0, width - markerWidth - cursorWidth);
+    return `${marker}${takeFormTail(visible[0] ?? "", contentWidth)}${cursor}`;
+  }
+
+  if (clipped) {
+    const contentWidth = Math.max(0, width - markerWidth);
+    visible[0] = `${marker}${takeFormTail(visible[0] ?? "", contentWidth)}`;
+  }
+
+  const lastIndex = visible.length - 1;
+  const contentWidth = Math.max(0, width - cursorWidth);
+  visible[lastIndex] = `${takeFormTail(visible[lastIndex] ?? "", contentWidth)}${cursor}`;
+  return visible.join("\n");
+};
 
 const visibleFormFields = (
   fields: FormField[],
@@ -725,13 +796,16 @@ function FormScreen({ columns, rows, title, subtitle, fields, error, footer }: F
   const visible = visibleFormFields(fields, focusedIndex, viewportHeight);
   const hiddenAbove = visible.start;
   const hiddenBelow = fields.length - visible.end;
+  const formWidth = Math.max(1, Math.min(columns - 2, 96));
+  const horizontalPadding = columns >= 50 ? 2 : 1;
+  const fieldTextWidth = Math.max(1, formWidth - horizontalPadding * 2 - 4);
 
   return (
     <Box width={columns} height={rows} alignItems="center" overflow="hidden">
       <Box
-        width={Math.max(1, Math.min(columns - 2, 96))}
+        width={formWidth}
         height={rows}
-        paddingX={columns >= 50 ? 2 : 1}
+        paddingX={horizontalPadding}
         flexDirection="column"
         overflow="hidden"
       >
@@ -747,13 +821,17 @@ function FormScreen({ columns, rows, title, subtitle, fields, error, footer }: F
           {subtitle}
         </Text>
         <Text dimColor wrap="truncate-end">
-          Showing {visible.start + 1}–{visible.end} of {fields.length}
+          Showing {visible.start + 1}–{visible.end} of {fields.length} rows
           {hiddenAbove > 0 ? ` · ↑ ${hiddenAbove} hidden` : ""}
           {hiddenBelow > 0 ? ` · ↓ ${hiddenBelow} hidden` : ""}
         </Text>
         <Box height={viewportHeight} flexDirection="column" overflow="hidden">
           {visible.fields.map((field) => {
             const value = sanitizeTerminalText(field.value);
+            const displayValue =
+              field.focused && field.textInput
+                ? focusedFormValue(value, fieldTextWidth, field.multiline ? 3 : 1)
+                : value || " ";
             return (
               <Box key={field.label} flexDirection="column">
                 <Text bold color={field.focused ? "cyan" : "gray"} wrap="truncate-end">
@@ -766,9 +844,7 @@ function FormScreen({ columns, rows, title, subtitle, fields, error, footer }: F
                   paddingX={1}
                   overflow="hidden"
                 >
-                  <Text wrap={field.multiline ? "wrap" : "truncate-end"}>
-                    {value || (field.focused ? "▏" : " ")}
-                  </Text>
+                  <Text wrap={field.multiline ? "wrap" : "truncate-end"}>{displayValue}</Text>
                 </Box>
               </Box>
             );
@@ -2274,33 +2350,43 @@ export function AgentqApp({
     const fields: FormField[] =
       queueDraft.kind === "create"
         ? [
-            { label: "Name", value: queueDraft.name, focused: queueDraft.field === 0 },
+            {
+              label: "Name",
+              value: queueDraft.name,
+              focused: queueDraft.field === 0,
+              textInput: true,
+            },
             {
               label: "Repository",
               value: queueDraft.repoPath,
               focused: queueDraft.field === 1,
+              textInput: true,
             },
             {
               label: "Base ref",
               value: queueDraft.baseRef || "auto (current branch)",
               focused: queueDraft.field === 2,
+              textInput: true,
             },
             { label: "Provider", value: provider, focused: queueDraft.field === 3 },
             {
               label: "Concurrency",
               value: queueDraft.concurrency,
               focused: queueDraft.field === 4,
+              textInput: true,
             },
             {
               label: "Max attempts",
               value: queueDraft.maxAttempts,
               focused: queueDraft.field === 5,
+              textInput: true,
             },
             {
               label: "Verify commands",
               value: queueDraft.verifyCommands || "none",
               focused: queueDraft.field === 6,
               multiline: true,
+              textInput: true,
             },
             {
               label: "Auto-commit",
@@ -2309,25 +2395,38 @@ export function AgentqApp({
             },
           ]
         : [
-            { label: "Name", value: queueDraft.name, focused: queueDraft.field === 0 },
+            {
+              label: "Name",
+              value: queueDraft.name,
+              focused: queueDraft.field === 0,
+              textInput: true,
+            },
             { label: "Repository (read-only)", value: queueDraft.repoPath, focusable: false },
-            { label: "Base ref", value: queueDraft.baseRef, focused: queueDraft.field === 1 },
+            {
+              label: "Base ref",
+              value: queueDraft.baseRef,
+              focused: queueDraft.field === 1,
+              textInput: true,
+            },
             { label: "Provider", value: provider, focused: queueDraft.field === 2 },
             {
               label: "Concurrency",
               value: queueDraft.concurrency,
               focused: queueDraft.field === 3,
+              textInput: true,
             },
             {
               label: "Max attempts",
               value: queueDraft.maxAttempts,
               focused: queueDraft.field === 4,
+              textInput: true,
             },
             {
               label: "Verify commands",
               value: queueDraft.verifyCommands || "none",
               focused: queueDraft.field === 5,
               multiline: true,
+              textInput: true,
             },
             {
               label: "Auto-commit",
@@ -2347,7 +2446,7 @@ export function AgentqApp({
         }
         fields={fields}
         error={queueDraft.error}
-        footer="tab fields · arrows provider/toggle · commands separated by ; · ctrl+u clear · ctrl+s save · esc cancel"
+        footer="ctrl+s save · esc cancel · ←→ change · tab fields · ctrl+u clear · ; separates commands"
       />
     );
   }
@@ -2527,23 +2626,35 @@ export function AgentqApp({
             value: PROVIDERS[editDraft.providerIndex] ?? "No provider",
             focused: editDraft.field === 0,
           },
-          { label: "Priority", value: editDraft.priority, focused: editDraft.field === 1 },
-          { label: "Title", value: editDraft.title, focused: editDraft.field === 2 },
+          {
+            label: "Priority",
+            value: editDraft.priority,
+            focused: editDraft.field === 1,
+            textInput: true,
+          },
+          {
+            label: "Title",
+            value: editDraft.title,
+            focused: editDraft.field === 2,
+            textInput: true,
+          },
           {
             label: "Instructions",
             value: editDraft.instructions,
             focused: editDraft.field === 3,
             multiline: true,
+            textInput: true,
           },
           {
             label: "Acceptance criteria",
             value: editDraft.acceptanceCriteria,
             focused: editDraft.field === 4,
             multiline: true,
+            textInput: true,
           },
         ]}
         error={editDraft.error}
-        footer="tab next · arrows provider · ctrl+u clear · enter advance/submit · ctrl+s save · esc cancel"
+        footer="ctrl+s save · esc cancel · ←→ provider · enter next/submit · tab next · ctrl+u clear"
       />
     );
   }
@@ -2568,28 +2679,41 @@ export function AgentqApp({
             value: provider ?? "No provider",
             focused: draft.field === 1,
           },
-          { label: "Title", value: draft.title, focused: draft.field === 2 },
+          {
+            label: "Title",
+            value: draft.title,
+            focused: draft.field === 2,
+            textInput: true,
+          },
           {
             label: "Instructions",
             value: draft.instructions,
             focused: draft.field === 3,
             multiline: true,
+            textInput: true,
           },
-          { label: "Priority", value: draft.priority, focused: draft.field === 4 },
+          {
+            label: "Priority",
+            value: draft.priority,
+            focused: draft.field === 4,
+            textInput: true,
+          },
           {
             label: "Acceptance",
             value: draft.acceptanceCriteria,
             focused: draft.field === 5,
             multiline: true,
+            textInput: true,
           },
           {
             label: "Idempotency key",
             value: draft.idempotencyKey,
             focused: draft.field === 6,
+            textInput: true,
           },
         ]}
         error={draft.error}
-        footer="tab next · esc cancel · arrows choose · criteria separated by ; · ctrl+u clear · ctrl+s submit"
+        footer="ctrl+s submit · esc cancel · ←→ choose · tab next · ctrl+u clear · ; separates criteria"
       />
     );
   }
