@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveBinary, resolveCommandInvocation } from "../src/process/resolve-binary.ts";
+import { resolveBinary, resolveNpmCommandInvocation } from "../src/process/resolve-binary.ts";
 
 interface PackResult {
   files?: { path?: string }[];
@@ -11,7 +11,7 @@ const cache = await mkdtemp(join(tmpdir(), "agentq-npm-cache-"));
 try {
   const npm = resolveBinary({ name: "npm", envVar: "AGENTQ_NPM_BIN", from: import.meta.dir });
   if (!npm) throw new Error("npm is required to verify the package contents");
-  const invocation = resolveCommandInvocation(npm, [
+  const invocation = resolveNpmCommandInvocation(npm, [
     "pack",
     "--json",
     "--dry-run",

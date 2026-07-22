@@ -5,6 +5,7 @@ export {
   type ResolveBinaryOptions,
   resolveBinary,
   resolveCommandInvocation,
+  resolveNpmCommandInvocation,
 } from "./resolve-binary.ts";
 export {
   inspectProcessIdentity,

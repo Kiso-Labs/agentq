@@ -1,5 +1,5 @@
 import { accessSync, constants, readFileSync, statSync } from "node:fs";
-import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 export interface ResolveBinaryOptions {
   name: string;
@@ -228,6 +228,41 @@ export function resolveCommandInvocation(
     return { command, args: [...args] };
   }
   return npmShimInvocation(resolve(command), args, env);
+}
+
+/**
+ * Return a shell-free npm invocation, including Node's Windows distribution layout.
+ *
+ * The npm launcher shipped beside `node.exe` is not the same shim format generated for
+ * package binaries. Its stable target is the adjacent `node_modules/npm/bin/npm-cli.js`.
+ */
+export function resolveNpmCommandInvocation(
+  command: string,
+  args: readonly string[] = [],
+  env: NodeJS.ProcessEnv = process.env,
+  /** @internal Allows the Windows layout to be exercised on other CI hosts. */
+  platform: NodeJS.Platform = process.platform,
+): CommandInvocation {
+  if (platform === "win32" && /^npm\.cmd$/i.test(basename(command))) {
+    const installationDirectory = dirname(resolve(command));
+    const cli = join(installationDirectory, "node_modules", "npm", "bin", "npm-cli.js");
+    if (isExecutable(cli, platform)) {
+      const node = firstExecutable(
+        [
+          join(installationDirectory, "node"),
+          ...pathCandidates("node", environmentValue(env, "PATH", platform)),
+        ],
+        env,
+        platform,
+      );
+      if (!node) {
+        throw new Error(`Cannot safely launch npm because Node.js was not found beside ${command}`);
+      }
+      return { command: node, args: [cli, ...args] };
+    }
+  }
+
+  return resolveCommandInvocation(command, args, env, platform);
 }
 
 /** Resolve an agent CLI without invoking a shell. Explicit invalid overrides fail closed. */

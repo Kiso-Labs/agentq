@@ -10,6 +10,7 @@ import {
   matchesProcessIdentity,
   resolveBinary,
   resolveCommandInvocation,
+  resolveNpmCommandInvocation,
   spawnProcess,
 } from "../src/process/index.ts";
 
@@ -133,8 +134,8 @@ describe("resolveBinary", () => {
 
   test("unwraps npm Windows command shims into a shell-free argv", async () => {
     const directory = await temporaryDirectory();
-    const shim = join(directory, "agent-tool.cmd");
-    const target = join(directory, "agent-tool.js");
+    const shim = join(directory, "npm.cmd");
+    const target = join(directory, "npm-cli.js");
     await writeFile(target, "console.log('ok');\n");
     await writeFile(
       shim,
@@ -153,7 +154,7 @@ describe("resolveBinary", () => {
         '  SET "_prog=node"',
         ")",
         "",
-        'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\agent-tool.js" %*',
+        'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\npm-cli.js" %*',
         "",
       ].join("\r\n"),
     );
@@ -162,6 +163,9 @@ describe("resolveBinary", () => {
     const invocation = resolveCommandInvocation(shim, [hostileArgument], { PATH: "" }, "win32");
 
     expect(invocation).toEqual({ command: "node", args: [target, hostileArgument] });
+    expect(resolveNpmCommandInvocation(shim, [hostileArgument], { PATH: "" }, "win32")).toEqual(
+      invocation,
+    );
   });
 
   test("unwraps npm Windows shims that directly target a provider executable", async () => {
@@ -189,6 +193,32 @@ describe("resolveBinary", () => {
     expect(resolveCommandInvocation(shim, ["--version"], {}, "win32")).toEqual({
       command: target,
       args: ["--version"],
+    });
+  });
+
+  test("launches Node's Windows npm distribution without a command shell", async () => {
+    const directory = await temporaryDirectory();
+    const shim = join(directory, "npm.CMD");
+    const node = join(directory, "node.EXE");
+    const cli = join(directory, "node_modules", "npm", "bin", "npm-cli.js");
+    await mkdir(join(directory, "node_modules", "npm", "bin"), { recursive: true });
+    await writeFile(
+      shim,
+      [
+        ":: Created by npm, please don't edit manually.",
+        "@ECHO OFF",
+        'SET "NODE_EXE=%~dp0\\node.exe"',
+        'SET "NPM_CLI_JS=%~dp0\\node_modules\\npm\\bin\\npm-cli.js"',
+        '"%NODE_EXE%" "%NPM_CLI_JS%" %*',
+      ].join("\r\n"),
+    );
+    await writeFile(node, "placeholder executable");
+    await writeFile(cli, "console.log('npm');\n");
+
+    const hostileArgument = "literal & echo never-runs";
+    expect(resolveNpmCommandInvocation(shim, ["pack", hostileArgument], {}, "win32")).toEqual({
+      command: node,
+      args: [cli, "pack", hostileArgument],
     });
   });
 });
