@@ -208,6 +208,34 @@ describe("AgentQApp", () => {
     unsubscribe();
   });
 
+  test("deletes an inactive task while refusing to delete active work", async () => {
+    const value = await fixture();
+    const queue = await value.app.createQueue({ name: "delete-tasks", repoPath: value.firstRepo });
+    const removable = await value.app.addTask({ queue: queue.id, title: "Remove me" });
+    const active = await value.app.addTask({ queue: queue.id, title: "Keep active work" });
+    const claim = value.app.store.claimNextTask({ queue: queue.id });
+    if (!claim || claim.task.id !== removable.id) throw new Error("Expected the first task claim");
+    value.app.store.finishRun(claim.run.id, { status: "cancelled" });
+    const activeClaim = value.app.store.claimNextTask({ queue: queue.id });
+    if (!activeClaim || activeClaim.task.id !== active.id) throw new Error("Expected active claim");
+
+    const notifications: string[] = [];
+    const unsubscribe = value.app.subscribe(() => notifications.push("changed"));
+
+    await value.app.deleteTask(removable.id);
+    await expect(value.app.getTask(removable.id)).rejects.toMatchObject({
+      code: "TASK_NOT_FOUND",
+    } satisfies Partial<AgentQError>);
+    expect(notifications).toHaveLength(1);
+
+    await expect(value.app.deleteTask(active.id)).rejects.toMatchObject({
+      code: "TASK_ACTIVE",
+    } satisfies Partial<AgentQError>);
+    expect((await value.app.getTask(active.id)).status).toBe("starting");
+    expect(notifications).toHaveLength(1);
+    unsubscribe();
+  });
+
   test("lists run history and resumes only a session from the task's current provider", async () => {
     const value = await fixture();
     const queue = await value.app.createQueue({

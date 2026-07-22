@@ -230,6 +230,13 @@ export class AgentQApp implements UiController {
     return task;
   }
 
+  async deleteTask(taskId: string): Promise<void> {
+    if (!this.store.deleteTask(taskId)) {
+      throw new AgentQError(`Task not found: ${taskId}`, "TASK_NOT_FOUND");
+    }
+    this.notify();
+  }
+
   async listEvents(
     taskId: string,
     options?: { afterId?: number; limit?: number },
