@@ -873,22 +873,22 @@ describe("AgentqApp", () => {
     const view = render(
       <AgentqApp controller={failedController} dimensions={{ columns: 90, rows: 24 }} />,
     );
+    await waitForFrame(view.lastFrame, "[FAILED]");
     await settle();
 
     view.stdin.write("r");
+    await waitForFrame(view.lastFrame, "RETRY TASK?");
     await settle();
-    expect(view.lastFrame()).toContain("RETRY TASK?");
     expect(retryTask).not.toHaveBeenCalled();
 
     view.stdin.write("\r");
+    await waitForFrame(view.lastFrame, "Retry queued for task-1");
     await settle();
     expect(retryTask).toHaveBeenCalledWith("task-1");
-    expect(view.lastFrame()).toContain("Retry queued for task-1");
 
     view.stdin.write("d");
-    await settle();
+    await waitForFrame(view.lastFrame, "Marked task-1 complete");
     expect(completeManualTask).toHaveBeenCalledWith("task-1");
-    expect(view.lastFrame()).toContain("Marked task-1 complete");
   });
 
   test("resumes tasks, shows immutable attempt specs, and offers safe or force cleanup", async () => {
