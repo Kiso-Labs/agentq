@@ -185,7 +185,9 @@ describe("AgentQStore", () => {
 
   afterEach(() => {
     for (const store of stores) store.close();
-    rmSync(stateDirectory, { recursive: true, force: true });
+    // Windows can briefly retain SQLite/WAL handles after a synchronous close.
+    // Bound the native EBUSY retry so persistent handle leaks still fail the test.
+    rmSync(stateDirectory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
 
   function open(): AgentQStore {
