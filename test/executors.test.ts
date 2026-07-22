@@ -35,6 +35,10 @@ function makeInput(cwd: string, overrides: Partial<ExecutorRunInput> = {}): Exec
     repoPath: cwd,
     baseRef: "main",
     defaultProvider: "codex",
+    planModel: "",
+    planInstructions: "",
+    implementModel: "",
+    implementInstructions: "",
     concurrency: 2,
     maxAttempts: 2,
     verifyCommands: [],
@@ -63,6 +67,7 @@ function makeInput(cwd: string, overrides: Partial<ExecutorRunInput> = {}): Exec
     queue,
     cwd,
     prompt: "Fix the bug and test it.",
+    phase: "implement",
     signal: new AbortController().signal,
     env: {},
     ...overrides,
@@ -92,15 +97,19 @@ describe("CodexStreamParser", () => {
     expect(events).toContainEqual({ type: "session", sessionId: "019abc" });
     expect(events).toContainEqual({
       type: "tool",
+      toolId: "item_0",
       name: "command",
       state: "started",
       detail: "bun test",
     });
     expect(events).toContainEqual({
       type: "tool",
+      toolId: "item_0",
       name: "command",
       state: "completed",
       detail: "bun test",
+      output: "pass",
+      exitCode: 0,
     });
     expect(events).toContainEqual({ type: "assistant", text: "Fixed the bug." });
     expect(events).toContainEqual({ type: "usage", inputTokens: 120, outputTokens: 30 });
@@ -161,15 +170,18 @@ describe("ClaudeStreamParser", () => {
     expect(events).toContainEqual({ type: "assistant", text: "I will inspect it." });
     expect(events).toContainEqual({
       type: "tool",
+      toolId: "tool-1",
       name: "Bash",
       state: "started",
       detail: '{"command":"bun test"}',
     });
     expect(events).toContainEqual({
       type: "tool",
+      toolId: "tool-1",
       name: "Bash",
       state: "completed",
       detail: "all tests passed",
+      output: "all tests passed",
     });
     expect(events).toContainEqual({
       type: "usage",
@@ -319,6 +331,8 @@ describe("CLI executors", () => {
 
     const execution = await executor.start(
       makeInput(directory, {
+        phase: "implement",
+        model: "gpt-builder",
         env: {
           AGENTQ_CAPTURE: capture,
           AGENTQ_FAKE_PROVIDER: "codex",
@@ -337,6 +351,8 @@ describe("CLI executors", () => {
         directory,
         "--sandbox",
         "workspace-write",
+        "--model",
+        "gpt-builder",
         "--add-dir",
         intake,
         "-",
@@ -358,6 +374,38 @@ describe("CLI executors", () => {
     });
   });
 
+  test("Codex runs the custom planner read-only with its configured model and no intake", async () => {
+    const directory = await temporaryDirectory();
+    const binary = await fakeProviderBinary(directory);
+    const capture = join(directory, "plan-capture.json");
+    const executor = new CodexExecutor({ binary });
+    const execution = await executor.start(
+      makeInput(directory, {
+        phase: "plan",
+        model: "gpt-planner",
+        env: {
+          AGENTQ_CAPTURE: capture,
+          AGENTQ_FAKE_PROVIDER: "codex",
+          AGENTQ_INTAKE_DIR: join(directory, "must-not-be-exposed"),
+        },
+      }),
+    );
+    await Promise.all([collect(execution.events), execution.completion]);
+
+    const invocation = JSON.parse(await Bun.file(capture).text());
+    expect(invocation.args).toEqual([
+      "exec",
+      "--json",
+      "-C",
+      directory,
+      "--sandbox",
+      "read-only",
+      "--model",
+      "gpt-planner",
+      "-",
+    ]);
+  });
+
   test("Claude resumes with safe autonomous flags and stdin", async () => {
     const directory = await temporaryDirectory();
     const binary = await fakeProviderBinary(directory);
@@ -365,6 +413,8 @@ describe("CLI executors", () => {
     const executor = new ClaudeExecutor({ binary });
     const execution = await executor.start(
       makeInput(directory, {
+        phase: "implement",
+        model: "claude-builder",
         resumeSessionId: "existing-session",
         env: { AGENTQ_CAPTURE: capture, AGENTQ_FAKE_PROVIDER: "claude" },
       }),
@@ -377,8 +427,12 @@ describe("CLI executors", () => {
       "--output-format",
       "stream-json",
       "--verbose",
+      "--model",
+      "claude-builder",
       "--permission-mode",
       "acceptEdits",
+      "--tools",
+      "Bash,Edit,Write,Read,Glob,Grep",
       "--allowedTools",
       "Bash,Edit,Write,Read,Glob,Grep",
       "--resume",
@@ -391,6 +445,35 @@ describe("CLI executors", () => {
       sessionId: "claude-session",
       summary: "Claude done",
     });
+  });
+
+  test("Claude runs a custom planner with only read tools and its configured model", async () => {
+    const directory = await temporaryDirectory();
+    const binary = await fakeProviderBinary(directory);
+    const capture = join(directory, "claude-plan-capture.json");
+    const executor = new ClaudeExecutor({ binary });
+    const execution = await executor.start(
+      makeInput(directory, {
+        phase: "plan",
+        model: "claude-planner",
+        env: { AGENTQ_CAPTURE: capture, AGENTQ_FAKE_PROVIDER: "claude" },
+      }),
+    );
+    await Promise.all([collect(execution.events), execution.completion]);
+
+    const invocation = JSON.parse(await Bun.file(capture).text());
+    expect(invocation.args).toEqual([
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--model",
+      "claude-planner",
+      "--tools",
+      "Read,Glob,Grep",
+      "--allowedTools",
+      "Read,Glob,Grep",
+    ]);
   });
 
   test("fails instead of inventing success when a provider omits its terminal event", async () => {

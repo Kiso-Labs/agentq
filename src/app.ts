@@ -275,19 +275,21 @@ export class AgentQApp implements UiController {
 
     await this.worktrees.withRepositoryLock(queue.repoPath, async () => {
       const task = await this.getTask(taskId);
-      const previous = this.store
-        .listRuns({ taskId })
-        .find(
-          (run) =>
-            run.provider === task.provider &&
-            run.providerSessionId &&
-            run.worktreePath &&
-            run.branchName &&
-            run.baseSha,
-        );
-      if (!previous?.providerSessionId || !previous.worktreePath) {
+      // Resume is deliberately pinned to the newest attempt. Falling back to
+      // an older session can discard a newer durable planner handoff.
+      const previous = this.store.listRuns({ taskId, limit: 1 })[0];
+      const resumableStage =
+        previous?.phase === "plan" ? previous.planSessionId : previous?.planOutput;
+      if (
+        !previous ||
+        previous.provider !== task.provider ||
+        !resumableStage ||
+        !previous.worktreePath ||
+        !previous.branchName ||
+        !previous.baseSha
+      ) {
         throw new AgentQError(
-          "No resumable provider session and worktree were retained for this task",
+          "The latest attempt has no resumable stage and retained worktree",
           "RUN_NOT_RESUMABLE",
         );
       }

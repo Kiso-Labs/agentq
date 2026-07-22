@@ -233,6 +233,23 @@ export class WorktreeManager {
     return head.stdout.trim() || undefined;
   }
 
+  async assertUnchanged(
+    worktreePath: string,
+    expectedHead: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const [head, status] = await Promise.all([
+      runGit(worktreePath, ["rev-parse", "HEAD"], { signal }),
+      runGit(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"], { signal }),
+    ]);
+    if (head.stdout.trim() !== expectedHead || status.stdout.trim()) {
+      throw new AgentQError(
+        "Planning agent modified the worktree; refusing to pass an untrusted handoff to implementation",
+        "PLANNER_MODIFIED_WORKTREE",
+      );
+    }
+  }
+
   async verify(
     worktreePath: string,
     commands: string[],

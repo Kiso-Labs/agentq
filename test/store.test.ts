@@ -162,6 +162,11 @@ function createVersion3Database(path: string): void {
       `)
       .run("run_v3", "task_v3", 1, "codex", "failed", at, at, at, 1, "Legacy run");
     database
+      .query(
+        "UPDATE tasks SET status = 'queued', completed_at = NULL, resume_run_id = ? WHERE id = ?",
+      )
+      .run("run_v3", "task_v3");
+    database
       .query(`
         INSERT INTO task_events(task_id, run_id, kind, payload, created_at)
         VALUES (?, ?, ?, ?, ?)
@@ -208,6 +213,12 @@ describe("AgentQStore", () => {
     const first = open();
     const queue = first.createQueue({ name: "build", repoKey: "repo", repoPath: "/repo" });
     expect(queue.baseRef).toBe("HEAD");
+    expect(queue).toMatchObject({
+      planModel: "",
+      planInstructions: "",
+      implementModel: "",
+      implementInstructions: "",
+    });
 
     const second = open();
     expect(second.getQueue("BUILD")?.id).toBe(queue.id);
@@ -220,7 +231,7 @@ describe("AgentQStore", () => {
       expect(
         inspection.query<CountRow, []>("SELECT COUNT(*) AS count FROM schema_migrations").get()
           ?.count,
-      ).toBe(4);
+      ).toBe(6);
     } finally {
       inspection.close();
     }
@@ -236,12 +247,22 @@ describe("AgentQStore", () => {
       name: "Build",
       repoKey: "/repos/legacy",
       repoPath: "/repos/legacy",
+      planModel: "",
+      planInstructions: "",
+      implementModel: "",
+      implementInstructions: "",
     });
     expect(store.getTask("task_v3")).toMatchObject({
       title: "Legacy task",
       acceptanceCriteria: ["Still present"],
+      status: "queued",
     });
-    expect(store.getRun("run_v3")).toMatchObject({ id: "run_v3", summary: "Legacy run" });
+    expect(store.getTask("task_v3")?.resumeRunId).toBeUndefined();
+    expect(store.getRun("run_v3")).toMatchObject({
+      id: "run_v3",
+      phase: "implement",
+      summary: "Legacy run",
+    });
     expect(store.getRun("run_v3")?.taskSnapshot).toBeUndefined();
     expect(store.listEvents({ taskId: "task_v3" })[0]).toMatchObject({
       runId: "run_v3",
@@ -356,6 +377,10 @@ describe("AgentQStore", () => {
       defaultProvider: "claude",
       concurrency: 3,
       maxAttempts: 5,
+      planModel: "gpt-5.4-mini",
+      planInstructions: "Identify the smallest safe change before handing off.",
+      implementModel: "gpt-5.4",
+      implementInstructions: "Prefer focused tests and preserve public APIs.",
       verifyCommands: ["bun test", "bun run typecheck"],
       autoCommit: true,
     });
@@ -364,14 +389,40 @@ describe("AgentQStore", () => {
     const updated = store.updateQueue(queue.id, {
       name: "product",
       concurrency: 2,
+      planModel: "gpt-5.4",
+      planInstructions: "Map the affected call paths.",
+      implementModel: "gpt-5.4-codex",
+      implementInstructions: "Keep commits reviewable.",
       verifyCommands: ["bun test"],
       autoCommit: false,
     });
     expect(updated).toMatchObject({
       name: "product",
       concurrency: 2,
+      planModel: "gpt-5.4",
+      planInstructions: "Map the affected call paths.",
+      implementModel: "gpt-5.4-codex",
+      implementInstructions: "Keep commits reviewable.",
       verifyCommands: ["bun test"],
       autoCommit: false,
+    });
+    expect(store.updateQueue(queue.id, { defaultProvider: "codex" })).toMatchObject({
+      defaultProvider: "codex",
+      planModel: "",
+      implementModel: "",
+      planInstructions: "Map the affected call paths.",
+      implementInstructions: "Keep commits reviewable.",
+    });
+    expect(
+      store.updateQueue(queue.id, {
+        defaultProvider: "claude",
+        planModel: "haiku",
+        implementModel: "sonnet",
+      }),
+    ).toMatchObject({
+      defaultProvider: "claude",
+      planModel: "haiku",
+      implementModel: "sonnet",
     });
     expect(() =>
       store.createQueue({ name: "PRODUCT", repoKey: "features-repo", repoPath: "/other" }),
@@ -790,6 +841,10 @@ describe("AgentQStore", () => {
       repoKey: "repo",
       repoPath: "/repo",
       maxAttempts: 1,
+      planModel: "planner-v1",
+      planInstructions: "Inspect dependencies first.",
+      implementModel: "builder-v1",
+      implementInstructions: "Run focused checks.",
     });
     const task = store.addTask({
       queue: queue.id,
@@ -807,6 +862,12 @@ describe("AgentQStore", () => {
       acceptanceCriteria: ["Original criterion"],
       provider: "codex",
       priority: 2,
+      workflow: {
+        planModel: "planner-v1",
+        planInstructions: "Inspect dependencies first.",
+        implementModel: "builder-v1",
+        implementInstructions: "Run focused checks.",
+      },
     });
     store.finishRun(first.run.id, { status: "failed", error: "Needs revision" });
 
@@ -834,6 +895,12 @@ describe("AgentQStore", () => {
       acceptanceCriteria: ["Revised criterion"],
       provider: "claude",
       priority: 8,
+      workflow: {
+        planModel: "",
+        planInstructions: "Inspect dependencies first.",
+        implementModel: "",
+        implementInstructions: "Run focused checks.",
+      },
     });
     expect(store.getRun(first.run.id)?.taskSnapshot).toEqual({
       title: "Original title",
@@ -841,7 +908,165 @@ describe("AgentQStore", () => {
       acceptanceCriteria: ["Original criterion"],
       provider: "codex",
       priority: 2,
+      workflow: {
+        planModel: "planner-v1",
+        planInstructions: "Inspect dependencies first.",
+        implementModel: "builder-v1",
+        implementInstructions: "Run focused checks.",
+      },
     });
+  });
+
+  test("durably advances one active run from planning to implementation", () => {
+    const store = open();
+    const queue = store.createQueue({
+      name: "pipeline",
+      repoKey: "repo",
+      repoPath: "/repo",
+      planModel: "planner",
+      implementModel: "builder",
+    });
+    const task = store.addTask({ queue: queue.id, title: "Pipeline task" });
+    const claim = store.claimNextTask({
+      queue: queue.id,
+      ownerToken: "pipeline-owner",
+      ownerPid: process.pid,
+    });
+    if (!claim) throw new Error("Expected pipeline claim");
+    expect(claim.run.phase).toBe("plan");
+
+    store.markRunRunning(
+      claim.run.id,
+      {
+        planSessionId: "plan-session",
+        pid: 123,
+        processToken: "plan-token",
+        processStartMarker: "plan-start",
+        processIdentityPath: "/tmp/plan-identity",
+      },
+      claim.leaseToken,
+    );
+    const advanced = store.advanceRunToImplementation(
+      claim.run.id,
+      {
+        planOutput: "Edit src/pipeline.ts and add a focused regression test.",
+        planSessionId: "plan-session",
+      },
+      claim.leaseToken,
+    );
+
+    expect(advanced).toMatchObject({
+      phase: "implement",
+      planOutput: "Edit src/pipeline.ts and add a focused regression test.",
+      planSessionId: "plan-session",
+      status: "running",
+    });
+    expect(advanced.pid).toBeUndefined();
+    expect(advanced.processToken).toBeUndefined();
+    expect(store.getTask(task.id)?.status).toBe("running");
+    expect(() =>
+      store.advanceRunToImplementation(
+        claim.run.id,
+        { planOutput: "second plan" },
+        claim.leaseToken,
+      ),
+    ).toThrow(AgentQError);
+  });
+
+  test("restores the saved pipeline phase and handoff for an explicit implementation resume", () => {
+    const store = open();
+    const queue = store.createQueue({
+      name: "implementation-resume",
+      repoKey: "repo",
+      repoPath: "/repo",
+      planModel: "planner-v1",
+      implementModel: "builder-v1",
+    });
+    const task = store.addTask({ queue: queue.id, title: "Resume implementation" });
+    const first = store.claimNextTask({
+      queue: queue.id,
+      ownerToken: "first-owner",
+      now: "2026-07-22T12:02:00Z",
+    });
+    if (!first) throw new Error("Expected first claim");
+    store.markRunRunning(
+      first.run.id,
+      {
+        planSessionId: "plan-session",
+        baseSha: "abc123",
+        branchName: "agentq/resume/task-a1",
+        worktreePath: "/tmp/resume-worktree",
+      },
+      first.leaseToken,
+    );
+    store.advanceRunToImplementation(
+      first.run.id,
+      { planOutput: "Edit src/resume.ts and run its focused test." },
+      first.leaseToken,
+    );
+    store.finishRun(
+      first.run.id,
+      { status: "failed", error: "Implementation did not start" },
+      first.leaseToken,
+    );
+
+    store.requeueTask(task.id, undefined, first.run.id);
+    const resumed = store.claimNextTask({
+      queue: queue.id,
+      ownerToken: "second-owner",
+      now: "2026-07-22T12:01:00Z",
+    });
+    if (!resumed) throw new Error("Expected resumed claim");
+    expect(resumed.run).toMatchObject({
+      phase: "implement",
+      planOutput: "Edit src/resume.ts and run its focused test.",
+      planSessionId: "plan-session",
+      taskSnapshot: {
+        workflow: { planModel: "planner-v1", implementModel: "builder-v1" },
+      },
+    });
+    expect(resumed.run.providerSessionId).toBeUndefined();
+    expect(store.listRuns({ taskId: task.id }).map((run) => run.id)).toEqual([
+      resumed.run.id,
+      first.run.id,
+    ]);
+  });
+
+  test("discards an invalid legacy resume intent and starts a fresh planning claim", () => {
+    const store = open();
+    const queue = store.createQueue({
+      name: "legacy-resume",
+      repoKey: "repo",
+      repoPath: "/repo",
+      planModel: "new-planner",
+    });
+    const task = store.addTask({ queue: queue.id, title: "Upgrade legacy resume" });
+    const first = store.claimNextTask({ queue: queue.id });
+    if (!first) throw new Error("Expected first claim");
+    store.markRunRunning(first.run.id, {
+      planSessionId: "legacy-session",
+      baseSha: "abc123",
+      branchName: "agentq/legacy/task-a1",
+      worktreePath: "/tmp/legacy-worktree",
+    });
+    store.finishRun(first.run.id, { status: "failed", error: "legacy failure" });
+    store.requeueTask(task.id, undefined, first.run.id);
+
+    const raw = new Database(databasePath);
+    raw
+      .query("UPDATE runs SET phase = 'implement', plan_output = NULL WHERE id = ?")
+      .run(first.run.id);
+    raw.close();
+
+    const fresh = store.claimNextTask({ queue: queue.id });
+    if (!fresh) throw new Error("Expected fresh claim");
+    expect(fresh.task.resumeRunId).toBeUndefined();
+    expect(fresh.run).toMatchObject({
+      phase: "plan",
+      taskSnapshot: { workflow: { planModel: "new-planner" } },
+    });
+    expect(fresh.run.planOutput).toBeUndefined();
+    expect(fresh.run.planSessionId).toBeUndefined();
   });
 
   test("enforces delegated child limits atomically after idempotency lookup", () => {
@@ -1139,6 +1364,14 @@ describe("AgentQStore", () => {
     const cancelling = store.requestCancellation(claim.task.id);
     expect(cancelling.status).toBe("cancelling");
     expect(store.getRun(claim.run.id)?.status).toBe("cancelling");
+    expect(() =>
+      store.advanceRunToImplementation(
+        claim.run.id,
+        { planOutput: "This plan must not be implemented after cancellation." },
+        claim.leaseToken,
+      ),
+    ).toThrow("being cancelled");
+    expect(store.getRun(claim.run.id)?.phase).toBe("plan");
     const finished = store.finishRun(claim.run.id, {
       status: "failed",
       error: "process interrupted",
@@ -1188,7 +1421,7 @@ describe("AgentQStore", () => {
     const first = store.claimNextTask({ queue: queue.id });
     if (!first) throw new Error("Expected initial claim");
     store.markRunRunning(first.run.id, {
-      providerSessionId: "session-1",
+      planSessionId: "session-1",
       worktreePath: "/tmp/worktree",
       branchName: "agentq/resume/task-a1",
       baseSha: "abc123",
@@ -1208,7 +1441,7 @@ describe("AgentQStore", () => {
     store.markRunRunning(
       resumed.run.id,
       {
-        providerSessionId: "session-2",
+        planSessionId: "session-2",
         worktreePath: "/tmp/worktree-2",
         branchName: "agentq/resume/task-a2",
         baseSha: "def456",
@@ -1280,6 +1513,14 @@ describe("AgentQStore", () => {
     expect(fenced.tasks[0]?.status).toBe("cancelling");
     expect(store.claimNextTask({ queue: queue.id })).toBeUndefined();
     expect(() => store.heartbeatRun(claim.run.id, undefined, "expired-owner")).toThrow(AgentQError);
+    for (const patch of [
+      { planSessionId: "stale-plan-session" },
+      { providerSessionId: "stale-implementation-session" },
+    ]) {
+      expect(() => store.updateRun(claim.run.id, patch, "expired-owner")).toThrow(AgentQError);
+    }
+    expect(store.getRun(claim.run.id)?.planSessionId).toBeUndefined();
+    expect(store.getRun(claim.run.id)?.providerSessionId).toBeUndefined();
 
     const finished = store.finishRun(
       claim.run.id,
@@ -1368,6 +1609,24 @@ describe("AgentQStore", () => {
     expect(store.counts().events).toBe(0);
     expect(store.deleteQueue(queue.id)).toBe(true);
     expect(store.counts().queues).toBe(0);
+  });
+
+  test("returns the newest limited event window while cursors continue forward", () => {
+    const store = open();
+    const queue = store.createQueue({ name: "event-window", repoKey: "repo", repoPath: "/repo" });
+    const task = store.addTask({ queue: queue.id, title: "stream a long run" });
+    const events = Array.from({ length: 5 }, (_, index) =>
+      store.appendEvent({
+        taskId: task.id,
+        kind: "assistant",
+        payload: { text: `event ${index + 1}` },
+      }),
+    );
+
+    expect(store.listEvents({ taskId: task.id, limit: 2 })).toEqual(events.slice(-2));
+    expect(store.listEvents({ taskId: task.id, afterId: events[0]?.id, limit: 2 })).toEqual(
+      events.slice(1, 3),
+    );
   });
 
   test("enables foreign keys on every store connection", () => {

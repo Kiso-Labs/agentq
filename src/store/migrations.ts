@@ -210,6 +210,42 @@ const migrations: readonly Migration[] = [
       }
     },
   },
+  {
+    version: 5,
+    name: "planning_and_implementation_pipeline",
+    up(database) {
+      database.run("ALTER TABLE queues ADD COLUMN plan_model TEXT NOT NULL DEFAULT ''");
+      database.run("ALTER TABLE queues ADD COLUMN plan_instructions TEXT NOT NULL DEFAULT ''");
+      database.run("ALTER TABLE queues ADD COLUMN implement_model TEXT NOT NULL DEFAULT ''");
+      database.run("ALTER TABLE queues ADD COLUMN implement_instructions TEXT NOT NULL DEFAULT ''");
+      // Existing runs predate the pipeline and therefore represent an
+      // implementation attempt. New claims explicitly start in `plan`.
+      database.run(
+        "ALTER TABLE runs ADD COLUMN phase TEXT NOT NULL DEFAULT 'implement' CHECK (phase IN ('plan', 'implement'))",
+      );
+      database.run("ALTER TABLE runs ADD COLUMN plan_output TEXT");
+      database.run("ALTER TABLE runs ADD COLUMN plan_session_id TEXT");
+    },
+  },
+  {
+    version: 6,
+    name: "discard_unplanned_legacy_resume_intents",
+    up(database) {
+      // A resume intent created before v5 points at an implementation run
+      // that cannot have a trustworthy planner handoff. Leave the task queued,
+      // but make its next claim start the mandatory pipeline from planning.
+      database.run(`
+        UPDATE tasks
+        SET resume_run_id = NULL
+        WHERE resume_run_id IN (
+          SELECT id
+          FROM runs
+          WHERE phase = 'implement'
+            AND (plan_output IS NULL OR trim(plan_output) = '')
+        )
+      `);
+    },
+  },
 ];
 
 interface VersionRow {

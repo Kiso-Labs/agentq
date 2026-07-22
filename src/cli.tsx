@@ -8,9 +8,10 @@ import { AgentQError, errorMessage } from "./core/errors.ts";
 import { resolvePaths } from "./core/paths.ts";
 import { type AddTaskInput, PROVIDERS, type Provider, TASK_STATUSES } from "./core/types.ts";
 import { findRepositoryContext } from "./git/repository.ts";
-import { hasDelegatedTaskIntake, submitDelegatedTask } from "./intake/delegated-tasks.ts";
+import { submitDelegatedTask } from "./intake/delegated-tasks.ts";
 import type { IntegrationTarget } from "./integrations/instructions.ts";
 import { Supervisor } from "./supervisor/supervisor.ts";
+import { activityEntries } from "./ui/activity.ts";
 import { renderAgentq } from "./ui/index.tsx";
 import { sanitizeTerminalText } from "./ui/sanitize.ts";
 import type { UiQueuePatch } from "./ui/types.ts";
@@ -39,6 +40,10 @@ queue
   .option("-r, --repo <path>", "Git repository", process.cwd())
   .option("-b, --base <ref>", "base branch or ref (defaults to current branch)")
   .option("-p, --provider <provider>", "default provider: codex or claude", parseProvider, "codex")
+  .option("--plan-model <model>", "model used by the planning agent")
+  .option("--plan-instructions <text>", "general instructions for the planning agent")
+  .option("--implement-model <model>", "model used by the implementation agent")
+  .option("--implement-instructions <text>", "general instructions for the implementation agent")
   .option("-c, --concurrency <number>", "parallel tasks for this queue", positiveInteger, 2)
   .option("--max-attempts <number>", "maximum attempts per task", positiveInteger, 2)
   .option("--verify <command>", "verification command; repeatable", collect, [])
@@ -51,6 +56,10 @@ queue
         repoPath: options.repo,
         baseRef: options.base,
         defaultProvider: options.provider,
+        planModel: options.planModel,
+        planInstructions: options.planInstructions,
+        implementModel: options.implementModel,
+        implementInstructions: options.implementInstructions,
         concurrency: options.concurrency,
         maxAttempts: options.maxAttempts,
         verifyCommands: options.verify,
@@ -71,6 +80,14 @@ queue
   .option("--name <name>", "replace the queue name")
   .option("-b, --base <ref>", "replace the base branch or ref")
   .option("-p, --provider <provider>", "replace the default provider", parseProvider)
+  .option("--plan-model <model>", "replace the planning-agent model")
+  .option("--clear-plan-model", "use the provider default for the planning agent")
+  .option("--plan-instructions <text>", "replace general planning-agent instructions")
+  .option("--clear-plan-instructions", "remove general planning-agent instructions")
+  .option("--implement-model <model>", "replace the implementation-agent model")
+  .option("--clear-implement-model", "use the provider default for the implementation agent")
+  .option("--implement-instructions <text>", "replace general implementation-agent instructions")
+  .option("--clear-implement-instructions", "remove general implementation-agent instructions")
   .option("-c, --concurrency <number>", "replace parallel task capacity", positiveInteger)
   .option("--max-attempts <number>", "replace maximum attempts per task", positiveInteger)
   .option("--verify <command>", "replace verification commands; repeatable", collectOptional)
@@ -79,6 +96,37 @@ queue
   .option("--no-auto-commit", "leave successful task changes uncommitted")
   .option("--json", "print machine-readable JSON")
   .action(async (queueRef, options) => {
+    const workflowConflicts = [
+      [options.planModel, options.clearPlanModel, "--plan-model", "--clear-plan-model"],
+      [
+        options.planInstructions,
+        options.clearPlanInstructions,
+        "--plan-instructions",
+        "--clear-plan-instructions",
+      ],
+      [
+        options.implementModel,
+        options.clearImplementModel,
+        "--implement-model",
+        "--clear-implement-model",
+      ],
+      [
+        options.implementInstructions,
+        options.clearImplementInstructions,
+        "--implement-instructions",
+        "--clear-implement-instructions",
+      ],
+    ] as const;
+    const workflowConflict = workflowConflicts.find(
+      ([value, clear]) => value !== undefined && clear,
+    );
+    if (workflowConflict) {
+      throw new AgentQError(
+        `Use either ${workflowConflict[2]} or ${workflowConflict[3]}, not both`,
+        "INVALID_QUEUE_EDIT",
+        2,
+      );
+    }
     if (options.verify && options.clearVerify) {
       throw new AgentQError(
         "Use either --verify or --clear-verify, not both",
@@ -90,6 +138,16 @@ queue
       name: options.name as string | undefined,
       baseRef: options.base as string | undefined,
       defaultProvider: options.provider as Provider | undefined,
+      planModel: options.clearPlanModel ? "" : (options.planModel as string | undefined),
+      planInstructions: options.clearPlanInstructions
+        ? ""
+        : (options.planInstructions as string | undefined),
+      implementModel: options.clearImplementModel
+        ? ""
+        : (options.implementModel as string | undefined),
+      implementInstructions: options.clearImplementInstructions
+        ? ""
+        : (options.implementInstructions as string | undefined),
       concurrency: options.concurrency as number | undefined,
       maxAttempts: options.maxAttempts as number | undefined,
       verifyCommands: options.clearVerify ? [] : (options.verify as string[] | undefined),
@@ -199,9 +257,10 @@ task
       throw new AgentQError("A task title is required", "TITLE_REQUIRED", 2);
 
     const taskInput = input as AddTaskInput;
-    const created = hasDelegatedTaskIntake()
-      ? await submitDelegatedTask(taskInput)
-      : await withApp((app) => app.addTask(taskInput));
+    const created =
+      process.env.AGENTQ_AGENT_CONTEXT === "1"
+        ? await submitDelegatedTask(taskInput)
+        : await withApp((app) => app.addTask(taskInput));
     print(
       created,
       options.json || options.stdinJson,
@@ -313,14 +372,14 @@ task
 
 task
   .command("resume")
-  .description("Resume the latest provider session in its retained worktree")
+  .description("Continue the latest resumable planning or implementation stage")
   .argument("<task-id>")
   .option("--json", "print machine-readable JSON")
   .action(async (taskId, options) => {
     await withApp(async (app) => {
       await app.resumeTask(taskId);
       const task = await app.getTask(taskId);
-      print(task, options.json, `Queued ${taskId} to resume its latest agent session`);
+      print(task, options.json, `Queued ${taskId} to continue its latest retained agent stage`);
     });
   });
 
@@ -351,11 +410,16 @@ task
         const events = app.store.listEvents({ taskId, afterId, limit: 500 });
         for (const event of events) {
           afterId = Math.max(afterId, event.id);
-          if (options.json) console.log(JSON.stringify(event));
-          else
-            console.log(
-              `${event.createdAt}  ${human(event.kind)}  ${human(formatPayload(event.payload))}`,
-            );
+        }
+        if (options.json) {
+          for (const event of events) console.log(JSON.stringify(event));
+        } else {
+          for (const entry of activityEntries(events)) {
+            console.log(`${entry.marker} ${entry.title}`);
+            for (const [index, detail] of entry.details.entries()) {
+              console.log(`  ${index === 0 ? "└ " : "  "}${detail}`);
+            }
+          }
         }
         if (!options.follow) break;
         const current = await app.getTask(taskId);
@@ -595,13 +659,6 @@ function printJson(value: unknown): void {
 
 function human(value: string): string {
   return sanitizeTerminalText(value);
-}
-
-function formatPayload(payload: Record<string, unknown>): string {
-  if (typeof payload.text === "string") return payload.text.replaceAll("\n", " ").slice(0, 180);
-  if (typeof payload.message === "string")
-    return payload.message.replaceAll("\n", " ").slice(0, 180);
-  return JSON.stringify(payload).slice(0, 180);
 }
 
 function signalController(): AbortController {

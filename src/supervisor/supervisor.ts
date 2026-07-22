@@ -3,9 +3,10 @@ import { appendFile, mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentQApp } from "../app.ts";
 import { AgentQError, errorMessage } from "../core/errors.ts";
-import { buildTaskPrompt } from "../core/prompt.ts";
-import type { Execution, ExecutorEvent, ExecutorResult, Task } from "../core/types.ts";
+import { buildImplementationPrompt, buildPlanningPrompt } from "../core/prompt.ts";
+import type { ExecutionPhase, ExecutorEvent, ExecutorResult, Queue, Task } from "../core/types.ts";
 import { createExecutorMap } from "../executors/index.ts";
+import type { PreparedWorktree } from "../git/worktrees.ts";
 import { DelegatedTaskIntake } from "../intake/delegated-tasks.ts";
 import {
   inspectProcessIdentity,
@@ -24,6 +25,12 @@ const MAX_GLOBAL_CONCURRENCY = 128;
 const DEFAULT_STALE_AFTER_MS = 30_000;
 const MIN_HARD_STALE_AFTER_MS = 15 * 60_000;
 const HARD_STALE_MULTIPLIER = 20;
+
+interface EventBudget {
+  events: number;
+  bytes: number;
+  limitReported: boolean;
+}
 
 export interface SupervisorOptions {
   queue?: string;
@@ -190,13 +197,11 @@ export class Supervisor {
   private async executeClaim(claim: TaskClaim, controller: AbortController): Promise<void> {
     const { queue, task, run } = claim;
     const logPath = join(this.app.paths.logsDir, task.id, `${run.id}.jsonl`);
-    let prepared: Awaited<ReturnType<typeof this.app.worktrees.prepare>> | undefined;
-    let sessionId: string | undefined;
-    let execution: Execution | undefined;
+    let prepared: PreparedWorktree | undefined;
     let intakeRegistered = false;
-    let persistedEvents = 0;
-    let persistedEventBytes = 0;
-    let outputLimitReported = false;
+    let activePhase: ExecutionPhase = run.phase;
+    let phaseFinished = false;
+    const eventBudget: EventBudget = { events: 0, bytes: 0, limitReported: false };
     const heartbeat = setInterval(() => {
       try {
         this.app.store.heartbeatRun(run.id, undefined, claim.leaseToken);
@@ -210,6 +215,12 @@ export class Supervisor {
       await this.log(logPath, { type: "run.claimed", taskId: task.id, runId: run.id });
 
       const resume = this.resumeContext(claim);
+      if (task.resumeRunId && !resume) {
+        throw new AgentQError(
+          "The retained stage can no longer be resumed safely",
+          "RUN_NOT_RESUMABLE",
+        );
+      }
       if (resume) {
         await this.app.worktrees.validateExisting(
           queue.repoPath,
@@ -226,30 +237,12 @@ export class Supervisor {
       } else {
         prepared = await this.app.worktrees.prepare(queue, task, run.attemptNo, controller.signal);
       }
-      const executor = this.executors.get(task.provider);
-      if (!executor) throw new Error(`No executor registered for provider ${task.provider}`);
-
-      const intakeDirectory = await this.intake.register(run.id, queue.id, task.id);
-      intakeRegistered = true;
-      execution = await executor.start({
-        runId: run.id,
-        task,
-        queue,
-        cwd: prepared.worktreePath,
-        prompt: buildTaskPrompt(task, queue),
-        resumeSessionId: resume?.providerSessionId,
-        deferStart: true,
-        signal: controller.signal,
-        env: this.agentEnvironment(task, run.id, queue.name, intakeDirectory),
-      });
-
-      this.app.store.markRunRunning(
+      // Persist the retained workspace before either provider starts. This
+      // keeps a saved implementation handoff resumable even if intake or
+      // process startup fails before a provider session is emitted.
+      this.app.store.updateRun(
         run.id,
         {
-          pid: execution.pid,
-          processToken: execution.processIdentity.token,
-          processStartMarker: execution.processIdentity.startMarker,
-          processIdentityPath: execution.processIdentity.path,
           baseSha: prepared.baseSha,
           branchName: prepared.branchName,
           worktreePath: prepared.worktreePath,
@@ -257,83 +250,162 @@ export class Supervisor {
         },
         claim.leaseToken,
       );
-      await execution.release();
-      if (resume) {
+      const workflow = run.taskSnapshot?.workflow ?? {
+        planModel: queue.planModel,
+        planInstructions: queue.planInstructions,
+        implementModel: queue.implementModel,
+        implementInstructions: queue.implementInstructions,
+      };
+      const executionQueue: Queue = { ...queue, ...workflow };
+      const executionTask: Task = run.taskSnapshot
+        ? {
+            ...task,
+            title: run.taskSnapshot.title,
+            instructions: run.taskSnapshot.instructions,
+            acceptanceCriteria: [...run.taskSnapshot.acceptanceCriteria],
+            provider: run.taskSnapshot.provider,
+            priority: run.taskSnapshot.priority,
+          }
+        : task;
+      let resumeConsumed = false;
+      let runStarted = false;
+      const consumeResume = async () => {
+        if (!resume || resumeConsumed) return;
         this.app.store.consumeResumeIntent(task.id, run.id, resume.id, claim.leaseToken);
+        resumeConsumed = true;
         try {
           this.app.store.appendEvent({
             taskId: task.id,
             runId: run.id,
             kind: "task.resume_consumed",
-            payload: { previousRunId: resume.id },
+            payload: { previousRunId: resume.id, phase: activePhase },
           });
         } catch {
           // Resume intent is already consumed atomically; this event is observability only.
         }
-      }
-      try {
-        this.app.store.appendEvent({
-          taskId: task.id,
-          runId: run.id,
-          kind: "run.started",
-          payload: {
-            provider: task.provider,
-            pid: execution.pid,
-            branchName: prepared.branchName,
-            worktreePath: prepared.worktreePath,
-          },
+      };
+
+      let planOutput = run.planOutput;
+      if (run.phase === "plan") {
+        activePhase = "plan";
+        phaseFinished = false;
+        const planned = await this.executeProviderPhase({
+          claim,
+          prepared,
+          task: executionTask,
+          queue: executionQueue,
+          phase: "plan",
+          model: workflow.planModel,
+          prompt: buildPlanningPrompt(executionTask, executionQueue),
+          resumeSessionId: resume?.phase === "plan" ? resume.sessionId : undefined,
+          logPath,
+          signal: controller.signal,
+          eventBudget,
+          emitRunStarted: !runStarted,
+          onReleased: consumeResume,
         });
-      } catch {
-        // The run row is authoritative if optional event persistence fails.
-      }
-      this.app.notify();
-
-      const consumeEvents = (async () => {
-        for await (const event of execution?.events ?? []) {
-          if (event.type === "session") {
-            sessionId = event.sessionId;
-            this.app.store.updateRun(run.id, { providerSessionId: sessionId }, claim.leaseToken);
-          }
-          const storedEvent = boundedExecutorEvent(event);
-          const eventBytes = Buffer.byteLength(JSON.stringify(storedEvent));
-          if (
-            persistedEvents >= MAX_PERSISTED_EVENTS ||
-            persistedEventBytes + eventBytes > MAX_PERSISTED_EVENT_BYTES
-          ) {
-            if (!outputLimitReported) {
-              outputLimitReported = true;
-              await this.persistExecutorEvent(task, run.id, logPath, {
-                type: "diagnostic",
-                level: "warning",
-                message: "Further provider events were omitted after the per-run output limit",
-              });
-            }
-            continue;
-          }
-          persistedEvents += 1;
-          persistedEventBytes += eventBytes;
-          await this.persistExecutorEvent(task, run.id, logPath, storedEvent);
+        runStarted = true;
+        if (planned.result.status !== "succeeded") {
+          await this.workflowPhase(claim, logPath, "plan", "failed", {
+            model: workflow.planModel,
+            message: planned.result.error,
+          });
+          phaseFinished = true;
+          const terminal = await this.finalizeSuccessfulOrFailed(
+            claim,
+            prepared,
+            planned.result,
+            undefined,
+            logPath,
+            controller.signal,
+          );
+          await this.completeClaim(claim, logPath, terminal.input, terminal.payload);
+          return;
         }
-      })();
+        planOutput = planned.result.summary?.trim();
+        if (!planOutput) {
+          throw new AgentQError(
+            "Planning agent completed without a usable implementation handoff",
+            "EMPTY_PLAN_OUTPUT",
+          );
+        }
+        await this.app.worktrees.assertUnchanged(
+          prepared.worktreePath,
+          prepared.baseSha,
+          controller.signal,
+        );
+        this.app.store.advanceRunToImplementation(
+          run.id,
+          { planOutput, ...(planned.sessionId ? { planSessionId: planned.sessionId } : {}) },
+          claim.leaseToken,
+        );
+        await this.workflowPhase(claim, logPath, "plan", "completed", {
+          model: workflow.planModel,
+          summary: truncate(planOutput),
+        });
+        phaseFinished = true;
+      }
 
-      const guardedEvents = consumeEvents.catch(async (error) => {
-        await execution?.cancel("Provider event persistence failed").catch(() => undefined);
-        throw error;
+      if (!planOutput?.trim()) {
+        throw new AgentQError(
+          "Implementation cannot start without a durable planner handoff",
+          "EMPTY_PLAN_OUTPUT",
+        );
+      }
+      planOutput = planOutput.trim();
+      activePhase = "implement";
+      phaseFinished = false;
+      const intakeDirectory = await this.intake.register(run.id, queue.id, task.id);
+      intakeRegistered = true;
+      const implemented = await this.executeProviderPhase({
+        claim,
+        prepared,
+        task: executionTask,
+        queue: executionQueue,
+        phase: "implement",
+        model: workflow.implementModel,
+        prompt: buildImplementationPrompt(executionTask, executionQueue, planOutput),
+        resumeSessionId: resume?.phase === "implement" ? resume.sessionId : undefined,
+        intakeDirectory,
+        logPath,
+        signal: controller.signal,
+        eventBudget,
+        emitRunStarted: !runStarted,
+        onReleased: consumeResume,
       });
-      const [result] = await Promise.all([execution.completion, guardedEvents]);
-      sessionId = result.sessionId ?? sessionId;
+      if (implemented.result.status !== "succeeded") {
+        await this.workflowPhase(claim, logPath, "implement", "failed", {
+          model: workflow.implementModel,
+          summary: implemented.result.summary,
+          message: implemented.result.error,
+        });
+        phaseFinished = true;
+        const terminal = await this.finalizeSuccessfulOrFailed(
+          claim,
+          prepared,
+          implemented.result,
+          implemented.sessionId,
+          logPath,
+          controller.signal,
+        );
+        await this.completeClaim(claim, logPath, terminal.input, terminal.payload);
+        return;
+      }
+      await this.workflowPhase(claim, logPath, "implement", "completed", {
+        model: workflow.implementModel,
+        summary: implemented.result.summary,
+      });
+      phaseFinished = true;
       const terminal = await this.finalizeSuccessfulOrFailed(
         claim,
         prepared,
-        result,
-        sessionId,
+        implemented.result,
+        implemented.sessionId,
         logPath,
         controller.signal,
       );
       await this.completeClaim(claim, logPath, terminal.input, terminal.payload);
     } catch (error) {
-      if (execution)
-        await execution.cancel("Run setup or supervision failed").catch(() => undefined);
       const currentTask = this.app.store.getTask(task.id);
       const userCancelled = currentTask?.cancelRequestedAt !== undefined;
       const shuttingDown = this.shutdownRuns.has(run.id) && !userCancelled;
@@ -342,13 +414,20 @@ export class Supervisor {
         : shuttingDown
           ? String(controller.signal.reason ?? "Supervisor stopped")
           : errorMessage(error);
+      if (!phaseFinished) {
+        await this.workflowPhase(claim, logPath, activePhase, "failed", { message }).catch(
+          () => undefined,
+        );
+      }
+      const persistedRun = this.app.store.getRun(run.id);
       await this.completeClaim(
         claim,
         logPath,
         {
           status: userCancelled ? "cancelled" : shuttingDown ? "interrupted" : "failed",
           error: message,
-          providerSessionId: sessionId,
+          providerSessionId:
+            activePhase === "implement" ? persistedRun?.providerSessionId : undefined,
           requeue: shuttingDown,
         },
         {
@@ -364,6 +443,149 @@ export class Supervisor {
         await this.intake.cleanup(run.id);
       }
       this.app.notify();
+    }
+  }
+
+  private async executeProviderPhase(input: {
+    claim: TaskClaim;
+    prepared: PreparedWorktree;
+    task: Task;
+    queue: Queue;
+    phase: ExecutionPhase;
+    model: string;
+    prompt: string;
+    resumeSessionId?: string;
+    intakeDirectory?: string;
+    logPath: string;
+    signal: AbortSignal;
+    eventBudget: EventBudget;
+    emitRunStarted: boolean;
+    onReleased(): Promise<void>;
+  }): Promise<{ result: ExecutorResult; sessionId?: string }> {
+    const { claim, prepared, task, queue, phase, logPath } = input;
+    const executor = this.executors.get(task.provider);
+    if (!executor) throw new Error(`No executor registered for provider ${task.provider}`);
+    let execution: Awaited<ReturnType<typeof executor.start>> | undefined;
+    let sessionId = input.resumeSessionId;
+    try {
+      execution = await executor.start({
+        runId: claim.run.id,
+        task,
+        queue,
+        cwd: prepared.worktreePath,
+        prompt: input.prompt,
+        phase,
+        model: input.model,
+        ...(input.resumeSessionId ? { resumeSessionId: input.resumeSessionId } : {}),
+        deferStart: true,
+        signal: input.signal,
+        env: this.agentEnvironment(task, claim.run.id, queue.name, phase, input.intakeDirectory),
+      });
+      const markedRun = this.app.store.markRunRunning(
+        claim.run.id,
+        {
+          pid: execution.pid,
+          processToken: execution.processIdentity.token,
+          processStartMarker: execution.processIdentity.startMarker,
+          processIdentityPath: execution.processIdentity.path,
+          baseSha: prepared.baseSha,
+          branchName: prepared.branchName,
+          worktreePath: prepared.worktreePath,
+          logPath,
+        },
+        claim.leaseToken,
+      );
+      const currentTask = this.app.store.getTask(task.id);
+      const currentRun = this.app.store.getRun(claim.run.id);
+      if (
+        markedRun.status === "cancelling" ||
+        currentRun?.status === "cancelling" ||
+        currentTask?.cancelRequestedAt ||
+        input.signal.aborted
+      ) {
+        await execution.cancel("Cancellation requested before provider release");
+        throw new AgentQError(
+          "Run was cancelled before the provider process was released",
+          "RUN_CANCELLING",
+        );
+      }
+      await execution.release();
+      await input.onReleased();
+      await this.workflowPhase(claim, logPath, phase, "started", {
+        provider: task.provider,
+        model: input.model,
+        pid: execution.pid,
+      });
+      if (input.emitRunStarted) {
+        try {
+          this.app.store.appendEvent({
+            taskId: task.id,
+            runId: claim.run.id,
+            kind: "run.started",
+            payload: {
+              provider: task.provider,
+              phase,
+              model: input.model,
+              pid: execution.pid,
+              branchName: prepared.branchName,
+              worktreePath: prepared.worktreePath,
+            },
+          });
+        } catch {
+          // The run row is authoritative if optional event persistence fails.
+        }
+      }
+      this.app.notify();
+
+      const activeExecution = execution;
+      const consumeEvents = (async () => {
+        for await (const event of activeExecution.events) {
+          if (event.type === "session") {
+            sessionId = event.sessionId;
+            this.app.store.updateRun(
+              claim.run.id,
+              phase === "plan" ? { planSessionId: sessionId } : { providerSessionId: sessionId },
+              claim.leaseToken,
+            );
+          }
+          const storedEvent = boundedExecutorEvent(event);
+          const eventBytes = Buffer.byteLength(JSON.stringify(storedEvent));
+          if (
+            input.eventBudget.events >= MAX_PERSISTED_EVENTS ||
+            input.eventBudget.bytes + eventBytes > MAX_PERSISTED_EVENT_BYTES
+          ) {
+            if (!input.eventBudget.limitReported) {
+              input.eventBudget.limitReported = true;
+              await this.persistExecutorEvent(task, claim.run.id, logPath, phase, {
+                type: "diagnostic",
+                level: "warning",
+                message: "Further provider events were omitted after the per-run output limit",
+              });
+            }
+            continue;
+          }
+          input.eventBudget.events += 1;
+          input.eventBudget.bytes += eventBytes;
+          await this.persistExecutorEvent(task, claim.run.id, logPath, phase, storedEvent);
+        }
+      })();
+      const guardedEvents = consumeEvents.catch(async (error) => {
+        await activeExecution.cancel("Provider event persistence failed").catch(() => undefined);
+        throw error;
+      });
+      const [result] = await Promise.all([activeExecution.completion, guardedEvents]);
+      sessionId = result.sessionId ?? sessionId;
+      if (sessionId) {
+        this.app.store.updateRun(
+          claim.run.id,
+          phase === "plan" ? { planSessionId: sessionId } : { providerSessionId: sessionId },
+          claim.leaseToken,
+        );
+      }
+      return { result, ...(sessionId ? { sessionId } : {}) };
+    } catch (error) {
+      await execution?.cancel("Run setup or supervision failed").catch(() => undefined);
+      throw error;
     }
   }
 
@@ -461,15 +683,34 @@ export class Supervisor {
     task: Task,
     runId: string,
     logPath: string,
+    phase: ExecutionPhase,
     event: ExecutorEvent,
   ): Promise<void> {
-    await this.log(logPath, event);
+    await this.log(logPath, { ...event, phase });
     this.app.store.appendEvent({
       taskId: task.id,
       runId,
       kind: `executor.${event.type}`,
-      payload: { ...event },
+      payload: { ...event, phase },
     });
+    this.app.notify();
+  }
+
+  private async workflowPhase(
+    claim: TaskClaim,
+    logPath: string,
+    phase: ExecutionPhase,
+    state: "started" | "completed" | "failed",
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    const eventPayload = { phase, state, ...payload };
+    this.app.store.appendEvent({
+      taskId: claim.task.id,
+      runId: claim.run.id,
+      kind: "workflow.phase",
+      payload: eventPayload,
+    });
+    await this.log(logPath, { type: "workflow.phase", ...eventPayload });
     this.app.notify();
   }
 
@@ -641,7 +882,8 @@ export class Supervisor {
     task: Task,
     runId: string,
     queueName: string,
-    intakeDirectory: string,
+    phase: ExecutionPhase,
+    intakeDirectory?: string,
   ): Record<string, string> {
     return {
       AGENTQ_STATE_DIR: this.app.paths.stateDir,
@@ -649,16 +891,22 @@ export class Supervisor {
       AGENTQ_TASK_ID: task.id,
       AGENTQ_RUN_ID: runId,
       AGENTQ_PROVIDER: task.provider,
+      AGENTQ_STAGE: phase,
       AGENTQ_AGENT_CONTEXT: "1",
-      AGENTQ_INTAKE_DIR: intakeDirectory,
+      ...(intakeDirectory ? { AGENTQ_INTAKE_DIR: intakeDirectory } : {}),
     };
   }
 
   private resumeContext(claim: TaskClaim) {
     if (!claim.task.resumeRunId) return undefined;
     const previous = this.app.store.getRun(claim.task.resumeRunId);
+    const sessionId =
+      previous?.phase === "plan" ? previous.planSessionId : previous?.providerSessionId;
+    const resumableStage =
+      previous?.phase === "plan" ? previous.planSessionId : previous?.planOutput;
     if (
-      !previous?.providerSessionId ||
+      !previous ||
+      !resumableStage ||
       !previous.worktreePath ||
       !previous.branchName ||
       !previous.baseSha ||
@@ -668,7 +916,8 @@ export class Supervisor {
     }
     return {
       id: previous.id,
-      providerSessionId: previous.providerSessionId,
+      phase: previous.phase,
+      sessionId,
       worktreePath: previous.worktreePath,
       branchName: previous.branchName,
       baseSha: previous.baseSha,
@@ -704,9 +953,11 @@ function boundedExecutorEvent(event: ExecutorEvent): ExecutorEvent {
     case "assistant":
       return { ...event, text: truncate(event.text, 256 * 1024) };
     case "tool":
-      return event.detail === undefined
-        ? event
-        : { ...event, detail: truncate(event.detail, 64 * 1024) };
+      return {
+        ...event,
+        ...(event.detail === undefined ? {} : { detail: truncate(event.detail, 64 * 1024) }),
+        ...(event.output === undefined ? {} : { output: truncate(event.output, 64 * 1024) }),
+      };
     case "diagnostic":
       return { ...event, message: truncate(event.message, 64 * 1024) };
     default:

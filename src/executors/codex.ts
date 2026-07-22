@@ -43,6 +43,10 @@ function codexToolDetail(item: Record<string, unknown>): string | undefined {
   );
 }
 
+function codexToolOutput(item: Record<string, unknown>): string | undefined {
+  return compactDetail(item.aggregated_output ?? item.output ?? item.result ?? item.error);
+}
+
 function failedTool(item: Record<string, unknown>): boolean {
   const status = asString(item.status);
   const exitCode = asNumber(item.exit_code ?? item.exitCode);
@@ -99,7 +103,20 @@ export class CodexStreamParser implements StreamParser {
             : type === "item.failed" || failedTool(item)
               ? "failed"
               : "completed";
-        events.push({ type: "tool", name, state, detail: codexToolDetail(item) });
+        const toolEvent: Extract<ExecutorEvent, { type: "tool" }> = {
+          type: "tool",
+          name,
+          state,
+        };
+        const toolId = asString(item.id);
+        const detail = codexToolDetail(item);
+        const output = type === "item.started" ? undefined : codexToolOutput(item);
+        const exitCode = asNumber(item.exit_code ?? item.exitCode);
+        if (toolId) toolEvent.toolId = toolId;
+        if (detail) toolEvent.detail = detail;
+        if (output) toolEvent.output = output;
+        if (exitCode !== undefined) toolEvent.exitCode = exitCode;
+        events.push(toolEvent);
       }
       return events;
     }
@@ -152,9 +169,18 @@ export class CodexExecutor extends CliExecutor {
   }
 
   protected arguments(input: ExecutorRunInput): string[] {
-    const base = ["exec", "--json", "-C", input.cwd, "--sandbox", "workspace-write"];
+    const base = [
+      "exec",
+      "--json",
+      "-C",
+      input.cwd,
+      "--sandbox",
+      input.phase === "plan" ? "read-only" : "workspace-write",
+    ];
+    const model = input.model?.trim();
+    if (model) base.push("--model", model);
     const intakeDirectory = input.env.AGENTQ_INTAKE_DIR;
-    if (intakeDirectory) base.push("--add-dir", intakeDirectory);
+    if (input.phase === "implement" && intakeDirectory) base.push("--add-dir", intakeDirectory);
     if (input.resumeSessionId) base.push("resume", input.resumeSessionId);
     base.push("-");
     return base;

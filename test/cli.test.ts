@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { AgentQStore } from "../src/store/index.ts";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -11,14 +12,20 @@ afterEach(async () => {
 const projectRoot = join(import.meta.dir, "..");
 const cliEntry = join(projectRoot, "src", "cli.tsx");
 
-async function cli(stateDir: string, args: string[], stdin?: string, cwd = projectRoot) {
+async function cli(
+  stateDir: string,
+  args: string[],
+  stdin?: string,
+  cwd = projectRoot,
+  env: NodeJS.ProcessEnv = {},
+) {
   const process = Bun.spawn({
     cmd: [Bun.which("bun") ?? "bun", cliEntry, "--state-dir", stateDir, ...args],
     cwd,
     stdin: stdin === undefined ? "ignore" : new Blob([stdin]),
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...globalThis.process.env, NO_COLOR: "1" },
+    env: { ...globalThis.process.env, NO_COLOR: "1", ...env },
   });
   const [stdout, stderr, exitCode] = await Promise.all([
     process.stdout.text(),
@@ -51,9 +58,30 @@ describe("agentq CLI", () => {
     const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-"));
     roots.push(stateDir);
     const repository = join(import.meta.dir, "..");
-    const created = await cli(stateDir, ["queue", "create", "cli", "--repo", repository, "--json"]);
+    const created = await cli(stateDir, [
+      "queue",
+      "create",
+      "cli",
+      "--repo",
+      repository,
+      "--plan-model",
+      "gpt-planner",
+      "--plan-instructions",
+      "Inspect repository conventions first.",
+      "--implement-model",
+      "gpt-builder",
+      "--implement-instructions",
+      "Keep the change focused.",
+      "--json",
+    ]);
     expect(created.exitCode).toBe(0);
-    expect(JSON.parse(created.stdout).name).toBe("cli");
+    expect(JSON.parse(created.stdout)).toMatchObject({
+      name: "cli",
+      planModel: "gpt-planner",
+      planInstructions: "Inspect repository conventions first.",
+      implementModel: "gpt-builder",
+      implementInstructions: "Keep the change focused.",
+    });
 
     const input = JSON.stringify({
       queue: "cli",
@@ -78,6 +106,29 @@ describe("agentq CLI", () => {
     const result = await cli(stateDir, ["task", "add", "--stdin-json"], "not-json");
     expect(result.exitCode).toBe(2);
     expect(result.stderr).toContain("Invalid task JSON");
+  });
+
+  test("fails closed when a managed planning agent has no child-task intake", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-plan-intake-"));
+    roots.push(stateDir);
+    await cli(stateDir, ["queue", "create", "plan", "--repo", projectRoot, "--json"]);
+
+    const result = await cli(
+      stateDir,
+      ["task", "add", "--queue", "plan", "--title", "Planner child", "--json"],
+      undefined,
+      projectRoot,
+      {
+        AGENTQ_AGENT_CONTEXT: "1",
+        AGENTQ_STAGE: "plan",
+        AGENTQ_RUN_ID: "run-plan",
+      },
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("No managed-agent task intake is available");
+    const listed = await cli(stateDir, ["task", "list", "--json"]);
+    expect(JSON.parse(listed.stdout)).toEqual([]);
   });
 
   test("sanitizes an untrusted queue reference in supervisor startup output", async () => {
@@ -150,6 +201,95 @@ describe("agentq CLI", () => {
     expect(JSON.parse(removed.stdout)).toEqual({ removed: true, queue: "empty" });
   });
 
+  test("renders human task logs as an activity transcript and keeps JSON Lines raw", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-logs-"));
+    roots.push(stateDir);
+    await cli(stateDir, ["queue", "create", "logs", "--repo", projectRoot, "--json"]);
+    const added = await cli(stateDir, [
+      "task",
+      "add",
+      "Render task activity",
+      "--queue",
+      "logs",
+      "--json",
+    ]);
+    const taskId = (JSON.parse(added.stdout) as { id: string }).id;
+    const store = new AgentQStore(join(stateDir, "agentq.sqlite"));
+    const claim = store.claimNextTask({ queue: "logs" });
+    if (!claim) throw new Error("Expected task claim");
+    const implementationSummary = "Finished the transcript renderer.";
+    const terminalSummary = `${implementationSummary}\n\nBranch: agentq/logs/render-activity\nCommit: abc123\nWorktree: /tmp/agentq-logs`;
+
+    try {
+      store.appendEvent({
+        taskId,
+        runId: claim.run.id,
+        kind: "executor.tool",
+        payload: {
+          type: "tool",
+          toolId: "tool-1",
+          name: "command",
+          state: "started",
+          detail: '/bin/zsh -lc "bun test test/activity.test.ts"',
+        },
+      });
+      store.appendEvent({
+        taskId,
+        runId: claim.run.id,
+        kind: "executor.tool",
+        payload: {
+          type: "tool",
+          toolId: "tool-1",
+          name: "command",
+          state: "completed",
+          output: "2 pass\n0 fail",
+        },
+      });
+      store.appendEvent({
+        taskId,
+        runId: claim.run.id,
+        kind: "executor.assistant",
+        payload: { type: "assistant", phase: "implement", text: implementationSummary },
+      });
+      store.appendEvent({
+        taskId,
+        runId: claim.run.id,
+        kind: "run.succeeded",
+        payload: {
+          summary: terminalSummary,
+          branchName: "agentq/logs/render-activity",
+          commitSha: "abc123",
+          worktreePath: "/tmp/agentq-logs",
+        },
+      });
+    } finally {
+      store.close();
+    }
+
+    const humanLogs = await cli(stateDir, ["task", "logs", taskId]);
+    expect(humanLogs.exitCode).toBe(0);
+    expect(humanLogs.stdout).toContain("• Ran bun test test/activity.test.ts");
+    expect(humanLogs.stdout).toContain("  └ 2 pass … +1 lines");
+    expect(humanLogs.stdout).toContain(`• ${implementationSummary}`);
+    expect(humanLogs.stdout).toContain("✓ Run succeeded");
+    expect(humanLogs.stdout).toContain("  └ Branch: agentq/logs/render-activity");
+    expect(humanLogs.stdout).toContain("    Commit: abc123");
+    expect(humanLogs.stdout).toContain("    Worktree: /tmp/agentq-logs");
+    expect(humanLogs.stdout).not.toContain("executor.tool");
+    expect(humanLogs.stdout).not.toContain(terminalSummary);
+
+    const jsonLogs = await cli(stateDir, ["task", "logs", taskId, "--json"]);
+    expect(jsonLogs.exitCode).toBe(0);
+    const rawEvents = jsonLogs.stdout
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> });
+    expect(rawEvents.some((entry) => entry.kind === "executor.tool")).toBe(true);
+    expect(rawEvents.find((entry) => entry.kind === "run.succeeded")?.payload.summary).toBe(
+      terminalSummary,
+    );
+  });
+
   test("edits every mutable queue field without changing repository identity", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-queue-edit-"));
     roots.push(stateDir);
@@ -179,6 +319,14 @@ describe("agentq CLI", () => {
         "5",
         "--max-attempts",
         "7",
+        "--plan-model",
+        "claude-haiku",
+        "--plan-instructions",
+        "Map exact files and tests.",
+        "--implement-model",
+        "claude-sonnet",
+        "--implement-instructions",
+        "Preserve compatibility.",
         "--verify",
         "bun run lint",
         "--verify",
@@ -197,6 +345,10 @@ describe("agentq CLI", () => {
       defaultProvider: "claude",
       concurrency: 5,
       maxAttempts: 7,
+      planModel: "claude-haiku",
+      planInstructions: "Map exact files and tests.",
+      implementModel: "claude-sonnet",
+      implementInstructions: "Preserve compatibility.",
       verifyCommands: ["bun run lint", "bun test"],
       autoCommit: false,
       repoKey: original.repoKey,
@@ -205,11 +357,29 @@ describe("agentq CLI", () => {
 
     const reset = await cli(
       stateDir,
-      ["queue", "edit", "delivery", "--clear-verify", "--auto-commit", "--json"],
+      [
+        "queue",
+        "edit",
+        "delivery",
+        "--clear-plan-model",
+        "--clear-plan-instructions",
+        "--clear-implement-model",
+        "--clear-implement-instructions",
+        "--clear-verify",
+        "--auto-commit",
+        "--json",
+      ],
       undefined,
       repositoryRoot,
     );
-    expect(JSON.parse(reset.stdout)).toMatchObject({ verifyCommands: [], autoCommit: true });
+    expect(JSON.parse(reset.stdout)).toMatchObject({
+      planModel: "",
+      planInstructions: "",
+      implementModel: "",
+      implementInstructions: "",
+      verifyCommands: [],
+      autoCommit: true,
+    });
 
     const conflicting = await cli(
       stateDir,
@@ -219,6 +389,23 @@ describe("agentq CLI", () => {
     );
     expect(conflicting.exitCode).toBe(2);
     expect(conflicting.stderr).toContain("either --verify or --clear-verify");
+
+    const workflowConflicts = [
+      ["--plan-model", "gpt-planner", "--clear-plan-model"],
+      ["--plan-instructions", "Inspect first.", "--clear-plan-instructions"],
+      ["--implement-model", "gpt-builder", "--clear-implement-model"],
+      ["--implement-instructions", "Keep it focused.", "--clear-implement-instructions"],
+    ] as const;
+    for (const [setOption, value, clearOption] of workflowConflicts) {
+      const result = await cli(
+        stateDir,
+        ["queue", "edit", "delivery", setOption, value, clearOption],
+        undefined,
+        repositoryRoot,
+      );
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr).toContain(`either ${setOption} or ${clearOption}`);
+    }
 
     const empty = await cli(stateDir, ["queue", "edit", "delivery"], undefined, repositoryRoot);
     expect(empty.exitCode).toBe(2);

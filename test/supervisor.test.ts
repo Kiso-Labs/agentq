@@ -67,6 +67,36 @@ async function executable(path: string, source: string): Promise<void> {
   await chmod(path, 0o755);
 }
 
+const planningPromptMarker = "You are the planning agent for an agentq task";
+
+function codexPlanningGate(
+  plan = "Inspect the relevant repository files, identify the exact edits, and run focused verification.",
+): string {
+  return `
+    const agentqPrompt = await Bun.stdin.text();
+    if (agentqPrompt.includes(${JSON.stringify(planningPromptMarker)})) {
+      console.log(JSON.stringify({type:"thread.started",thread_id:"codex-plan-session"}));
+      console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:${JSON.stringify(plan)}}}));
+      console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:5,output_tokens:5}}));
+      process.exit(0);
+    }
+  `;
+}
+
+function claudePlanningGate(
+  plan = "Inspect the relevant repository files, identify the exact edits, and run focused verification.",
+): string {
+  return `
+    const agentqPrompt = await Bun.stdin.text();
+    if (agentqPrompt.includes(${JSON.stringify(planningPromptMarker)})) {
+      console.log(JSON.stringify({type:"system",subtype:"init",session_id:"claude-plan-session"}));
+      console.log(JSON.stringify({type:"assistant",message:{content:[{type:"text",text:${JSON.stringify(plan)}}]}}));
+      console.log(JSON.stringify({type:"result",subtype:"success",is_error:false,session_id:"claude-plan-session",result:${JSON.stringify(plan)},usage:{input_tokens:5,output_tokens:5}}));
+      process.exit(0);
+    }
+  `;
+}
+
 describe.skipIf(process.platform === "win32")("Supervisor", () => {
   test("rejects invalid environment and option concurrency limits before claiming work", async () => {
     const { repo, app } = await setup();
@@ -90,6 +120,198 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     app.close();
   });
 
+  test("hands a persisted repository plan to a fresh implementation agent", async () => {
+    const { root, repo, app } = await setup();
+    const codex = join(root, "codex");
+    const capture = join(root, "pipeline.jsonl");
+    const plan =
+      "Update src/session.ts at the redirect guard and add the expired-session regression test.";
+    await executable(
+      codex,
+      `
+      import { appendFileSync } from "node:fs";
+      const args = process.argv.slice(2);
+      const input = await Bun.stdin.text();
+      appendFileSync(${JSON.stringify(capture)}, JSON.stringify({
+        args,
+        input,
+        stage: process.env.AGENTQ_STAGE,
+        intake: process.env.AGENTQ_INTAKE_DIR,
+      }) + "\\n");
+      const planning = input.includes("You are the planning agent");
+      if (planning) {
+        console.log(JSON.stringify({type:"thread.started",thread_id:"plan-session"}));
+        console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:${JSON.stringify(plan)}}}));
+        console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:10,output_tokens:4}}));
+      } else {
+        if (!input.includes(${JSON.stringify(plan)})) {
+          console.error("planner handoff missing");
+          process.exit(9);
+        }
+        await Bun.write("implemented.txt", "implemented");
+        console.log(JSON.stringify({type:"thread.started",thread_id:"implementation-session"}));
+        console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:"Implemented the handoff"}}));
+        console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:20,output_tokens:8}}));
+      }
+      `,
+    );
+    process.env.AGENTQ_CODEX_BIN = codex;
+    const queue = await app.createQueue({
+      name: "pipeline",
+      repoPath: repo,
+      maxAttempts: 1,
+      planModel: "planner-model",
+      planInstructions: "Identify exact files and symbols before handing off.",
+      implementModel: "builder-model",
+      implementInstructions: "Follow the handoff and keep APIs stable.",
+      verifyCommands: ["test -f implemented.txt"],
+    });
+    const task = await app.addTask({ queue: queue.id, title: "Fix redirects" });
+
+    await new Supervisor(app, { pollIntervalMs: 20 }).run({ once: true });
+
+    expect(app.store.getTask(task.id)?.status).toBe("succeeded");
+    const run = app.store.listRuns({ taskId: task.id })[0];
+    expect(run).toMatchObject({
+      phase: "implement",
+      planOutput: plan,
+      planSessionId: "plan-session",
+      providerSessionId: "implementation-session",
+    });
+    expect(run?.taskSnapshot?.workflow).toEqual({
+      planModel: "planner-model",
+      planInstructions: "Identify exact files and symbols before handing off.",
+      implementModel: "builder-model",
+      implementInstructions: "Follow the handoff and keep APIs stable.",
+    });
+    const invocations = (await readFile(capture, "utf8"))
+      .trim()
+      .split("\n")
+      .map(
+        (line) =>
+          JSON.parse(line) as { args: string[]; input: string; stage?: string; intake?: string },
+      );
+    expect(invocations).toHaveLength(2);
+    expect(invocations[0]?.args).toContain("read-only");
+    expect(invocations[0]?.args).toContain("planner-model");
+    expect(invocations[0]?.args).not.toContain("--add-dir");
+    expect(invocations[0]).toMatchObject({ stage: "plan" });
+    expect(invocations[0]?.intake).toBeUndefined();
+    expect(invocations[0]?.input).toContain("Identify exact files and symbols before handing off.");
+    expect(invocations[1]?.args).toContain("workspace-write");
+    expect(invocations[1]?.args).toContain("builder-model");
+    expect(invocations[1]).toMatchObject({ stage: "implement" });
+    expect(invocations[1]?.intake).toContain("intake");
+    expect(invocations[1]?.input).toContain(plan);
+    expect(invocations[1]?.input).toContain("Follow the handoff and keep APIs stable.");
+    expect(
+      app.store.listEvents({ taskId: task.id }).filter((event) => event.kind === "workflow.phase"),
+    ).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({ phase: "plan", state: "started" }),
+      }),
+      expect.objectContaining({
+        payload: expect.objectContaining({ phase: "plan", state: "completed" }),
+      }),
+      expect.objectContaining({
+        payload: expect.objectContaining({ phase: "implement", state: "started" }),
+      }),
+      expect.objectContaining({
+        payload: expect.objectContaining({ phase: "implement", state: "completed" }),
+      }),
+    ]);
+    app.close();
+  });
+
+  test("fails closed when the planning agent returns an empty handoff", async () => {
+    const { root, repo, app } = await setup();
+    const codex = join(root, "codex");
+    await executable(
+      codex,
+      `
+      const input = await Bun.stdin.text();
+      if (input.includes(${JSON.stringify(planningPromptMarker)})) {
+        console.log(JSON.stringify({type:"thread.started",thread_id:"empty-plan-session"}));
+        console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:2,output_tokens:0}}));
+      } else {
+        await Bun.write("implementation-ran.txt", "unexpected");
+        console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:1,output_tokens:1}}));
+      }
+      `,
+    );
+    process.env.AGENTQ_CODEX_BIN = codex;
+    const queue = await app.createQueue({ name: "empty-plan", repoPath: repo, maxAttempts: 1 });
+    const task = await app.addTask({ queue: queue.id, title: "Require a real plan" });
+
+    await new Supervisor(app, { pollIntervalMs: 20 }).run({ once: true });
+
+    expect(app.store.getTask(task.id)?.status).toBe("failed");
+    const run = app.store.listRuns({ taskId: task.id })[0];
+    expect(run).toMatchObject({
+      status: "failed",
+      phase: "plan",
+      planSessionId: "empty-plan-session",
+    });
+    expect(run?.planOutput).toBeUndefined();
+    expect(run?.providerSessionId).toBeUndefined();
+    expect(run?.error).toContain("without a usable implementation handoff");
+    expect(
+      await Bun.file(join(run?.worktreePath ?? repo, "implementation-ran.txt")).exists(),
+    ).toBeFalse();
+    expect(
+      app.store
+        .listEvents({ taskId: task.id })
+        .some(
+          (event) =>
+            event.kind === "workflow.phase" &&
+            event.payload.phase === "implement" &&
+            event.payload.state === "started",
+        ),
+    ).toBeFalse();
+    app.close();
+  });
+
+  test("rejects a planner handoff when the planning agent modifies the worktree", async () => {
+    const { root, repo, app } = await setup();
+    const codex = join(root, "codex");
+    await executable(
+      codex,
+      `
+      const input = await Bun.stdin.text();
+      if (input.includes(${JSON.stringify(planningPromptMarker)})) {
+        await Bun.write("planner-leak.txt", "planner changed the repository");
+        console.log(JSON.stringify({type:"thread.started",thread_id:"dirty-plan-session"}));
+        console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:"Edit README.md and verify the result."}}));
+        console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:3,output_tokens:3}}));
+      } else {
+        await Bun.write("implementation-ran.txt", "unexpected");
+        console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:1,output_tokens:1}}));
+      }
+      `,
+    );
+    process.env.AGENTQ_CODEX_BIN = codex;
+    const queue = await app.createQueue({ name: "dirty-plan", repoPath: repo, maxAttempts: 1 });
+    const task = await app.addTask({ queue: queue.id, title: "Keep planning read-only" });
+
+    await new Supervisor(app, { pollIntervalMs: 20 }).run({ once: true });
+
+    expect(app.store.getTask(task.id)?.status).toBe("failed");
+    const run = app.store.listRuns({ taskId: task.id })[0];
+    expect(run).toMatchObject({
+      status: "failed",
+      phase: "plan",
+      planSessionId: "dirty-plan-session",
+    });
+    expect(run?.planOutput).toBeUndefined();
+    expect(run?.providerSessionId).toBeUndefined();
+    expect(run?.error).toContain("Planning agent modified the worktree");
+    expect(await Bun.file(join(run?.worktreePath ?? repo, "planner-leak.txt")).exists()).toBeTrue();
+    expect(
+      await Bun.file(join(run?.worktreePath ?? repo, "implementation-ran.txt")).exists(),
+    ).toBeFalse();
+    app.close();
+  });
+
   test("runs Codex and Claude tasks concurrently in distinct worktrees", async () => {
     const { root, repo, app } = await setup();
     const barrier = join(root, "barrier");
@@ -100,7 +322,7 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
       import { readdir } from "node:fs/promises";
       import { join } from "node:path";
       const provider = ${JSON.stringify(provider)};
-      await Bun.stdin.text();
+      ${provider === "codex" ? codexPlanningGate() : claudePlanningGate()}
       await Bun.write(join(process.cwd(), \`done-\${provider}.txt\`), provider);
       await Bun.write(join(process.env.AGENTQ_TEST_BARRIER!, provider), "ready");
       const deadline = Date.now() + 3000;
@@ -152,11 +374,21 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
   test("resumes the same Codex session in the retained worktree", async () => {
     const { root, repo, app } = await setup();
     const codex = join(root, "codex");
+    const capture = join(root, "implementation-resume.jsonl");
+    const plan = "Reuse the retained implementation worktree and finish the requested task.";
     await executable(
       codex,
       `
+      import { appendFileSync } from "node:fs";
       const args = process.argv.slice(2);
-      await Bun.stdin.text();
+      const input = await Bun.stdin.text();
+      appendFileSync(${JSON.stringify(capture)}, JSON.stringify({args,input}) + "\\n");
+      if (input.includes(${JSON.stringify(planningPromptMarker)})) {
+        console.log(JSON.stringify({type:"thread.started",thread_id:"codex-plan-session"}));
+        console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:${JSON.stringify(plan)}}}));
+        console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:5,output_tokens:5}}));
+        process.exit(0);
+      }
       const resumed = args.includes("resume");
       await Bun.write(resumed ? "resumed.txt" : "first.txt", resumed ? "yes" : "first");
       console.log(JSON.stringify({type:"thread.started",thread_id:"codex-session"}));
@@ -176,8 +408,220 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
 
     const [secondRun, originalRun] = app.store.listRuns({ taskId: task.id });
     expect(secondRun?.status).toBe("succeeded");
+    expect(secondRun?.phase).toBe("implement");
+    expect(secondRun?.planOutput).toBe(plan);
     expect(secondRun?.worktreePath).toBe(originalRun?.worktreePath);
     expect(await readFile(join(secondRun?.worktreePath ?? "", "resumed.txt"), "utf8")).toBe("yes");
+    const invocations = (await readFile(capture, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { args: string[]; input: string });
+    expect(invocations).toHaveLength(3);
+    expect(invocations.filter(({ input }) => input.includes(planningPromptMarker))).toHaveLength(1);
+    expect(invocations[1]?.args).not.toContain("resume");
+    expect(invocations[2]?.args).toContain("resume");
+    expect(invocations[2]?.args).toContain("codex-session");
+    app.close();
+  });
+
+  test("resumes a failed planning session before starting a fresh implementation agent", async () => {
+    const { root, repo, app } = await setup();
+    const codex = join(root, "codex");
+    const capture = join(root, "planning-resume.jsonl");
+    const plan = "Edit README.md in the retained worktree, then verify its new contents.";
+    await executable(
+      codex,
+      `
+      import { appendFileSync } from "node:fs";
+      const args = process.argv.slice(2);
+      const input = await Bun.stdin.text();
+      appendFileSync(${JSON.stringify(capture)}, JSON.stringify({args,input}) + "\\n");
+      if (input.includes(${JSON.stringify(planningPromptMarker)})) {
+        console.log(JSON.stringify({type:"thread.started",thread_id:"retryable-plan-session"}));
+        if (!args.includes("resume")) {
+          console.log(JSON.stringify({type:"turn.failed",error:{message:"planner needs another turn"}}));
+          process.exit(0);
+        }
+        console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:${JSON.stringify(plan)}}}));
+        console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:5,output_tokens:5}}));
+        process.exit(0);
+      }
+      if (args.includes("resume")) {
+        console.error("implementation must start in a fresh provider session");
+        process.exit(8);
+      }
+      await Bun.write("planned-implementation.txt", "implemented");
+      console.log(JSON.stringify({type:"thread.started",thread_id:"fresh-implementation-session"}));
+      console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:"Implemented resumed plan"}}));
+      console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:5,output_tokens:5}}));
+      `,
+    );
+    process.env.AGENTQ_CODEX_BIN = codex;
+    const queue = await app.createQueue({
+      name: "plan-resume",
+      repoPath: repo,
+      maxAttempts: 1,
+      verifyCommands: ["test -f planned-implementation.txt"],
+    });
+    const task = await app.addTask({ queue: queue.id, title: "Resume planning" });
+
+    await new Supervisor(app, { pollIntervalMs: 20 }).run({ once: true });
+    const failedPlan = app.store.listRuns({ taskId: task.id })[0];
+    expect(failedPlan).toMatchObject({
+      status: "failed",
+      phase: "plan",
+      planSessionId: "retryable-plan-session",
+    });
+    expect(failedPlan?.providerSessionId).toBeUndefined();
+
+    await app.resumeTask(task.id);
+    await new Supervisor(app, { pollIntervalMs: 20 }).run({ once: true });
+
+    const [completed, original] = app.store.listRuns({ taskId: task.id });
+    expect(completed).toMatchObject({
+      status: "succeeded",
+      phase: "implement",
+      planOutput: plan,
+      planSessionId: "retryable-plan-session",
+      providerSessionId: "fresh-implementation-session",
+      worktreePath: original?.worktreePath,
+    });
+    const invocations = (await readFile(capture, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { args: string[]; input: string });
+    expect(invocations).toHaveLength(3);
+    expect(invocations[0]?.args).not.toContain("resume");
+    expect(invocations[1]?.args).toContain("resume");
+    expect(invocations[1]?.args).toContain("retryable-plan-session");
+    expect(invocations[2]?.args).not.toContain("resume");
+    expect(invocations[2]?.input).toContain(plan);
+    app.close();
+  });
+
+  test("continues a saved plan with a fresh implementation process when no session was emitted", async () => {
+    const { root, repo, app } = await setup();
+    const codex = join(root, "codex");
+    const capture = join(root, "fresh-implementation-resume.jsonl");
+    const firstImplementation = join(root, "first-implementation-attempted");
+    const plan = "Update the retained worktree using the concrete saved implementation plan.";
+    await executable(
+      codex,
+      `
+      import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+      const args = process.argv.slice(2);
+      const input = await Bun.stdin.text();
+      appendFileSync(${JSON.stringify(capture)}, JSON.stringify({args,input}) + "\\n");
+      if (input.includes(${JSON.stringify(planningPromptMarker)})) {
+        console.log(JSON.stringify({type:"thread.started",thread_id:"saved-plan-session"}));
+        console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:${JSON.stringify(plan)}}}));
+        console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:4,output_tokens:4}}));
+        process.exit(0);
+      }
+      if (!existsSync(${JSON.stringify(firstImplementation)})) {
+        writeFileSync(${JSON.stringify(firstImplementation)}, "attempted");
+        console.log(JSON.stringify({type:"turn.failed",error:{message:"startup failed before session"}}));
+        process.exit(0);
+      }
+      if (args.includes("resume")) {
+        console.error("implementation without a saved session must start fresh");
+        process.exit(8);
+      }
+      await Bun.write("continued-from-plan.txt", "implemented");
+      console.log(JSON.stringify({type:"thread.started",thread_id:"new-implementation-session"}));
+      console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:"Continued saved plan"}}));
+      console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:4,output_tokens:4}}));
+      `,
+    );
+    process.env.AGENTQ_CODEX_BIN = codex;
+    const queue = await app.createQueue({
+      name: "fresh-implementation-resume",
+      repoPath: repo,
+      maxAttempts: 1,
+      verifyCommands: ["test -f continued-from-plan.txt"],
+    });
+    const task = await app.addTask({ queue: queue.id, title: "Continue without session" });
+
+    await new Supervisor(app, { pollIntervalMs: 20 }).run({ once: true });
+    const firstRun = app.store.listRuns({ taskId: task.id })[0];
+    expect(firstRun).toMatchObject({
+      status: "failed",
+      phase: "implement",
+      planOutput: plan,
+    });
+    expect(firstRun?.providerSessionId).toBeUndefined();
+
+    await app.resumeTask(task.id);
+    await new Supervisor(app, { pollIntervalMs: 20 }).run({ once: true });
+
+    const [completed, original] = app.store.listRuns({ taskId: task.id });
+    expect(completed).toMatchObject({
+      status: "succeeded",
+      phase: "implement",
+      planOutput: plan,
+      providerSessionId: "new-implementation-session",
+      worktreePath: original?.worktreePath,
+    });
+    expect(
+      await readFile(join(completed?.worktreePath ?? "", "continued-from-plan.txt"), "utf8"),
+    ).toBe("implemented");
+    const invocations = (await readFile(capture, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { args: string[]; input: string });
+    expect(invocations).toHaveLength(3);
+    expect(invocations.filter(({ input }) => input.includes(planningPromptMarker))).toHaveLength(1);
+    expect(invocations[2]?.args).not.toContain("resume");
+    expect(invocations[2]?.input).toContain(plan);
+    app.close();
+  });
+
+  test("records implementation completion separately from verification failure", async () => {
+    const { root, repo, app } = await setup();
+    const codex = join(root, "codex");
+    await executable(
+      codex,
+      `
+      ${codexPlanningGate("Inspect README.md and hand the exact verification requirement to implementation.")}
+      console.log(JSON.stringify({type:"thread.started",thread_id:"implementation-finished"}));
+      console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:"Implementation work finished"}}));
+      console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:1,output_tokens:1}}));
+      `,
+    );
+    process.env.AGENTQ_CODEX_BIN = codex;
+    const queue = await app.createQueue({
+      name: "verification-failure",
+      repoPath: repo,
+      maxAttempts: 1,
+      verifyCommands: ["test -f intentionally-missing.txt"],
+    });
+    const task = await app.addTask({ queue: queue.id, title: "Fail verification only" });
+
+    await new Supervisor(app, { pollIntervalMs: 20 }).run({ once: true });
+
+    expect(app.store.getTask(task.id)?.status).toBe("failed");
+    const events = app.store.listEvents({ taskId: task.id, limit: 1_000 });
+    expect(
+      events.some(
+        (event) =>
+          event.kind === "workflow.phase" &&
+          event.payload.phase === "implement" &&
+          event.payload.state === "completed",
+      ),
+    ).toBeTrue();
+    expect(
+      events.some(
+        (event) =>
+          event.kind === "workflow.phase" &&
+          event.payload.phase === "implement" &&
+          event.payload.state === "failed",
+      ),
+    ).toBeFalse();
+    expect(
+      events.some(
+        (event) => event.kind === "verification.completed" && event.payload.exitCode !== 0,
+      ),
+    ).toBeTrue();
     app.close();
   });
 
@@ -187,7 +631,7 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     await executable(
       codex,
       `
-      await Bun.stdin.text();
+      ${codexPlanningGate()}
       console.log(JSON.stringify({type:"thread.started",thread_id:"cancel-session"}));
       await Bun.sleep(30_000);
       console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:1,output_tokens:1}}));
@@ -200,7 +644,10 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     const running = supervisor.run({ once: true });
 
     const deadline = Date.now() + 3_000;
-    while (app.store.getTask(task.id)?.status !== "running") {
+    while (
+      app.store.getTask(task.id)?.status !== "running" ||
+      app.store.listRuns({ taskId: task.id })[0]?.providerSessionId !== "cancel-session"
+    ) {
       if (Date.now() > deadline) throw new Error("task did not start");
       await Bun.sleep(20);
     }
@@ -219,6 +666,59 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     app.close();
   });
 
+  test("never releases implementation when cancellation reaches the phase boundary", async () => {
+    const { root, repo, app } = await setup();
+    const codex = join(root, "codex");
+    const plannerReady = join(root, "planner-ready");
+    const releasePlanner = join(root, "release-planner");
+    const implementationStarted = join(root, "implementation-started");
+    await executable(
+      codex,
+      `
+      import { existsSync } from "node:fs";
+      const input = await Bun.stdin.text();
+      if (input.includes(${JSON.stringify(planningPromptMarker)})) {
+        await Bun.write(${JSON.stringify(plannerReady)}, "ready");
+        while (!existsSync(${JSON.stringify(releasePlanner)})) await Bun.sleep(10);
+        console.log(JSON.stringify({type:"thread.started",thread_id:"boundary-plan-session"}));
+        console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:"Inspect README.md, then implement the requested change."}}));
+        console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:2,output_tokens:2}}));
+        process.exit(0);
+      }
+      await Bun.write(${JSON.stringify(implementationStarted)}, "released");
+      console.log(JSON.stringify({type:"thread.started",thread_id:"must-not-start"}));
+      console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:1,output_tokens:1}}));
+      `,
+    );
+    process.env.AGENTQ_CODEX_BIN = codex;
+    const queue = await app.createQueue({ name: "phase-cancel", repoPath: repo, maxAttempts: 1 });
+    const task = await app.addTask({ queue: queue.id, title: "Cancel between stages" });
+    const running = new Supervisor(app, { pollIntervalMs: 10 }).run({ once: true });
+
+    const deadline = Date.now() + 3_000;
+    while (!(await Bun.file(plannerReady).exists())) {
+      if (Date.now() > deadline) throw new Error("planner did not reach the phase boundary");
+      await Bun.sleep(10);
+    }
+    await app.cancelTask(task.id);
+    await Bun.write(releasePlanner, "release");
+    await running;
+
+    expect(app.store.getTask(task.id)?.status).toBe("cancelled");
+    expect(await Bun.file(implementationStarted).exists()).toBeFalse();
+    expect(
+      app.store
+        .listEvents({ taskId: task.id, limit: 1_000 })
+        .some(
+          (event) =>
+            event.kind === "workflow.phase" &&
+            event.payload.phase === "implement" &&
+            event.payload.state === "started",
+        ),
+    ).toBeFalse();
+    app.close();
+  });
+
   test("cancels a provider immediately when event persistence fails", async () => {
     const { root, repo, app } = await setup();
     const codex = join(root, "codex");
@@ -226,7 +726,7 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     await executable(
       codex,
       `
-      await Bun.stdin.text();
+      ${codexPlanningGate()}
       await Bun.write(${JSON.stringify(pidFile)}, String(process.pid));
       console.log(JSON.stringify({type:"thread.started",thread_id:"event-failure-session"}));
       await Bun.sleep(30_000);
@@ -241,7 +741,7 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     });
     const originalAppendEvent = app.store.appendEvent.bind(app.store);
     app.store.appendEvent = ((input) => {
-      if (input.kind.startsWith("executor."))
+      if (input.kind.startsWith("executor.") && input.payload?.phase === "implement")
         throw new Error("simulated event persistence failure");
       return originalAppendEvent(input);
     }) as typeof app.store.appendEvent;
@@ -267,7 +767,7 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     await executable(
       codex,
       `
-      await Bun.stdin.text();
+      ${codexPlanningGate()}
       await Bun.write(${JSON.stringify(pidFile)}, String(process.pid));
       console.log(JSON.stringify({type:"thread.started",thread_id:"loop-failure-session"}));
       await Bun.sleep(30_000);
@@ -307,7 +807,7 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     await executable(
       codex,
       `
-      await Bun.stdin.text();
+      ${codexPlanningGate()}
       console.log(JSON.stringify({type:"thread.started",thread_id:"shutdown-session"}));
       await Bun.sleep(30_000);
       `,
@@ -319,7 +819,10 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     const running = supervisor.run({ once: true });
 
     const deadline = Date.now() + 3_000;
-    while (app.store.getTask(task.id)?.status !== "running") {
+    while (
+      app.store.getTask(task.id)?.status !== "running" ||
+      app.store.listRuns({ taskId: task.id })[0]?.providerSessionId !== "shutdown-session"
+    ) {
       if (Date.now() > deadline) throw new Error("task did not start");
       await Bun.sleep(20);
     }
@@ -351,7 +854,7 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     await executable(
       codex,
       `
-      await Bun.stdin.text();
+      ${codexPlanningGate()}
       console.log(JSON.stringify({type:"thread.started",thread_id:"recovered-session"}));
       console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:1,output_tokens:1}}));
       `,
@@ -399,7 +902,7 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     await executable(
       codex,
       `
-      await Bun.stdin.text();
+      ${codexPlanningGate()}
       console.log(JSON.stringify({type:"thread.started",thread_id:"hard-recovery-session"}));
       console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:1,output_tokens:1}}));
       `,
@@ -448,7 +951,7 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     await executable(
       codex,
       `
-      await Bun.stdin.text();
+      ${codexPlanningGate()}
       console.log(JSON.stringify({type:"thread.started",thread_id:"replacement-session"}));
       console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:1,output_tokens:1}}));
       `,
@@ -520,8 +1023,8 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     await executable(
       codex,
       `
+      ${codexPlanningGate()}
       await Bun.write(${JSON.stringify(pidFile)}, String(process.pid));
-      await Bun.stdin.text();
       await Bun.sleep(30_000);
       `,
     );
@@ -555,8 +1058,8 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     await executable(
       codex,
       `
-      const prompt = await Bun.stdin.text();
-      if (prompt.includes("Title: Parent task")) {
+      ${codexPlanningGate()}
+      if (agentqPrompt.includes("Title: Parent task")) {
         const child = Bun.spawn([
           process.execPath,
           process.env.AGENTQ_TEST_CLI!,

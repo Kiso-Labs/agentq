@@ -16,6 +16,12 @@ import {
   type TaskEvent,
 } from "../core/types.ts";
 import type { IntegrationResult, IntegrationTarget } from "../integrations/instructions.ts";
+import {
+  type ActivityEntry,
+  type ActivityTone,
+  activityEntries,
+  visibleActivityEntries,
+} from "./activity.ts";
 import { sanitizeTerminalText } from "./sanitize.ts";
 import type {
   AgentqAppProps,
@@ -74,6 +80,10 @@ interface QueueDraft {
   repoPath: string;
   baseRef: string;
   providerIndex: number;
+  planModel: string;
+  planInstructions: string;
+  implementModel: string;
+  implementInstructions: string;
   concurrency: string;
   maxAttempts: string;
   verifyCommands: string;
@@ -81,6 +91,136 @@ interface QueueDraft {
   field: number;
   error?: string;
 }
+
+type QueueDraftTextKey =
+  | "name"
+  | "repoPath"
+  | "baseRef"
+  | "planModel"
+  | "planInstructions"
+  | "implementModel"
+  | "implementInstructions"
+  | "concurrency"
+  | "maxAttempts"
+  | "verifyCommands";
+
+type QueueFormControl =
+  | {
+      kind: "text";
+      key: QueueDraftTextKey;
+      label: string;
+      focusIndex: number;
+      multiline?: boolean;
+      placeholder?: string;
+    }
+  | { kind: "provider"; label: string; focusIndex: number }
+  | { kind: "toggle"; key: "autoCommit"; label: string; focusIndex: number }
+  | { kind: "readonly"; key: "repoPath"; label: string };
+
+const CREATE_QUEUE_CONTROLS: readonly QueueFormControl[] = [
+  { kind: "text", key: "name", label: "Name", focusIndex: 0 },
+  { kind: "text", key: "repoPath", label: "Repository", focusIndex: 1 },
+  {
+    kind: "text",
+    key: "baseRef",
+    label: "Base ref",
+    focusIndex: 2,
+    placeholder: "auto (current branch)",
+  },
+  { kind: "provider", label: "Provider", focusIndex: 3 },
+  {
+    kind: "text",
+    key: "planModel",
+    label: "Plan model",
+    focusIndex: 4,
+    placeholder: "provider default",
+  },
+  {
+    kind: "text",
+    key: "planInstructions",
+    label: "Plan instructions",
+    focusIndex: 5,
+    multiline: true,
+    placeholder: "none",
+  },
+  {
+    kind: "text",
+    key: "implementModel",
+    label: "Implementation model",
+    focusIndex: 6,
+    placeholder: "provider default",
+  },
+  {
+    kind: "text",
+    key: "implementInstructions",
+    label: "Implementation instructions",
+    focusIndex: 7,
+    multiline: true,
+    placeholder: "none",
+  },
+  { kind: "text", key: "concurrency", label: "Concurrency", focusIndex: 8 },
+  { kind: "text", key: "maxAttempts", label: "Max attempts", focusIndex: 9 },
+  {
+    kind: "text",
+    key: "verifyCommands",
+    label: "Verify commands",
+    focusIndex: 10,
+    multiline: true,
+    placeholder: "none",
+  },
+  { kind: "toggle", key: "autoCommit", label: "Auto-commit", focusIndex: 11 },
+];
+
+const EDIT_QUEUE_CONTROLS: readonly QueueFormControl[] = [
+  { kind: "text", key: "name", label: "Name", focusIndex: 0 },
+  { kind: "readonly", key: "repoPath", label: "Repository (read-only)" },
+  { kind: "text", key: "baseRef", label: "Base ref", focusIndex: 1 },
+  { kind: "provider", label: "Provider", focusIndex: 2 },
+  {
+    kind: "text",
+    key: "planModel",
+    label: "Plan model",
+    focusIndex: 3,
+    placeholder: "provider default",
+  },
+  {
+    kind: "text",
+    key: "planInstructions",
+    label: "Plan instructions",
+    focusIndex: 4,
+    multiline: true,
+    placeholder: "none",
+  },
+  {
+    kind: "text",
+    key: "implementModel",
+    label: "Implementation model",
+    focusIndex: 5,
+    placeholder: "provider default",
+  },
+  {
+    kind: "text",
+    key: "implementInstructions",
+    label: "Implementation instructions",
+    focusIndex: 6,
+    multiline: true,
+    placeholder: "none",
+  },
+  { kind: "text", key: "concurrency", label: "Concurrency", focusIndex: 7 },
+  { kind: "text", key: "maxAttempts", label: "Max attempts", focusIndex: 8 },
+  {
+    kind: "text",
+    key: "verifyCommands",
+    label: "Verify commands",
+    focusIndex: 9,
+    multiline: true,
+    placeholder: "none",
+  },
+  { kind: "toggle", key: "autoCommit", label: "Auto-commit", focusIndex: 10 },
+];
+
+const queueFormControls = (kind: QueueDraft["kind"]): readonly QueueFormControl[] =>
+  kind === "create" ? CREATE_QUEUE_CONTROLS : EDIT_QUEUE_CONTROLS;
 
 type Confirmation =
   | { kind: "cancel"; task: Task }
@@ -160,6 +300,14 @@ const STATUS_COLOR: Record<Task["status"], string> = {
   cancelled: "gray",
 };
 
+const queueModelLabel = (queue: Queue, model: string): string =>
+  model.trim() || `${queue.defaultProvider} default`;
+
+const queueInstructionSummary = (instructions: string): string => {
+  const summary = sanitizeTerminalText(instructions).replace(/\s+/gu, " ").trim();
+  return summary || "none";
+};
+
 const FOCUS_ORDER: FocusPane[] = ["queues", "tasks", "details"];
 type PaneWeights = Record<FocusPane, number>;
 
@@ -224,21 +372,6 @@ const windowItems = <T,>(items: T[], selectedIndex: number, capacity: number): W
 const messageFrom = (error: unknown): string => {
   if (error instanceof Error) return error.message;
   return String(error);
-};
-
-const eventText = (event: TaskEvent): string => {
-  const text = event.payload.text ?? event.payload.message ?? event.payload.detail;
-  if (typeof text === "string" && text.length > 0) return sanitizeTerminalText(text);
-
-  const name = typeof event.payload.name === "string" ? event.payload.name : undefined;
-  const state = typeof event.payload.state === "string" ? event.payload.state : undefined;
-  if (name) {
-    return sanitizeTerminalText(state ? `${name} · ${state}` : name);
-  }
-
-  const keys = Object.keys(event.payload);
-  if (keys.length === 0) return sanitizeTerminalText(event.kind);
-  return sanitizeTerminalText(JSON.stringify(event.payload));
 };
 
 const parseCommands = (value: string): string[] =>
@@ -479,9 +612,50 @@ function TaskPane({
   );
 }
 
+const ACTIVITY_COLOR: Record<ActivityTone, string | undefined> = {
+  default: undefined,
+  active: "cyan",
+  muted: "gray",
+  success: "green",
+  warning: "yellow",
+  error: "red",
+};
+
+function ActivityRow({ entry }: { entry: ActivityEntry }) {
+  const color = ACTIVITY_COLOR[entry.tone];
+  return (
+    <Box flexDirection="column">
+      <Box>
+        <Text color={color}>{entry.marker} </Text>
+        <Text
+          bold={entry.emphasis}
+          color={color}
+          dimColor={entry.tone === "muted"}
+          wrap="truncate-end"
+        >
+          {entry.title}
+        </Text>
+      </Box>
+      {entry.details.map((detail, index) => (
+        <Box key={`${entry.key}-detail-${detail}`} marginLeft={2}>
+          <Text dimColor>{index === 0 ? "└ " : "  "}</Text>
+          <Text
+            color={entry.tone === "error" || entry.tone === "warning" ? color : undefined}
+            dimColor={entry.tone !== "error" && entry.tone !== "warning"}
+            wrap="truncate-end"
+          >
+            {detail}
+          </Text>
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
 function DetailsPane({
   task,
   queue,
+  run,
   events,
   active,
   height,
@@ -489,13 +663,57 @@ function DetailsPane({
 }: {
   task?: Task;
   queue?: Queue;
+  run?: Run;
   events: TaskEvent[];
   active: boolean;
   height?: number | string;
   width?: number | string;
 }) {
-  const eventLimit = typeof height === "number" ? Math.max(2, height - 12) : 8;
-  const visibleEvents = events.slice(-eventLimit);
+  const activeRun =
+    run && ["starting", "running", "cancelling"].includes(run.status) ? run : undefined;
+  const activity = activityEntries(
+    activeRun
+      ? events.filter(
+          (event) =>
+            !(
+              event.runId === activeRun.id &&
+              event.kind === "workflow.phase" &&
+              event.payload.phase === activeRun.phase &&
+              event.payload.state === "started"
+            ),
+        )
+      : events,
+  );
+  const workflow = activeRun?.taskSnapshot?.workflow;
+  const activeModel =
+    activeRun?.phase === "plan"
+      ? (workflow?.planModel ?? queue?.planModel)
+      : (workflow?.implementModel ?? queue?.implementModel);
+  const activeStageFinished = activeRun
+    ? events.some(
+        (event) =>
+          event.runId === activeRun.id &&
+          event.kind === "workflow.phase" &&
+          event.payload.phase === activeRun.phase &&
+          (event.payload.state === "completed" || event.payload.state === "failed"),
+      )
+    : false;
+  const activeStage: ActivityEntry | undefined =
+    activeRun && !activeStageFinished
+      ? {
+          key: `active-${activeRun.id}-${activeRun.phase}`,
+          marker: "›",
+          title: `${activeRun.phase === "plan" ? "Planning" : "Implementing"} with ${
+            activeRun.provider === "claude" ? "Claude Code" : "Codex"
+          }${activeModel?.trim() ? ` · ${sanitizeTerminalText(activeModel.trim())}` : ""}`,
+          details: [],
+          tone: "active",
+          emphasis: true,
+        }
+      : undefined;
+  const activityRowLimit =
+    (typeof height === "number" ? Math.max(2, height - 7) : 8) - (activeStage ? 1 : 0);
+  const visibleActivity = visibleActivityEntries(activity, activityRowLimit);
 
   return (
     <Panel title="DETAILS / LIVE LOG" active={active} height={height} width={width}>
@@ -509,6 +727,24 @@ function DetailsPane({
               </Text>
               <Text>Base: {sanitizeTerminalText(queue.baseRef)}</Text>
               <Text>Provider: {queue.defaultProvider}</Text>
+              <Text bold color="cyan">
+                PLAN
+              </Text>
+              <Text wrap="truncate-end">
+                Model: {sanitizeTerminalText(queueModelLabel(queue, queue.planModel))}
+              </Text>
+              <Text dimColor wrap="truncate-end">
+                Instructions: {queueInstructionSummary(queue.planInstructions)}
+              </Text>
+              <Text bold color="green">
+                IMPLEMENTATION
+              </Text>
+              <Text wrap="truncate-end">
+                Model: {sanitizeTerminalText(queueModelLabel(queue, queue.implementModel))}
+              </Text>
+              <Text dimColor wrap="truncate-end">
+                Instructions: {queueInstructionSummary(queue.implementInstructions)}
+              </Text>
               <Text>
                 Concurrency: {queue.concurrency} · max attempts: {queue.maxAttempts}
               </Text>
@@ -544,28 +780,16 @@ function DetailsPane({
               ? sanitizeTerminalText(task.instructions)
               : "No additional instructions."}
           </Text>
-          <Box marginTop={1} borderTop borderColor="gray" flexDirection="column" flexGrow={1}>
-            <Text bold color="gray">
-              LIVE ACTIVITY
-            </Text>
-            {visibleEvents.length === 0 ? (
+          <Box marginTop={1} flexDirection="column" flexGrow={1} overflow="hidden">
+            {activeStage ? <ActivityRow entry={activeStage} /> : null}
+            {visibleActivity.length === 0 && !activeStage ? (
               <Text dimColor>
                 {isTaskTerminal(task.status)
                   ? "No recorded activity for this task."
                   : "Waiting for agent activity…"}
               </Text>
             ) : (
-              visibleEvents.map((event) => (
-                <Box key={event.id}>
-                  <Text color="gray">{String(event.id).padStart(3, "0")} </Text>
-                  <Text
-                    color={event.kind === "diagnostic" ? "yellow" : undefined}
-                    wrap="truncate-end"
-                  >
-                    {eventText(event)}
-                  </Text>
-                </Box>
-              ))
+              visibleActivity.map((entry) => <ActivityRow key={entry.key} entry={entry} />)
             )}
           </Box>
         </Box>
@@ -745,6 +969,36 @@ const focusedFormValue = (value: string, width: number, height: number): string 
   return visible.join("\n");
 };
 
+const attemptWorkflowLines = (run: Run, width: number): string[] => {
+  const lines: string[] = [];
+  const workflow = run.taskSnapshot?.workflow;
+  const addSection = (label: string, value: string | undefined, fallback: string) => {
+    lines.push(label);
+    lines.push(
+      ...wrapFormValue(sanitizeTerminalText(value ?? "").trim() || fallback, Math.max(1, width)),
+    );
+    lines.push("");
+  };
+
+  addSection(
+    "PLANNING INSTRUCTIONS",
+    workflow?.planInstructions,
+    "No planning instructions were captured for this attempt.",
+  );
+  addSection(
+    "IMPLEMENTATION INSTRUCTIONS",
+    workflow?.implementInstructions,
+    "No implementation instructions were captured for this attempt.",
+  );
+  addSection(
+    "PLANNER HANDOFF",
+    run.planOutput,
+    "No planner handoff was recorded for this attempt.",
+  );
+  if (lines.at(-1) === "") lines.pop();
+  return lines;
+};
+
 const visibleFormFields = (
   fields: FormField[],
   focusedIndex: number,
@@ -878,6 +1132,7 @@ export function AgentqApp({
   const [context, setContext] = useState<UiContext>();
   const [snapshotVersion, setSnapshotVersion] = useState(0);
   const [events, setEvents] = useState<TaskEvent[]>([]);
+  const [liveRun, setLiveRun] = useState<Run>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [notice, setNotice] = useState<string>();
@@ -893,6 +1148,9 @@ export function AgentqApp({
   const [queueDraft, setQueueDraft] = useState<QueueDraft>();
   const [confirmation, setConfirmation] = useState<Confirmation>();
   const [runs, setRuns] = useState<Run[]>([]);
+  const [attemptIndex, setAttemptIndex] = useState(0);
+  const [attemptDetailOpen, setAttemptDetailOpen] = useState(false);
+  const [attemptDetailOffset, setAttemptDetailOffset] = useState(0);
   const [doctorChecks, setDoctorChecks] = useState<UiDoctorCheck[]>([]);
   const [integrationResults, setIntegrationResults] = useState<IntegrationResult[]>([]);
   const [actionIndex, setActionIndex] = useState(0);
@@ -981,17 +1239,31 @@ export function AgentqApp({
     const sequence = ++eventRefreshSequence.current;
     if (!selectedTaskId) {
       setEvents([]);
+      setLiveRun(undefined);
       return;
     }
     try {
-      const nextEvents = await controller.listEvents(selectedTaskId, { limit: 200 });
-      if (mounted.current && sequence === eventRefreshSequence.current) setEvents(nextEvents);
+      const [nextEvents, taskRuns] = await Promise.all([
+        controller.listEvents(selectedTaskId, { limit: 200 }),
+        selectedTask && isTaskActive(selectedTask.status)
+          ? controller.listRuns(selectedTaskId).catch(() => [])
+          : Promise.resolve([]),
+      ]);
+      if (mounted.current && sequence === eventRefreshSequence.current) {
+        setEvents(nextEvents);
+        setLiveRun(
+          taskRuns.find((candidate) => candidate.id === selectedTask?.currentRunId) ??
+            taskRuns.find((candidate) =>
+              ["starting", "running", "cancelling"].includes(candidate.status),
+            ),
+        );
+      }
     } catch (cause) {
       if (mounted.current && sequence === eventRefreshSequence.current) {
         setNotice(`Logs unavailable: ${messageFrom(cause)}`);
       }
     }
-  }, [controller, selectedTaskId]);
+  }, [controller, selectedTask, selectedTaskId]);
 
   useEffect(() => {
     if (snapshotVersion > 0) void refreshEvents();
@@ -1195,6 +1467,10 @@ export function AgentqApp({
       repoPath: context?.repositoryPath ?? process.cwd(),
       baseRef: "",
       providerIndex: 0,
+      planModel: "",
+      planInstructions: "",
+      implementModel: "",
+      implementInstructions: "",
       concurrency: "2",
       maxAttempts: "2",
       verifyCommands: "",
@@ -1217,6 +1493,10 @@ export function AgentqApp({
       repoPath: selectedQueue.repoPath,
       baseRef: selectedQueue.baseRef,
       providerIndex: Math.max(0, PROVIDERS.indexOf(selectedQueue.defaultProvider)),
+      planModel: selectedQueue.planModel,
+      planInstructions: selectedQueue.planInstructions,
+      implementModel: selectedQueue.implementModel,
+      implementInstructions: selectedQueue.implementInstructions,
       concurrency: String(selectedQueue.concurrency),
       maxAttempts: String(selectedQueue.maxAttempts),
       verifyCommands: selectedQueue.verifyCommands.join("; "),
@@ -1254,6 +1534,10 @@ export function AgentqApp({
           repoPath,
           ...(baseRef ? { baseRef } : {}),
           defaultProvider: provider,
+          planModel: queueDraft.planModel.trim(),
+          planInstructions: queueDraft.planInstructions.trim(),
+          implementModel: queueDraft.implementModel.trim(),
+          implementInstructions: queueDraft.implementInstructions.trim(),
           concurrency,
           maxAttempts,
           verifyCommands,
@@ -1261,13 +1545,17 @@ export function AgentqApp({
         });
         setSelectedQueueId(created.id);
         setFocus("queues");
-        setNotice(`Created queue ${created.name}.`);
+        setNotice(`Created queue ${created.name}. Settings are snapshotted by future claims.`);
       } else {
         if (!queueDraft.queueId) throw new Error("The selected queue is no longer available.");
         const patch: UiQueuePatch = {
           name,
           baseRef,
           defaultProvider: provider,
+          planModel: queueDraft.planModel.trim(),
+          planInstructions: queueDraft.planInstructions.trim(),
+          implementModel: queueDraft.implementModel.trim(),
+          implementInstructions: queueDraft.implementInstructions.trim(),
           concurrency,
           maxAttempts,
           verifyCommands,
@@ -1275,7 +1563,9 @@ export function AgentqApp({
         };
         const updated = await controller.updateQueue(queueDraft.queueId, patch);
         setSelectedQueueId(updated.id);
-        setNotice(`Updated queue ${updated.name}.`);
+        setNotice(
+          `Updated queue ${updated.name}. Changes apply to future claims; active attempts keep their snapshot.`,
+        );
       }
       setQueueDraft(undefined);
       setMode("dashboard");
@@ -1328,6 +1618,9 @@ export function AgentqApp({
     try {
       const nextRuns = await controller.listRuns(selectedTask.id);
       setRuns(nextRuns);
+      setAttemptIndex(0);
+      setAttemptDetailOpen(false);
+      setAttemptDetailOffset(0);
       setMode("attempts");
       setNotice(undefined);
     } catch (cause) {
@@ -1502,7 +1795,7 @@ export function AgentqApp({
       {
         id: "edit-queue",
         label: "Edit selected queue",
-        detail: "Provider, limits, verification, and commit policy",
+        detail: "Planning and implementation models, guidance, and limits",
         available: queueSelected,
       },
       {
@@ -1533,7 +1826,7 @@ export function AgentqApp({
       {
         id: "resume-task",
         label: "Resume selected task",
-        detail: "Continue its retained provider session",
+        detail: "Continue its latest retained planning or implementation stage",
         available: Boolean(selectedTask && canRetryTask(selectedTask.status)),
       },
       {
@@ -1738,6 +2031,17 @@ export function AgentqApp({
     ],
   );
 
+  const safeAttemptIndex = Math.max(0, Math.min(runs.length - 1, attemptIndex));
+  const selectedAttempt = runs[safeAttemptIndex];
+  const attemptPanelWidth = Math.max(1, Math.min(columns - 2, 96));
+  const attemptHorizontalPadding = columns >= 50 ? 2 : 1;
+  const attemptContentWidth = Math.max(1, attemptPanelWidth - attemptHorizontalPadding * 2 - 2);
+  const attemptDetailCapacity = Math.max(1, rows - 9);
+  const attemptDetailLines = selectedAttempt
+    ? attemptWorkflowLines(selectedAttempt, attemptContentWidth)
+    : [];
+  const attemptDetailMaxOffset = Math.max(0, attemptDetailLines.length - attemptDetailCapacity);
+
   useInput((input, key) => {
     if (mode === "help") {
       if (key.escape || input === "?") setMode("dashboard");
@@ -1750,7 +2054,45 @@ export function AgentqApp({
     }
 
     if (mode === "attempts") {
-      if (key.escape || input === "v") setMode("dashboard");
+      if (attemptDetailOpen) {
+        if (input === "v") {
+          setAttemptDetailOpen(false);
+          setAttemptDetailOffset(0);
+          setMode("dashboard");
+          return;
+        }
+        if (key.escape) {
+          setAttemptDetailOpen(false);
+          setAttemptDetailOffset(0);
+          return;
+        }
+        if (key.upArrow || input === "k") {
+          setAttemptDetailOffset((current) => Math.max(0, current - 1));
+          return;
+        }
+        if (key.downArrow || input === "j") {
+          setAttemptDetailOffset((current) => Math.min(attemptDetailMaxOffset, current + 1));
+        }
+        return;
+      }
+      if (key.escape || input === "v") {
+        setMode("dashboard");
+        return;
+      }
+      if (key.upArrow || input === "k") {
+        setAttemptIndex((current) => nextIndex(current, runs.length, -1));
+        setAttemptDetailOffset(0);
+        return;
+      }
+      if (key.downArrow || input === "j") {
+        setAttemptIndex((current) => nextIndex(current, runs.length, 1));
+        setAttemptDetailOffset(0);
+        return;
+      }
+      if (key.return && selectedAttempt) {
+        setAttemptDetailOpen(true);
+        setAttemptDetailOffset(0);
+      }
       return;
     }
 
@@ -1814,9 +2156,11 @@ export function AgentqApp({
         void submitQueue();
         return;
       }
-      const providerField = queueDraft.kind === "create" ? 3 : 2;
-      const autoCommitField = queueDraft.kind === "create" ? 7 : 6;
-      const fieldCount = autoCommitField + 1;
+      const controls = queueFormControls(queueDraft.kind);
+      const focusedControl = controls.find(
+        (control) => "focusIndex" in control && control.focusIndex === queueDraft.field,
+      );
+      const fieldCount = controls.filter((control) => "focusIndex" in control).length;
       if (key.tab) {
         setQueueDraft((current) =>
           current
@@ -1826,23 +2170,26 @@ export function AgentqApp({
         return;
       }
       if (
-        queueDraft.field === providerField &&
+        focusedControl?.kind === "provider" &&
         (key.leftArrow || key.upArrow || key.rightArrow || key.downArrow)
       ) {
         const delta = key.leftArrow || key.upArrow ? -1 : 1;
-        setQueueDraft((current) =>
-          current
-            ? {
-                ...current,
-                providerIndex: nextIndex(current.providerIndex, PROVIDERS.length, delta),
-                error: undefined,
-              }
-            : current,
-        );
+        setQueueDraft((current) => {
+          if (!current) return current;
+          const providerIndex = nextIndex(current.providerIndex, PROVIDERS.length, delta);
+          return {
+            ...current,
+            providerIndex,
+            ...(providerIndex === current.providerIndex
+              ? {}
+              : { planModel: "", implementModel: "" }),
+            error: undefined,
+          };
+        });
         return;
       }
       if (
-        queueDraft.field === autoCommitField &&
+        focusedControl?.kind === "toggle" &&
         (input === " " || key.leftArrow || key.upArrow || key.rightArrow || key.downArrow)
       ) {
         setQueueDraft((current) =>
@@ -1851,7 +2198,7 @@ export function AgentqApp({
         return;
       }
       if (key.return) {
-        if (queueDraft.field < autoCommitField) {
+        if (queueDraft.field < fieldCount - 1) {
           setQueueDraft((current) =>
             current ? { ...current, field: current.field + 1 } : current,
           );
@@ -1861,28 +2208,21 @@ export function AgentqApp({
         return;
       }
 
-      const createFields = [
-        "name",
-        "repoPath",
-        "baseRef",
-        undefined,
-        "concurrency",
-        "maxAttempts",
-        "verifyCommands",
-        undefined,
-      ] as const;
-      const editFields = [
-        "name",
-        "baseRef",
-        undefined,
-        "concurrency",
-        "maxAttempts",
-        "verifyCommands",
-        undefined,
-      ] as const;
-      const textField = (queueDraft.kind === "create" ? createFields : editFields)[
-        queueDraft.field
-      ];
+      const textField = focusedControl?.kind === "text" ? focusedControl.key : undefined;
+      if (
+        textField &&
+        focusedControl?.kind === "text" &&
+        focusedControl.multiline &&
+        key.ctrl &&
+        input === "n"
+      ) {
+        setQueueDraft((current) =>
+          current
+            ? { ...current, [textField]: `${current[textField]}\n`, error: undefined }
+            : current,
+        );
+        return;
+      }
       if (textField && ((key.ctrl && input === "u") || key.backspace || key.delete)) {
         setQueueDraft((current) => {
           if (!current) return current;
@@ -1940,6 +2280,14 @@ export function AgentqApp({
               }
             : current,
         );
+        return;
+      }
+      if (key.ctrl && input === "n" && (editDraft.field === 3 || editDraft.field === 4)) {
+        setEditDraft((current) => {
+          if (!current || (current.field !== 3 && current.field !== 4)) return current;
+          const field = current.field === 3 ? "instructions" : "acceptanceCriteria";
+          return { ...current, [field]: `${current[field]}\n`, error: undefined };
+        });
         return;
       }
       if (key.return) {
@@ -2035,6 +2383,14 @@ export function AgentqApp({
             ...current,
             providerIndex: nextIndex(current.providerIndex, PROVIDERS.length, delta),
           };
+        });
+        return;
+      }
+      if (key.ctrl && input === "n" && (draft.field === 3 || draft.field === 5)) {
+        setDraft((current) => {
+          if (!current || (current.field !== 3 && current.field !== 5)) return current;
+          const field = current.field === 3 ? "instructions" : "acceptanceCriteria";
+          return { ...current, [field]: `${current[field]}\n`, error: undefined };
         });
         return;
       }
@@ -2278,7 +2634,9 @@ export function AgentqApp({
             <Text bold>:</Text> action center · <Text bold>g</Text> local / all ·{" "}
             <Text bold>R</Text> refresh · <Text bold>q</Text> quit · <Text bold>? / esc</Text> close
           </Text>
-          <Text dimColor>Forms: tab fields · ctrl+u clear · ctrl+s save · esc cancel</Text>
+          <Text dimColor>
+            Forms: tab fields · ctrl+n newline · ctrl+u clear · ctrl+s save · esc cancel
+          </Text>
         </Box>
       </Box>
     );
@@ -2348,93 +2706,36 @@ export function AgentqApp({
 
   if (mode === "queue-form" && queueDraft) {
     const provider = PROVIDERS[queueDraft.providerIndex] ?? "codex";
-    const fields: FormField[] =
-      queueDraft.kind === "create"
-        ? [
-            {
-              label: "Name",
-              value: queueDraft.name,
-              focused: queueDraft.field === 0,
-              textInput: true,
-            },
-            {
-              label: "Repository",
-              value: queueDraft.repoPath,
-              focused: queueDraft.field === 1,
-              textInput: true,
-            },
-            {
-              label: "Base ref",
-              value: queueDraft.baseRef || "auto (current branch)",
-              focused: queueDraft.field === 2,
-              textInput: true,
-            },
-            { label: "Provider", value: provider, focused: queueDraft.field === 3 },
-            {
-              label: "Concurrency",
-              value: queueDraft.concurrency,
-              focused: queueDraft.field === 4,
-              textInput: true,
-            },
-            {
-              label: "Max attempts",
-              value: queueDraft.maxAttempts,
-              focused: queueDraft.field === 5,
-              textInput: true,
-            },
-            {
-              label: "Verify commands",
-              value: queueDraft.verifyCommands || "none",
-              focused: queueDraft.field === 6,
-              multiline: true,
-              textInput: true,
-            },
-            {
-              label: "Auto-commit",
-              value: queueDraft.autoCommit ? "on" : "off",
-              focused: queueDraft.field === 7,
-            },
-          ]
-        : [
-            {
-              label: "Name",
-              value: queueDraft.name,
-              focused: queueDraft.field === 0,
-              textInput: true,
-            },
-            { label: "Repository (read-only)", value: queueDraft.repoPath, focusable: false },
-            {
-              label: "Base ref",
-              value: queueDraft.baseRef,
-              focused: queueDraft.field === 1,
-              textInput: true,
-            },
-            { label: "Provider", value: provider, focused: queueDraft.field === 2 },
-            {
-              label: "Concurrency",
-              value: queueDraft.concurrency,
-              focused: queueDraft.field === 3,
-              textInput: true,
-            },
-            {
-              label: "Max attempts",
-              value: queueDraft.maxAttempts,
-              focused: queueDraft.field === 4,
-              textInput: true,
-            },
-            {
-              label: "Verify commands",
-              value: queueDraft.verifyCommands || "none",
-              focused: queueDraft.field === 5,
-              multiline: true,
-              textInput: true,
-            },
-            {
-              label: "Auto-commit",
-              value: queueDraft.autoCommit ? "on" : "off",
-              focused: queueDraft.field === 6,
-            },
-          ];
+    const fields: FormField[] = queueFormControls(queueDraft.kind).map((control) => {
+      if (control.kind === "readonly") {
+        return {
+          label: control.label,
+          value: queueDraft[control.key],
+          focusable: false,
+        };
+      }
+      if (control.kind === "provider") {
+        return {
+          label: control.label,
+          value: provider,
+          focused: queueDraft.field === control.focusIndex,
+        };
+      }
+      if (control.kind === "toggle") {
+        return {
+          label: control.label,
+          value: queueDraft[control.key] ? "on" : "off",
+          focused: queueDraft.field === control.focusIndex,
+        };
+      }
+      return {
+        label: control.label,
+        value: queueDraft[control.key] || control.placeholder || "",
+        focused: queueDraft.field === control.focusIndex,
+        multiline: control.multiline,
+        textInput: true,
+      };
+    });
     return (
       <FormScreen
         columns={columns}
@@ -2447,14 +2748,68 @@ export function AgentqApp({
         }
         fields={fields}
         error={queueDraft.error}
-        footer="ctrl+s save · esc cancel · ←→ change · tab fields · ctrl+u clear · ; separates commands"
+        footer="ctrl+s save · ctrl+n newline · esc cancel · ←→ change · tab fields · ctrl+u clear"
       />
     );
   }
 
   if (mode === "attempts" && selectedTask) {
-    const capacity = Math.max(1, Math.floor((rows - 10) / 4));
-    const visibleRuns = runs.slice(0, capacity);
+    if (attemptDetailOpen && selectedAttempt) {
+      const safeOffset = Math.min(attemptDetailOffset, attemptDetailMaxOffset);
+      const visibleLines = attemptDetailLines.slice(safeOffset, safeOffset + attemptDetailCapacity);
+      const workflow = selectedAttempt.taskSnapshot?.workflow;
+      return (
+        <Box width={columns} height={rows} flexDirection="column" overflow="hidden">
+          <Header
+            tasks={snapshot.tasks}
+            focus={focus}
+            narrow={columns < 72}
+            scopeLabel={displayScope}
+          />
+          <Box flexGrow={1} alignItems="center" overflow="hidden">
+            <Box
+              width={attemptPanelWidth}
+              height={Math.max(1, rows - 4)}
+              borderStyle="double"
+              borderColor="magenta"
+              paddingX={attemptHorizontalPadding}
+              flexDirection="column"
+              overflow="hidden"
+            >
+              <Text bold color="magenta" wrap="truncate-end">
+                ATTEMPT DETAIL · #{selectedAttempt.attemptNo}
+              </Text>
+              <Text dimColor wrap="truncate-end">
+                {selectedAttempt.status.toUpperCase()} · {selectedAttempt.provider} ·{" "}
+                {selectedAttempt.phase} · plan{" "}
+                {sanitizeTerminalText(workflow?.planModel || `${selectedAttempt.provider} default`)}{" "}
+                → implement{" "}
+                {sanitizeTerminalText(
+                  workflow?.implementModel || `${selectedAttempt.provider} default`,
+                )}
+              </Text>
+              <Box height={attemptDetailCapacity} flexDirection="column" overflow="hidden">
+                {visibleLines.map((line, index) => (
+                  // The workflow snapshot is immutable; its absolute line number is a stable key.
+                  // biome-ignore lint/suspicious/noArrayIndexKey: static viewport over immutable text
+                  <Text key={`${safeOffset + index}-${line}`} wrap="truncate-end">
+                    {line || " "}
+                  </Text>
+                ))}
+              </Box>
+              <Text dimColor wrap="truncate-end">
+                Lines {safeOffset + 1}–
+                {Math.min(attemptDetailLines.length, safeOffset + attemptDetailCapacity)} of{" "}
+                {attemptDetailLines.length} · ↑↓/jk scroll · esc attempts · v dashboard
+              </Text>
+            </Box>
+          </Box>
+        </Box>
+      );
+    }
+
+    const capacity = Math.max(1, Math.floor((rows - 9) / 5));
+    const visible = windowItems(runs, safeAttemptIndex, capacity);
     return (
       <Box width={columns} height={rows} flexDirection="column" overflow="hidden">
         <Header
@@ -2465,59 +2820,71 @@ export function AgentqApp({
         />
         <Box flexGrow={1} alignItems="center" overflow="hidden">
           <Box
-            width={Math.max(1, Math.min(columns - 2, 96))}
+            width={attemptPanelWidth}
             height={Math.max(1, rows - 4)}
             borderStyle="double"
             borderColor="magenta"
-            paddingX={columns >= 50 ? 2 : 1}
+            paddingX={attemptHorizontalPadding}
             flexDirection="column"
             overflow="hidden"
           >
             <Text bold color="magenta">
               ATTEMPTS · {sanitizeTerminalText(selectedTask.title)}
             </Text>
-            {runs.length === 0 ? <Text dimColor>No attempts have started.</Text> : null}
-            {visibleRuns.map((run) => (
-              <Box key={run.id} flexDirection="column" marginBottom={1}>
-                <Text>
-                  <Text
-                    bold
-                    color={
-                      run.status === "succeeded"
-                        ? "green"
-                        : run.status === "failed"
-                          ? "red"
-                          : "cyan"
-                    }
-                  >
-                    #{run.attemptNo} {run.status.toUpperCase()}
-                  </Text>
-                  <Text dimColor>
-                    {" "}
-                    · {run.provider} · {run.id}
-                  </Text>
-                </Text>
-                <Text dimColor wrap="truncate-end">
-                  {sanitizeTerminalText(runSummary(run))}
-                </Text>
-                <Text dimColor wrap="truncate-end">
-                  {run.taskSnapshot
-                    ? `Spec: ${sanitizeTerminalText(run.taskSnapshot.title)} · ${run.taskSnapshot.provider} · priority ${run.taskSnapshot.priority}`
-                    : "Spec snapshot unavailable (legacy attempt)"}
-                </Text>
-                <Text dimColor wrap="truncate-end">
-                  {run.worktreePath
-                    ? sanitizeTerminalText(run.worktreePath)
-                    : "No worktree recorded"}
-                </Text>
-              </Box>
-            ))}
-            {runs.length > visibleRuns.length ? (
+            {runs.length > 0 ? (
               <Text dimColor>
-                … {runs.length - visibleRuns.length} older attempts hidden at this size
+                SELECTED {safeAttemptIndex + 1}/{runs.length} · ↑↓/jk select · enter details
               </Text>
             ) : null}
-            <Text dimColor>v / esc back</Text>
+            {runs.length === 0 ? <Text dimColor>No attempts have started.</Text> : null}
+            {visible.items.map((run, offset) => {
+              const index = visible.start + offset;
+              const selected = index === safeAttemptIndex;
+              return (
+                <Box key={run.id} flexDirection="column" marginBottom={1}>
+                  <Text>
+                    <Text color={selected ? "magenta" : undefined}>{selected ? "› " : "  "}</Text>
+                    <Text
+                      bold={selected}
+                      color={
+                        run.status === "succeeded"
+                          ? "green"
+                          : run.status === "failed"
+                            ? "red"
+                            : "cyan"
+                      }
+                    >
+                      #{run.attemptNo} {run.status.toUpperCase()}
+                    </Text>
+                    <Text dimColor>
+                      {" "}
+                      · {run.provider} · {run.phase} · {run.id}
+                    </Text>
+                  </Text>
+                  <Text dimColor wrap="truncate-end">
+                    {sanitizeTerminalText(runSummary(run))}
+                  </Text>
+                  <Text dimColor wrap="truncate-end">
+                    {run.taskSnapshot
+                      ? `Spec: ${sanitizeTerminalText(run.taskSnapshot.title)} · ${run.taskSnapshot.provider} · priority ${run.taskSnapshot.priority}`
+                      : "Spec snapshot unavailable (legacy attempt)"}
+                  </Text>
+                  {run.taskSnapshot?.workflow ? (
+                    <Text dimColor wrap="truncate-end">
+                      Models: plan{" "}
+                      {sanitizeTerminalText(
+                        run.taskSnapshot.workflow.planModel || `${run.provider} default`,
+                      )}{" "}
+                      → implement{" "}
+                      {sanitizeTerminalText(
+                        run.taskSnapshot.workflow.implementModel || `${run.provider} default`,
+                      )}
+                    </Text>
+                  ) : null}
+                </Box>
+              );
+            })}
+            <Text dimColor>↑↓ / j k select · enter details · v / esc back</Text>
           </Box>
         </Box>
       </Box>
@@ -2842,6 +3209,7 @@ export function AgentqApp({
     <DetailsPane
       task={selectedTask}
       queue={selectedQueue}
+      run={liveRun?.taskId === selectedTask?.id ? liveRun : undefined}
       events={events}
       active={focus === "details"}
       height={singlePane || wide ? bodyHeight : mediumDetailsHeight}

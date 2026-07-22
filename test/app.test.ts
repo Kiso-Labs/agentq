@@ -87,7 +87,7 @@ async function failedRun(
     baseSha: "0123456789abcdef",
     branchName: `agentq/${task.id}`,
     worktreePath: details.worktreePath,
-    providerSessionId: details.providerSessionId,
+    planSessionId: details.providerSessionId,
   });
   app.store.finishRun(claim.run.id, { status: "failed", exitCode: 1 });
   return claim.run.id;
@@ -254,6 +254,79 @@ describe("AgentQApp", () => {
     expect((await value.app.getTask(mismatched.id)).status).toBe("failed");
   });
 
+  test("resumes the latest saved implementation plan without requiring a provider session", async () => {
+    const value = await fixture();
+    const queue = await value.app.createQueue({
+      name: "saved-plan",
+      repoPath: value.firstRepo,
+      maxAttempts: 1,
+    });
+    const task = await value.app.addTask({ queue: queue.id, title: "Continue saved plan" });
+    const retained = join(value.root, "saved-plan-worktree");
+    await mkdir(retained);
+    const claim = value.app.store.claimNextTask({ queue: queue.id, ownerToken: "planner-owner" });
+    if (!claim) throw new Error("Expected claim");
+    value.app.store.markRunRunning(
+      claim.run.id,
+      {
+        baseSha: "0123456789abcdef",
+        branchName: `agentq/${task.id}`,
+        worktreePath: retained,
+        planSessionId: "completed-planner",
+      },
+      claim.leaseToken,
+    );
+    value.app.store.advanceRunToImplementation(
+      claim.run.id,
+      { planOutput: "Edit src/saved.ts and run the focused test." },
+      claim.leaseToken,
+    );
+    value.app.store.finishRun(
+      claim.run.id,
+      { status: "failed", error: "Implementation process did not start" },
+      claim.leaseToken,
+    );
+
+    await value.app.resumeTask(task.id);
+    expect(await value.app.getTask(task.id)).toMatchObject({
+      status: "queued",
+      resumeRunId: claim.run.id,
+    });
+  });
+
+  test("never falls back to an older resumable attempt", async () => {
+    const value = await fixture();
+    const queue = await value.app.createQueue({
+      name: "latest-only",
+      repoPath: value.firstRepo,
+      maxAttempts: 1,
+    });
+    const task = await value.app.addTask({ queue: queue.id, title: "Use latest attempt only" });
+    const olderPath = join(value.root, "older-resumable");
+    await mkdir(olderPath);
+    await failedRun(value.app, queue, task, {
+      worktreePath: olderPath,
+      providerSessionId: "older-plan-session",
+    });
+
+    value.app.store.requeueTask(task.id);
+    const newest = value.app.store.claimNextTask({ queue: queue.id });
+    if (!newest) throw new Error("Expected newest claim");
+    const newestPath = join(value.root, "newest-unresumable");
+    await mkdir(newestPath);
+    value.app.store.updateRun(newest.run.id, {
+      baseSha: "fedcba9876543210",
+      branchName: `agentq/${task.id}-newest`,
+      worktreePath: newestPath,
+    });
+    value.app.store.finishRun(newest.run.id, { status: "failed", error: "No planner session" });
+
+    await expect(value.app.resumeTask(task.id)).rejects.toMatchObject({
+      code: "RUN_NOT_RESUMABLE",
+    } satisfies Partial<AgentQError>);
+    expect((await value.app.getTask(task.id)).status).toBe("failed");
+  });
+
   test("cancels, retries, and manually completes a task through the service", async () => {
     const value = await fixture();
     const queue = await value.app.createQueue({ name: "lifecycle", repoPath: value.firstRepo });
@@ -412,7 +485,7 @@ describe("AgentQApp", () => {
     const prepared = await value.app.worktrees.prepare(queue, claim.task, claim.run.attemptNo);
     value.app.store.updateRun(claim.run.id, {
       ...prepared,
-      providerSessionId: "retained-session",
+      planSessionId: "retained-session",
     });
     value.app.store.finishRun(claim.run.id, { status: "failed", exitCode: 1 });
 

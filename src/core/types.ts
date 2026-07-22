@@ -67,6 +67,16 @@ export const RUN_STATUSES = [
 ] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
 
+export const EXECUTION_PHASES = ["plan", "implement"] as const;
+export type ExecutionPhase = (typeof EXECUTION_PHASES)[number];
+
+export interface QueueWorkflowSnapshot {
+  planModel: string;
+  planInstructions: string;
+  implementModel: string;
+  implementInstructions: string;
+}
+
 export interface Queue {
   id: string;
   name: string;
@@ -74,6 +84,10 @@ export interface Queue {
   repoPath: string;
   baseRef: string;
   defaultProvider: Provider;
+  planModel: string;
+  planInstructions: string;
+  implementModel: string;
+  implementInstructions: string;
   concurrency: number;
   maxAttempts: number;
   verifyCommands: string[];
@@ -88,6 +102,8 @@ export interface TaskSpecSnapshot {
   acceptanceCriteria: string[];
   provider: Provider;
   priority: number;
+  /** Immutable queue workflow captured when this attempt is claimed. */
+  workflow?: QueueWorkflowSnapshot;
 }
 
 export interface Task {
@@ -118,10 +134,13 @@ export interface Run {
   attemptNo: number;
   provider: Provider;
   status: RunStatus;
+  phase: ExecutionPhase;
   baseSha?: string;
   branchName?: string;
   worktreePath?: string;
   providerSessionId?: string;
+  planSessionId?: string;
+  planOutput?: string;
   pid?: number;
   processToken?: string;
   processStartMarker?: string;
@@ -152,6 +171,10 @@ export interface CreateQueueInput {
   repoPath: string;
   baseRef?: string;
   defaultProvider?: Provider;
+  planModel?: string;
+  planInstructions?: string;
+  implementModel?: string;
+  implementInstructions?: string;
   concurrency?: number;
   maxAttempts?: number;
   verifyCommands?: string[];
@@ -173,7 +196,15 @@ export interface AddTaskInput {
 export type ExecutorEvent =
   | { type: "session"; sessionId: string }
   | { type: "assistant"; text: string; delta?: boolean }
-  | { type: "tool"; name: string; state: "started" | "completed" | "failed"; detail?: string }
+  | {
+      type: "tool";
+      toolId?: string;
+      name: string;
+      state: "started" | "completed" | "failed";
+      detail?: string;
+      output?: string;
+      exitCode?: number;
+    }
   | { type: "usage"; inputTokens?: number; outputTokens?: number; costUsd?: number }
   | { type: "diagnostic"; level: "info" | "warning" | "error"; message: string };
 
@@ -192,6 +223,9 @@ export interface ExecutorRunInput {
   queue: Queue;
   cwd: string;
   prompt: string;
+  phase: ExecutionPhase;
+  /** Empty means use the provider CLI's configured default model. */
+  model?: string;
   resumeSessionId?: string;
   /** Supervisor-only launch gate used while durable process identity is recorded. */
   deferStart?: boolean;

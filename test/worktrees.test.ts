@@ -92,6 +92,10 @@ describe("WorktreeManager", () => {
       repoPath: repo,
       baseRef: "main",
       defaultProvider: "codex",
+      planModel: "",
+      planInstructions: "",
+      implementModel: "",
+      implementInstructions: "",
       concurrency: 2,
       maxAttempts: 2,
       verifyCommands: [],
@@ -117,7 +121,13 @@ describe("WorktreeManager", () => {
     const prepared = await manager.prepare(queue, task, 1);
     expect(prepared.worktreePath).not.toBe(repo);
     expect(prepared.branchName).toContain("agentq/bugs/");
+    await expect(
+      manager.assertUnchanged(prepared.worktreePath, prepared.baseSha),
+    ).resolves.toBeUndefined();
     await writeFile(join(prepared.worktreePath, "README.md"), "changed\n");
+    await expect(
+      manager.assertUnchanged(prepared.worktreePath, prepared.baseSha),
+    ).rejects.toMatchObject({ code: "PLANNER_MODIFIED_WORKTREE" });
     const sha = await manager.commitChanges(prepared.worktreePath, task);
     expect(sha).toHaveLength(40);
     expect(await readFile(join(repo, "README.md"), "utf8")).toBe("hello\n");
@@ -136,6 +146,10 @@ describe("WorktreeManager", () => {
       repoPath,
       baseRef: "main",
       defaultProvider: "codex",
+      planModel: "",
+      planInstructions: "",
+      implementModel: "",
+      implementInstructions: "",
       concurrency: 2,
       maxAttempts: 2,
       verifyCommands: [],
@@ -180,6 +194,10 @@ describe("WorktreeManager", () => {
       repoPath: repo,
       baseRef: "main",
       defaultProvider: "codex",
+      planModel: "",
+      planInstructions: "",
+      implementModel: "",
+      implementInstructions: "",
       concurrency: 1,
       maxAttempts: 1,
       verifyCommands: [],
@@ -217,6 +235,10 @@ describe("WorktreeManager", () => {
       repoPath: repo,
       baseRef: "main",
       defaultProvider: "codex",
+      planModel: "",
+      planInstructions: "",
+      implementModel: "",
+      implementInstructions: "",
       concurrency: 1,
       maxAttempts: 1,
       verifyCommands: [],

@@ -8,9 +8,11 @@ import {
   type CreateQueueInput,
   canCompleteTaskManually,
   canRetryTask,
+  EXECUTION_PHASES,
   isTaskActive,
   PROVIDERS,
   type Queue,
+  type QueueWorkflowSnapshot,
   RUN_STATUSES,
   type Run,
   type RunStatus,
@@ -24,6 +26,7 @@ import { migrate } from "./migrations.ts";
 import { selectAll, selectOne } from "./sqlite.ts";
 import type {
   AddTaskOptions,
+  AdvanceRunToImplementationInput,
   AppendEventInput,
   ClaimOptions,
   EditTaskInput,
@@ -50,6 +53,7 @@ const TERMINAL_TASK_STATUSES = ["succeeded", "failed", "interrupted", "cancelled
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
 const DEFAULT_LIST_LIMIT = 1_000;
 const MAX_LIST_LIMIT = 10_000;
+const MAX_PLAN_OUTPUT_LENGTH = 262_144;
 
 interface QueueRow {
   id: unknown;
@@ -58,6 +62,10 @@ interface QueueRow {
   repo_path: unknown;
   base_ref: unknown;
   default_provider: unknown;
+  plan_model: unknown;
+  plan_instructions: unknown;
+  implement_model: unknown;
+  implement_instructions: unknown;
   concurrency: unknown;
   max_attempts: unknown;
   verify_commands: unknown;
@@ -94,10 +102,13 @@ interface RunRow {
   attempt_no: unknown;
   provider: unknown;
   status: unknown;
+  phase: unknown;
   base_sha: unknown;
   branch_name: unknown;
   worktree_path: unknown;
   provider_session_id: unknown;
+  plan_session_id: unknown;
+  plan_output: unknown;
   pid: unknown;
   process_token: unknown;
   process_start_marker: unknown;
@@ -134,6 +145,10 @@ const QUEUE_COLUMNS = `
   q.repo_path,
   q.base_ref,
   q.default_provider,
+  q.plan_model,
+  q.plan_instructions,
+  q.implement_model,
+  q.implement_instructions,
   q.concurrency,
   q.max_attempts,
   q.verify_commands,
@@ -170,10 +185,13 @@ const RUN_COLUMNS = `
   r.attempt_no,
   r.provider,
   r.status,
+  r.phase,
   r.base_sha,
   r.branch_name,
   r.worktree_path,
   r.provider_session_id,
+  r.plan_session_id,
+  r.plan_output,
   r.pid,
   r.process_token,
   r.process_start_marker,
@@ -296,12 +314,41 @@ function taskSpecSnapshot(
   ) {
     return corrupt(entity, id, column, "a task specification snapshot");
   }
+  let workflow: QueueWorkflowSnapshot | undefined;
+  if (parsed.workflow !== undefined) {
+    if (!parsed.workflow || typeof parsed.workflow !== "object" || Array.isArray(parsed.workflow)) {
+      return corrupt(entity, id, `${column}.workflow`, "a queue workflow snapshot");
+    }
+    const value = parsed.workflow as Record<string, unknown>;
+    workflow = {
+      planModel: stringValue(value.planModel, entity, id, `${column}.workflow.planModel`),
+      planInstructions: stringValue(
+        value.planInstructions,
+        entity,
+        id,
+        `${column}.workflow.planInstructions`,
+      ),
+      implementModel: stringValue(
+        value.implementModel,
+        entity,
+        id,
+        `${column}.workflow.implementModel`,
+      ),
+      implementInstructions: stringValue(
+        value.implementInstructions,
+        entity,
+        id,
+        `${column}.workflow.implementInstructions`,
+      ),
+    };
+  }
   return {
     title: stringValue(parsed.title, entity, id, `${column}.title`),
     instructions: stringValue(parsed.instructions, entity, id, `${column}.instructions`),
     acceptanceCriteria: [...acceptanceCriteria],
     provider: enumValue(parsed.provider, PROVIDERS, entity, id, `${column}.provider`),
     priority: integerValue(parsed.priority, entity, id, `${column}.priority`),
+    ...(workflow === undefined ? {} : { workflow }),
   };
 }
 
@@ -327,6 +374,15 @@ function mapQueue(row: QueueRow): Queue {
     repoPath: stringValue(row.repo_path, "queue", id, "repo_path"),
     baseRef: stringValue(row.base_ref, "queue", id, "base_ref"),
     defaultProvider: enumValue(row.default_provider, PROVIDERS, "queue", id, "default_provider"),
+    planModel: stringValue(row.plan_model, "queue", id, "plan_model"),
+    planInstructions: stringValue(row.plan_instructions, "queue", id, "plan_instructions"),
+    implementModel: stringValue(row.implement_model, "queue", id, "implement_model"),
+    implementInstructions: stringValue(
+      row.implement_instructions,
+      "queue",
+      id,
+      "implement_instructions",
+    ),
     concurrency: integerValue(row.concurrency, "queue", id, "concurrency"),
     maxAttempts: integerValue(row.max_attempts, "queue", id, "max_attempts"),
     verifyCommands: jsonStringArray(row.verify_commands, "queue", id, "verify_commands"),
@@ -394,6 +450,7 @@ function mapRun(row: RunRow): Run {
     attemptNo: integerValue(row.attempt_no, "run", id, "attempt_no"),
     provider: enumValue(row.provider, PROVIDERS, "run", id, "provider"),
     status: enumValue(row.status, RUN_STATUSES, "run", id, "status"),
+    phase: enumValue(row.phase, EXECUTION_PHASES, "run", id, "phase"),
     ...optional("baseSha", optionalString(row.base_sha, "run", id, "base_sha")),
     ...optional("branchName", optionalString(row.branch_name, "run", id, "branch_name")),
     ...optional("worktreePath", optionalString(row.worktree_path, "run", id, "worktree_path")),
@@ -401,6 +458,8 @@ function mapRun(row: RunRow): Run {
       "providerSessionId",
       optionalString(row.provider_session_id, "run", id, "provider_session_id"),
     ),
+    ...optional("planSessionId", optionalString(row.plan_session_id, "run", id, "plan_session_id")),
+    ...optional("planOutput", optionalString(row.plan_output, "run", id, "plan_output")),
     ...optional("pid", optionalInteger(row.pid, "run", id, "pid")),
     ...optional("processToken", optionalString(row.process_token, "run", id, "process_token")),
     ...optional(
@@ -589,6 +648,10 @@ export class AgentQStore {
     const repoPath = nonEmpty(input.repoPath, "repoPath");
     const baseRef = nonEmpty(input.baseRef ?? "HEAD", "baseRef");
     const defaultProvider = input.defaultProvider ?? "codex";
+    const planModel = input.planModel?.trim() ?? "";
+    const planInstructions = input.planInstructions?.trim() ?? "";
+    const implementModel = input.implementModel?.trim() ?? "";
+    const implementInstructions = input.implementInstructions?.trim() ?? "";
     const concurrency = integerInput(input.concurrency ?? 1, "concurrency", 1);
     const maxAttempts = integerInput(input.maxAttempts ?? 3, "maxAttempts", 1);
     const verifyCommands = stringArrayInput(input.verifyCommands ?? [], "verifyCommands");
@@ -599,8 +662,9 @@ export class AgentQStore {
         `
           INSERT INTO queues(
             id, name, repo_key, repo_path, base_ref, default_provider, concurrency,
+            plan_model, plan_instructions, implement_model, implement_instructions,
             max_attempts, verify_commands, auto_commit, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
           id,
@@ -610,6 +674,10 @@ export class AgentQStore {
           baseRef,
           defaultProvider,
           concurrency,
+          planModel,
+          planInstructions,
+          implementModel,
+          implementInstructions,
           maxAttempts,
           JSON.stringify(verifyCommands),
           input.autoCommit === true ? 1 : 0,
@@ -692,7 +760,23 @@ export class AgentQStore {
     if (patch.repoKey !== undefined) set("repo_key", nonEmpty(patch.repoKey, "repoKey"));
     if (patch.repoPath !== undefined) set("repo_path", nonEmpty(patch.repoPath, "repoPath"));
     if (patch.baseRef !== undefined) set("base_ref", nonEmpty(patch.baseRef, "baseRef"));
-    if (patch.defaultProvider !== undefined) set("default_provider", patch.defaultProvider);
+    if (patch.defaultProvider !== undefined) {
+      set("default_provider", patch.defaultProvider);
+      if (patch.defaultProvider !== queue.defaultProvider) {
+        // Model identifiers are provider-specific. A provider switch without an
+        // explicit replacement must fall back to the new provider's defaults.
+        if (patch.planModel === undefined) set("plan_model", "");
+        if (patch.implementModel === undefined) set("implement_model", "");
+      }
+    }
+    if (patch.planModel !== undefined) set("plan_model", patch.planModel.trim());
+    if (patch.planInstructions !== undefined) {
+      set("plan_instructions", patch.planInstructions.trim());
+    }
+    if (patch.implementModel !== undefined) set("implement_model", patch.implementModel.trim());
+    if (patch.implementInstructions !== undefined) {
+      set("implement_instructions", patch.implementInstructions.trim());
+    }
     if (patch.concurrency !== undefined) {
       set("concurrency", integerInput(patch.concurrency, "concurrency", 1));
     }
@@ -1177,11 +1261,17 @@ export class AgentQStore {
       }
       if (resumeRunId !== null) {
         const resumeRun = this.#requireRun(resumeRunId);
+        const hasResumableStage =
+          resumeRun.phase === "plan"
+            ? Boolean(resumeRun.planSessionId)
+            : Boolean(resumeRun.planOutput);
         if (
           resumeRun.taskId !== task.id ||
           resumeRun.provider !== task.provider ||
-          !resumeRun.providerSessionId ||
-          !resumeRun.worktreePath
+          !hasResumableStage ||
+          !resumeRun.worktreePath ||
+          !resumeRun.branchName ||
+          !resumeRun.baseSha
         ) {
           throw new AgentQError(`Run ${resumeRunId} cannot be resumed`, "RUN_NOT_RESUMABLE");
         }
@@ -1303,29 +1393,57 @@ export class AgentQStore {
         options.ownerToken === undefined ? null : nonEmpty(options.ownerToken, "ownerToken");
       const ownerPid =
         options.ownerPid === undefined ? null : integerInput(options.ownerPid, "ownerPid", 1);
-      const snapshot: TaskSpecSnapshot = {
+      const useConfiguredModels = task.provider === queue.defaultProvider;
+      const currentSnapshot: TaskSpecSnapshot = {
         title: task.title,
         instructions: task.instructions,
         acceptanceCriteria: [...task.acceptanceCriteria],
         provider: task.provider,
         priority: task.priority,
+        workflow: {
+          planModel: useConfiguredModels ? queue.planModel : "",
+          planInstructions: queue.planInstructions,
+          implementModel: useConfiguredModels ? queue.implementModel : "",
+          implementInstructions: queue.implementInstructions,
+        },
       };
+      const resumeCandidate = task.resumeRunId ? this.#requireRun(task.resumeRunId) : undefined;
+      const resumedRun =
+        resumeCandidate &&
+        resumeCandidate.taskId === task.id &&
+        resumeCandidate.provider === task.provider &&
+        resumeCandidate.worktreePath &&
+        resumeCandidate.branchName &&
+        resumeCandidate.baseSha &&
+        resumeCandidate.taskSnapshot?.workflow &&
+        (resumeCandidate.phase === "plan"
+          ? resumeCandidate.planSessionId
+          : resumeCandidate.planOutput)
+          ? resumeCandidate
+          : undefined;
+      const snapshot = resumedRun?.taskSnapshot ?? currentSnapshot;
+      const phase = resumedRun?.phase ?? "plan";
+      const planOutput = resumedRun?.planOutput ?? null;
+      const planSessionId = resumedRun?.planSessionId ?? null;
 
       this.#database.run(
         `
           INSERT INTO runs(
-            id, task_id, attempt_no, provider, status, owner_token, owner_pid,
-            task_snapshot, started_at, heartbeat_at
-          ) VALUES (?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?)
+            id, task_id, attempt_no, provider, status, phase, owner_token, owner_pid,
+            task_snapshot, plan_output, plan_session_id, started_at, heartbeat_at
+          ) VALUES (?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
           runId,
           task.id,
           attemptNo,
           task.provider,
+          phase,
           ownerToken,
           ownerPid,
           JSON.stringify(snapshot),
+          planOutput,
+          planSessionId,
           now,
           now,
         ],
@@ -1334,10 +1452,11 @@ export class AgentQStore {
       const changed = this.#database.run(
         `
           UPDATE tasks
-          SET status = 'starting', attempt_count = ?, current_run_id = ?, updated_at = ?
+          SET status = 'starting', attempt_count = ?, current_run_id = ?,
+              resume_run_id = ?, updated_at = ?
           WHERE id = ? AND status = 'queued'
         `,
-        [attemptCount, runId, now, task.id],
+        [attemptCount, runId, resumedRun?.id ?? null, now, task.id],
       ).changes;
 
       if (changed !== 1) {
@@ -1389,6 +1508,10 @@ export class AgentQStore {
     const [limit, offset] = pagination(filter.limit, filter.offset);
     values.push(limit, offset);
     const clause = where.length === 0 ? "" : `WHERE ${where.join(" AND ")}`;
+    const orderBy =
+      filter.taskId === undefined
+        ? "r.started_at DESC, r.attempt_no DESC, r.id DESC"
+        : "r.attempt_no DESC, r.started_at DESC, r.id DESC";
 
     return selectAll<RunRow, Binding[]>(
       this.#database,
@@ -1397,7 +1520,7 @@ export class AgentQStore {
         FROM runs r
         ${join}
         ${clause}
-        ORDER BY r.started_at DESC, r.id DESC
+        ORDER BY ${orderBy}
         LIMIT ? OFFSET ?
       `,
       values,
@@ -1456,57 +1579,60 @@ export class AgentQStore {
   }
 
   updateRun(id: string, patch: UpdateRunInput, leaseToken?: string): Run {
-    this.#assertRunLease(id, leaseToken);
-    const fields: string[] = [];
-    const values: Binding[] = [];
-    const set = (column: string, value: Binding) => {
-      fields.push(`${column} = ?`);
-      values.push(value);
-    };
+    const update = this.#database.transaction(() => {
+      // Keep the lease check and guarded write under one IMMEDIATE lock so a
+      // fenced supervisor can never report a metadata update as successful.
+      this.#assertRunLease(id, leaseToken);
+      const fields: string[] = [];
+      const values: Binding[] = [];
+      const set = (column: string, value: Binding) => {
+        fields.push(`${column} = ?`);
+        values.push(value);
+      };
 
-    if (patch.status !== undefined) {
-      set("status", patch.status);
-    }
-    if (patch.baseSha !== undefined) set("base_sha", patch.baseSha);
-    if (patch.branchName !== undefined) set("branch_name", patch.branchName);
-    if (patch.worktreePath !== undefined) set("worktree_path", patch.worktreePath);
-    if (patch.providerSessionId !== undefined) {
-      set("provider_session_id", patch.providerSessionId);
-    }
-    if (patch.pid !== undefined) {
-      set("pid", patch.pid === null ? null : integerInput(patch.pid, "pid", 1));
-    }
-    if (patch.processToken !== undefined) set("process_token", patch.processToken);
-    if (patch.processStartMarker !== undefined) {
-      set("process_start_marker", patch.processStartMarker);
-    }
-    if (patch.processIdentityPath !== undefined) {
-      set("process_identity_path", patch.processIdentityPath);
-    }
-    if (patch.summary !== undefined) set("summary", patch.summary);
-    if (patch.error !== undefined) set("error", patch.error);
-    if (patch.logPath !== undefined) set("log_path", patch.logPath);
+      if (patch.status !== undefined) set("status", patch.status);
+      if (patch.baseSha !== undefined) set("base_sha", patch.baseSha);
+      if (patch.branchName !== undefined) set("branch_name", patch.branchName);
+      if (patch.worktreePath !== undefined) set("worktree_path", patch.worktreePath);
+      if (patch.providerSessionId !== undefined) {
+        set("provider_session_id", patch.providerSessionId);
+      }
+      if (patch.planSessionId !== undefined) set("plan_session_id", patch.planSessionId);
+      if (patch.pid !== undefined) {
+        set("pid", patch.pid === null ? null : integerInput(patch.pid, "pid", 1));
+      }
+      if (patch.processToken !== undefined) set("process_token", patch.processToken);
+      if (patch.processStartMarker !== undefined) {
+        set("process_start_marker", patch.processStartMarker);
+      }
+      if (patch.processIdentityPath !== undefined) {
+        set("process_identity_path", patch.processIdentityPath);
+      }
+      if (patch.summary !== undefined) set("summary", patch.summary);
+      if (patch.error !== undefined) set("error", patch.error);
+      if (patch.logPath !== undefined) set("log_path", patch.logPath);
 
-    if (fields.length === 0) return this.#requireRun(id);
-    values.push(id);
-    if (leaseToken !== undefined) values.push(leaseToken);
-    const activeCondition =
-      patch.status === undefined ? "" : " AND status IN ('starting', 'running', 'cancelling')";
-    const leaseCondition = leaseToken === undefined ? "" : " AND owner_token = ?";
-    const changed = this.#database.run(
-      `UPDATE runs SET ${fields.join(", ")} WHERE id = ?${activeCondition}${leaseCondition}`,
-      values,
-    ).changes;
+      if (fields.length === 0) return this.#requireRun(id);
+      values.push(id);
+      if (leaseToken !== undefined) values.push(leaseToken);
+      const activeCondition =
+        patch.status === undefined ? "" : " AND status IN ('starting', 'running', 'cancelling')";
+      const leaseCondition = leaseToken === undefined ? "" : " AND owner_token = ?";
+      const changed = this.#database.run(
+        `UPDATE runs SET ${fields.join(", ")} WHERE id = ?${activeCondition}${leaseCondition}`,
+        values,
+      ).changes;
 
-    if (changed === 0) {
-      const run = this.#requireRun(id);
-      if (patch.status !== undefined) {
+      if (changed !== 1) {
+        if (leaseToken !== undefined) {
+          throw new AgentQError(`Run ${id} lease was lost`, "RUN_LEASE_LOST");
+        }
         throw new AgentQError(`Run ${id} is already terminal`, "RUN_NOT_ACTIVE");
       }
-      return run;
-    }
 
-    return this.#requireRun(id);
+      return this.#requireRun(id);
+    });
+    return update.immediate();
   }
 
   markRunRunning(id: string, input: MarkRunRunningInput = {}, leaseToken?: string): Run {
@@ -1528,6 +1654,7 @@ export class AgentQStore {
         ["branchName", "branch_name"],
         ["worktreePath", "worktree_path"],
         ["providerSessionId", "provider_session_id"],
+        ["planSessionId", "plan_session_id"],
         ["pid", "pid"],
         ["processToken", "process_token"],
         ["processStartMarker", "process_start_marker"],
@@ -1585,6 +1712,57 @@ export class AgentQStore {
       throw new AgentQError(`Run ${id} is already terminal`, "RUN_NOT_ACTIVE");
     }
     return this.#requireRun(id);
+  }
+
+  advanceRunToImplementation(
+    id: string,
+    input: AdvanceRunToImplementationInput,
+    leaseToken?: string,
+  ): Run {
+    const advance = this.#database.transaction(() => {
+      this.#assertRunLease(id, leaseToken);
+      const run = this.#requireRun(id);
+      if (!ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number])) {
+        throw new AgentQError(`Run ${id} is already terminal`, "RUN_NOT_ACTIVE");
+      }
+      const task = this.#requireTask(run.taskId);
+      if (run.status === "cancelling" || task.cancelRequestedAt) {
+        throw new AgentQError(`Run ${id} is being cancelled`, "RUN_CANCELLING");
+      }
+      if (run.phase !== "plan") {
+        throw new AgentQError(`Run ${id} is already in implementation`, "RUN_PHASE_CHANGED");
+      }
+      const planOutput = nonEmpty(input.planOutput, "planOutput");
+      if (planOutput.length > MAX_PLAN_OUTPUT_LENGTH) {
+        throw new AgentQError(
+          `planOutput cannot exceed ${MAX_PLAN_OUTPUT_LENGTH} characters`,
+          "INVALID_INPUT",
+          2,
+        );
+      }
+      const planSessionId = input.planSessionId?.trim() || null;
+      const bindings: Binding[] = [planOutput, planSessionId, isoNow(), id];
+      if (leaseToken !== undefined) bindings.push(leaseToken);
+      const leaseCondition = leaseToken === undefined ? "" : " AND owner_token = ?";
+      const changed = this.#database.run(
+        `
+          UPDATE runs
+          SET phase = 'implement', plan_output = ?,
+              plan_session_id = COALESCE(?, plan_session_id),
+              provider_session_id = NULL, pid = NULL, process_token = NULL,
+              process_start_marker = NULL, process_identity_path = NULL,
+              heartbeat_at = ?
+          WHERE id = ? AND phase = 'plan'
+            AND status IN ('starting', 'running')${leaseCondition}
+        `,
+        bindings,
+      ).changes;
+      if (changed !== 1) {
+        throw new AgentQError(`Run ${id} phase or lease changed`, "RUN_PHASE_CHANGED");
+      }
+      return this.#requireRun(id);
+    });
+    return advance.immediate();
   }
 
   finishRun(id: string, input: FinishRunInput, leaseToken?: string): FinishedRun {
@@ -1867,17 +2045,19 @@ export class AgentQStore {
     }
     const [limit] = pagination(filter.limit, 0);
     values.push(limit);
-    return selectAll<EventRow, Binding[]>(
+    const direction = filter.afterId === undefined ? "DESC" : "ASC";
+    const events = selectAll<EventRow, Binding[]>(
       this.#database,
       `
         SELECT ${EVENT_COLUMNS}
         FROM task_events e
         WHERE ${where.join(" AND ")}
-        ORDER BY e.id
+        ORDER BY e.id ${direction}
         LIMIT ?
       `,
       values,
     ).map(mapEvent);
+    return filter.afterId === undefined ? events.reverse() : events;
   }
 
   deleteEvents(filter: EventFilter): number {

@@ -20,6 +20,10 @@ export type UpdateQueueInput = Partial<
     | "repoPath"
     | "baseRef"
     | "defaultProvider"
+    | "planModel"
+    | "planInstructions"
+    | "implementModel"
+    | "implementInstructions"
     | "concurrency"
     | "maxAttempts"
     | "verifyCommands"
@@ -95,6 +99,7 @@ export interface UpdateRunInput {
   branchName?: string | null;
   worktreePath?: string | null;
   providerSessionId?: string | null;
+  planSessionId?: string | null;
   pid?: number | null;
   processToken?: string | null;
   processStartMarker?: string | null;
@@ -102,6 +107,11 @@ export interface UpdateRunInput {
   summary?: string | null;
   error?: string | null;
   logPath?: string | null;
+}
+
+export interface AdvanceRunToImplementationInput {
+  planOutput: string;
+  planSessionId?: string;
 }
 
 export interface MarkRunRunningInput extends UpdateRunInput {

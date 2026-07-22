@@ -2,6 +2,8 @@
 
 `agentq` is a local, durable task queue for running Codex and Claude Code agents in parallel. Every attempt gets its own Git branch and worktree, so agents can work simultaneously without writing into the same checkout.
 
+Every task uses a mandatory two-agent workflow. A read-only planning process inspects the repository and produces a concrete file-, symbol-, and test-level handoff. A fresh implementation process then receives that handoff and performs the work. This custom planning stage cannot be disabled and is agentq's own pipeline, not Codex or Claude Code's built-in plan mode.
+
 It includes a full-screen Ink interface, scriptable JSON commands, SQLite persistence, live event logs, cancellation, retries, provider-session resumption, verification commands, and agent-to-agent task delegation.
 
 ## Install
@@ -39,6 +41,10 @@ cd ~/src/my-app
 agentq queue create app \
   --repo . \
   --provider codex \
+  --plan-model gpt-5.4-mini \
+  --plan-instructions "Identify the smallest safe change and exact verification" \
+  --implement-model gpt-5.4 \
+  --implement-instructions "Keep public APIs stable and add focused tests" \
   --concurrency 4 \
   --verify "bun test" \
   --verify "bun run typecheck"
@@ -96,16 +102,30 @@ agentq queue edit app \
   --name delivery \
   --base main \
   --provider claude \
+  --plan-model haiku \
+  --plan-instructions "Map the affected files, symbols, and tests" \
+  --implement-model sonnet \
+  --implement-instructions "Follow the handoff and preserve compatibility" \
   --concurrency 4 \
   --max-attempts 3 \
   --verify "bun test" \
   --verify "bun run typecheck" \
   --no-auto-commit
 
-agentq queue edit delivery --clear-verify --auto-commit
+agentq queue edit delivery \
+  --clear-plan-model \
+  --clear-plan-instructions \
+  --clear-implement-model \
+  --clear-implement-instructions \
+  --clear-verify \
+  --auto-commit
 ```
 
-`--verify` is repeatable and replaces the complete verification-command list; `--clear-verify` removes it. Queue edits can change the name, base ref, default provider, concurrency, attempt limit, verification commands, and auto-commit policy. The canonical repository identity and repository path stay fixed; create another queue to target a different repository.
+The task's selected provider is used for both planning and implementation. The two queue model fields select stage-specific models when the task uses the queue's default provider, and leaving either model blank uses that provider's default. If a task overrides the queue provider, agentq uses the override provider's default model for both stages instead of passing model names configured for a different provider. Planning and implementation instructions remain reusable queue-level guidance for every task in the queue.
+
+The four workflow settings are copied into the run's immutable snapshot when an attempt is claimed. Editing a queue changes later fresh attempts, but it cannot change an active attempt or a session resume that is continuing an earlier snapshot.
+
+`--verify` is repeatable and replaces the complete verification-command list; `--clear-verify` removes it. The four `--clear-plan-*` and `--clear-implement-*` options restore provider-default models or remove stage guidance. Queue edits can also change the name, base ref, default provider, concurrency, attempt limit, verification commands, and auto-commit policy. The canonical repository identity and repository path stay fixed; create another queue to target a different repository.
 
 ### Keyboard UI
 
@@ -119,7 +139,7 @@ The dashboard works in wide, medium, and narrow terminals. Its controls are:
 - Task shortcuts are `a` add, `c` cancel, `r` retry, `s` resume, `d` manually complete, and `v` view attempts.
 - `f` cycles the task-status filter, `g` toggles local/all-repository scope, `R` refreshes, `?` opens keyboard help, and `q` quits. `Esc` closes help, forms, results, and confirmation prompts.
 
-Queue creation collects the name, repository path, optional base ref, provider, concurrency, maximum attempts, verification commands, and auto-commit policy. Enter multiple verification commands separated by `;`. Queue editing exposes the same settings while showing its repository as read-only. Task and queue forms use large, individually bordered fields with a focus-following viewport on shorter terminals, so inputs remain comfortable instead of collapsing into compact rows. In all forms, use `Tab` and `Shift+Tab` to move between fields, arrow keys to change selectors, `Ctrl+U` to clear the current editable field, `Ctrl+S` to save, and `Esc` to cancel.
+Queue creation collects the name, repository path, optional base ref, provider, planning model and instructions, implementation model and instructions, concurrency, maximum attempts, verification commands, and auto-commit policy. Enter multiple verification commands separated by `;`; a blank stage model uses the provider default. Queue editing exposes the same settings while showing its repository as read-only. Task and queue forms use large, individually bordered fields with a focus-following viewport on shorter terminals, so inputs remain comfortable instead of collapsing into compact rows. In all forms, use `Tab` and `Shift+Tab` to move between fields, arrow keys to change selectors, `Ctrl+N` to insert a newline in a multiline field, `Ctrl+U` to clear the current editable field, `Ctrl+S` to save, and `Esc` to cancel.
 
 Destructive and consequential actions are explicit. Queue removal, task cancellation or retry, and provider-instruction installation require confirmation (`y`/`Enter` accepts; `n`/`Esc` cancels). Worktree cleanup also asks whether to use safe or force removal; press `f` or an arrow key to toggle that choice. The doctor screen uses `R` to rerun checks, `c` for real Codex login, and `l` for real Claude Code login. agentq temporarily yields the terminal to the official provider CLI, then restores Ink and refreshes the checks. Integration can target Codex, Claude Code, or both and reports each instruction file as created, updated, or unchanged. Attempt and integration-result screens close with `v`/`Esc` and `Enter`/`Esc`, respectively.
 
@@ -137,7 +157,7 @@ printf '%s' '{
 }' | agentq task add --stdin-json
 ```
 
-During a managed run, agentq injects `AGENTQ_QUEUE`, `AGENTQ_TASK_ID`, and `AGENTQ_RUN_ID`. A task created by that agent is recorded with parent/child provenance. Idempotency keys prevent duplicates across retries.
+During a managed run, agentq injects `AGENTQ_QUEUE`, `AGENTQ_TASK_ID`, `AGENTQ_RUN_ID`, and `AGENTQ_STAGE` (`plan` or `implement`). Only the implementation process receives the private task-intake directory, so the planner cannot enqueue child work. A task created there is recorded with parent/child provenance. Idempotency keys prevent duplicates across retries.
 
 Codex remains sandboxed while doing this: managed `task add` requests cross a per-run intake directory, and the supervisor atomically stages, validates, and inserts them. The agent never needs write access to the database or another task's worktree. Delegation defaults to 16 child tasks per parent and four ancestry levels; operators can lower those bounds with `AGENTQ_MAX_CHILD_TASKS_PER_RUN` and `AGENTQ_MAX_DELEGATION_DEPTH`.
 
@@ -159,7 +179,7 @@ agentq task edit <task-id> --clear-acceptance
 
 `--accept` is repeatable and replaces the complete acceptance-criteria list; `--clear-acceptance` removes it. Edits are limited to title, instructions, provider, priority, and acceptance criteria. Only `queued`, `failed`, `interrupted`, or `cancelled` tasks with no active run are editable. `starting`, `running`, `cancelling`, and `succeeded` tasks are locked, and optimistic version checks reject stale saves instead of overwriting a newer edit.
 
-Each claim atomically stores an immutable snapshot of those five task fields on its run. Editing a retryable task changes the next claimed attempt without rewriting what any previous attempt was asked to do.
+Each claim atomically stores an immutable snapshot of those five task fields plus the queue's planning model/instructions and implementation model/instructions on its run. Editing a retryable task or its queue changes the next fresh claimed attempt without rewriting what any previous attempt was asked to do. A retained session resume continues the earlier run's snapshot.
 
 ## Parallel execution model
 
@@ -176,10 +196,14 @@ Git worktree mutations are serialized per repository with crash-recoverable SQLi
 
 A successful attempt proceeds through:
 
-1. Provider process exits successfully.
-2. Queue verification commands pass in the task worktree.
-3. Uncommitted changes are committed to the task branch when auto-commit is enabled.
-4. The task is marked succeeded with its branch, commit, worktree, summary, and event history.
+1. A planner using the task's provider and planning model inspects the worktree with read-only tools and returns a non-empty implementation handoff.
+2. agentq verifies that the planner left `HEAD` unchanged and the Git worktree clean of tracked or untracked changes, then stores the handoff and planner session durably.
+3. A fresh process using the same provider and implementation model receives the original task, acceptance criteria, implementation guidance, and complete planner handoff.
+4. Queue verification commands pass in the task worktree.
+5. Uncommitted changes are committed to the task branch when auto-commit is enabled.
+6. The task is marked succeeded with its branch, commit, worktree, summary, and event history.
+
+An empty planner response or any Git-visible planner worktree change fails the planning phase; implementation is not started. There is no option to skip this custom planning stage or substitute either provider's built-in plan mode. When a retained provider stage and worktree from the current schema are available, `task resume` continues that phase. A planning-phase resume continues its planner session and still creates a fresh implementation process after producing a valid handoff. An implementation-phase resume reuses the stored handoff and resumes its implementation session when one was captured; if startup failed before a session existed, it starts a fresh implementation process in the retained worktree. Legacy pre-v5 sessions have no trustworthy planner handoff and are rejected for resume; use `task retry` to start them again with a fresh planning attempt. Every ordinary `task retry` likewise starts a new attempt from planning.
 
 agentq never merges, pushes, or opens pull requests automatically.
 
@@ -204,7 +228,7 @@ agentq task show <id>               show attempts and recent events
 agentq task logs <id> --follow      stream normalized provider events
 agentq task cancel <id>             cancel queued/running work
 agentq task retry <id>              retry in a fresh session/worktree
-agentq task resume <id>             resume the retained provider session/worktree
+agentq task resume <id>             continue the latest retained agent stage/worktree
 agentq task complete <id>           mark non-running work complete manually
 agentq task clean <id> --yes        remove a terminal task's retained worktree
 
@@ -236,8 +260,8 @@ SQLite runs in WAL mode with foreign keys, a busy timeout, atomic claims, fenced
 
 ## Security model
 
-- Codex runs with `workspace-write` sandboxing by default.
-- Claude Code runs in `acceptEdits` mode with an explicit coding-tool allowlist. Claude Code does not provide the same filesystem sandbox as Codex.
+- Codex planning runs with `read-only`; implementation runs with `workspace-write` and receives only its run's intake directory as an additional writable root.
+- Claude Code planning is restricted with `--tools Read,Glob,Grep`; implementation uses `acceptEdits` plus `--tools` and `--allowedTools` for the configured coding-tool set. Claude Code does not provide the same filesystem sandbox as Codex.
 - Dangerous provider bypass flags are never enabled automatically.
 - Child processes receive argument arrays rather than interpolated shell commands.
 - Process cleanup targets the complete lifecycle-owned tree: POSIX process groups and Windows Job Objects.
