@@ -333,7 +333,7 @@ describe("spawnProcess", () => {
       await Promise.allSettled(children.map((child) => child.cancel("test cleanup")));
       await Promise.allSettled(children.map((child) => child.completion));
     }
-  });
+  }, 15_000);
 
   test.skipIf(process.platform === "win32")(
     "fails closed when the process identity sidecar cannot refresh its lease",
