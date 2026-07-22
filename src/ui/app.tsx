@@ -1292,28 +1292,29 @@ export function AgentqApp({
   const runAction = useCallback(
     async (action: "cancel" | "retry" | "resume" | "done", task = selectedTask) => {
       if (!task || actionPending || !beginAction()) return;
+      let outcome: string;
       try {
         if (action === "cancel") await controller.cancelTask(task.id);
         if (action === "retry") await controller.retryTask(task.id);
         if (action === "resume") await controller.resumeTask(task.id);
         if (action === "done") await controller.completeManualTask(task.id);
         setMode("dashboard");
-        setNotice(
+        await refresh();
+        outcome =
           action === "cancel"
             ? `Cancellation requested for ${task.id}.`
             : action === "retry"
               ? `Retry queued for ${task.id}.`
               : action === "resume"
                 ? `Resume queued for ${task.id}.`
-                : `Marked ${task.id} complete.`,
-        );
-        await refresh();
+                : `Marked ${task.id} complete.`;
       } catch (cause) {
         setMode("dashboard");
-        setNotice(`${action} failed: ${messageFrom(cause)}`);
+        outcome = `${action} failed: ${messageFrom(cause)}`;
       } finally {
         finishAction();
       }
+      if (mounted.current) setNotice(outcome);
     },
     [actionPending, beginAction, controller, finishAction, refresh, selectedTask],
   );

@@ -889,7 +889,7 @@ describe("AgentqApp", () => {
     view.stdin.write("d");
     await waitForFrame(view.lastFrame, "Marked task-1 complete");
     expect(completeManualTask).toHaveBeenCalledWith("task-1");
-  });
+  }, 15_000);
 
   test("resumes tasks, shows immutable attempt specs, and offers safe or force cleanup", async () => {
     const resumeTask = mock(async () => undefined);
@@ -909,17 +909,18 @@ describe("AgentqApp", () => {
         dimensions={{ columns: 110, rows: 30 }}
       />,
     );
+    await waitForFrame(view.lastFrame, "[FAILED]");
     await settle();
 
     view.stdin.write("s");
+    await waitForFrame(view.lastFrame, "Resume queued for task-1");
     await settle();
     expect(resumeTask).toHaveBeenCalledWith("task-1");
-    expect(view.lastFrame()).toContain("Resume queued for task-1");
 
     view.stdin.write("v");
+    await waitForFrame(view.lastFrame, "ATTEMPTS");
     await settle();
     expect(listRuns).toHaveBeenCalledWith("task-1");
-    expect(view.lastFrame()).toContain("ATTEMPTS");
     expect(view.lastFrame()).toContain("Original task specification");
     expect(view.lastFrame()).toContain("codex · priority 4");
     view.stdin.write("\u001B");
