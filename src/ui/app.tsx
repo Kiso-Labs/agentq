@@ -225,16 +225,18 @@ const queueFormControls = (kind: QueueDraft["kind"]): readonly QueueFormControl[
 type Confirmation =
   | { kind: "cancel"; task: Task }
   | { kind: "retry"; task: Task }
-  | { kind: "remove-queue"; queue: Queue }
+  | { kind: "delete-queue"; queue: Queue }
+  | { kind: "delete-task"; task: Task }
   | { kind: "clean"; task: Task; force: boolean }
   | { kind: "integration"; target: IntegrationTarget; repoPath: string };
 
 type ActionId =
   | "create-queue"
   | "edit-queue"
-  | "remove-queue"
+  | "delete-queue"
   | "add-task"
   | "edit-task"
+  | "delete-task"
   | "cancel-task"
   | "retry-task"
   | "resume-task"
@@ -836,7 +838,7 @@ function Footer({
         <Text bold color="yellow">
           x
         </Text>{" "}
-        {focus === "queues" ? "remove" : "clean"}
+        delete {focus === "queues" ? "queue" : "task"}
         {"  "}
         {canToggle ? (
           <>
@@ -850,7 +852,7 @@ function Footer({
         <Text color="yellow">{sanitizeTerminalText(notice)}</Text>
       ) : task ? (
         <Text dimColor wrap="truncate-end">
-          c cancel · r retry · s resume · d done · v attempts · f filter · 1-3/tab focus
+          c cancel · r retry · s resume · d done · v attempts · X clean · f filter · 1-3/tab focus
         </Text>
       ) : !narrow ? (
         <Text dimColor>
@@ -1742,11 +1744,17 @@ export function AgentqApp({
 
     if (!beginAction()) return;
     try {
-      if (pending.kind === "remove-queue") {
+      if (pending.kind === "delete-queue") {
         await controller.deleteQueue(pending.queue.id);
         setSelectedQueueId(undefined);
         setMode("dashboard");
-        setNotice(`Removed queue ${pending.queue.name}.`);
+        setNotice(`Deleted queue ${pending.queue.name}.`);
+        await refresh();
+      } else if (pending.kind === "delete-task") {
+        await controller.deleteTask(pending.task.id);
+        setSelectedTaskId(undefined);
+        setMode("dashboard");
+        setNotice(`Deleted task ${pending.task.title}.`);
         await refresh();
       } else if (pending.kind === "clean") {
         const result = await controller.cleanTask(pending.task.id, { force: pending.force });
@@ -1784,6 +1792,9 @@ export function AgentqApp({
     const taskSelected = selectedTask !== undefined;
     const queueSelected = selectedQueue !== undefined;
     const editable = selectedTask ? isTaskEditable(selectedTask) : false;
+    const deletable = Boolean(
+      selectedTask && !isTaskActive(selectedTask.status) && !selectedTask.currentRunId,
+    );
     const integrationAvailable = Boolean(integrationRepositoryPath);
     return [
       {
@@ -1799,9 +1810,9 @@ export function AgentqApp({
         available: queueSelected,
       },
       {
-        id: "remove-queue",
-        label: "Remove selected queue",
-        detail: "Only empty queues can be removed",
+        id: "delete-queue",
+        label: "Delete selected queue",
+        detail: "Delete the queue and all inactive tasks and history",
         available: queueSelected,
       },
       { id: "add-task", label: "Add task", detail: "Queue manual work", available: queueSelected },
@@ -1810,6 +1821,12 @@ export function AgentqApp({
         label: "Edit selected task",
         detail: "Change the next attempt specification",
         available: editable,
+      },
+      {
+        id: "delete-task",
+        label: "Delete selected task",
+        detail: "Delete the task, attempts, events, and logs",
+        available: deletable,
       },
       {
         id: "cancel-task",
@@ -1924,9 +1941,9 @@ export function AgentqApp({
         case "edit-queue":
           startEditQueue();
           break;
-        case "remove-queue":
+        case "delete-queue":
           if (selectedQueue) {
-            setConfirmation({ kind: "remove-queue", queue: selectedQueue });
+            setConfirmation({ kind: "delete-queue", queue: selectedQueue });
             setMode("confirm");
           }
           break;
@@ -1935,6 +1952,12 @@ export function AgentqApp({
           break;
         case "edit-task":
           startEdit();
+          break;
+        case "delete-task":
+          if (selectedTask) {
+            setConfirmation({ kind: "delete-task", task: selectedTask });
+            setMode("confirm");
+          }
           break;
         case "cancel-task":
           if (selectedTask) {
@@ -2544,9 +2567,20 @@ export function AgentqApp({
     }
     if (input === "x") {
       if (focus === "queues" && selectedQueue) {
-        setConfirmation({ kind: "remove-queue", queue: selectedQueue });
+        setConfirmation({ kind: "delete-queue", queue: selectedQueue });
         setMode("confirm");
-      } else if (selectedTask && isTaskTerminal(selectedTask.status)) {
+      } else if (selectedTask && !isTaskActive(selectedTask.status) && !selectedTask.currentRunId) {
+        setConfirmation({ kind: "delete-task", task: selectedTask });
+        setMode("confirm");
+      } else if (selectedTask) {
+        setNotice("Cancel active work before deleting this task.");
+      } else {
+        setNotice("Select a queue or task to delete.");
+      }
+      return;
+    }
+    if (input === "X") {
+      if (selectedTask && isTaskTerminal(selectedTask.status)) {
         setConfirmation({ kind: "clean", task: selectedTask, force: false });
         setMode("confirm");
       } else {
@@ -2620,7 +2654,7 @@ export function AgentqApp({
           </Text>
           <Text>
             <Text bold>n</Text> new queue · <Text bold>a</Text> add task · <Text bold>e</Text>{" "}
-            contextual edit · <Text bold>x</Text> remove / clean
+            contextual edit · <Text bold>x</Text> delete queue / task · <Text bold>X</Text> clean
           </Text>
           <Text>
             <Text bold>c</Text> cancel · <Text bold>r</Text> retry · <Text bold>s</Text> resume ·{" "}
@@ -3092,13 +3126,15 @@ export function AgentqApp({
         ? "CANCEL TASK?"
         : confirmation.kind === "retry"
           ? "RETRY TASK?"
-          : confirmation.kind === "remove-queue"
-            ? "REMOVE QUEUE?"
-            : confirmation.kind === "clean"
-              ? "CLEAN WORKTREE?"
-              : "INSTALL INTEGRATION?";
+          : confirmation.kind === "delete-queue"
+            ? "DELETE QUEUE?"
+            : confirmation.kind === "delete-task"
+              ? "DELETE TASK?"
+              : confirmation.kind === "clean"
+                ? "CLEAN WORKTREE?"
+                : "INSTALL INTEGRATION?";
     const subject =
-      confirmation.kind === "remove-queue"
+      confirmation.kind === "delete-queue"
         ? confirmation.queue.name
         : confirmation.kind === "integration"
           ? confirmation.target === "all"
@@ -3112,16 +3148,19 @@ export function AgentqApp({
         ? "The agent process will receive a graceful stop request."
         : confirmation.kind === "retry"
           ? "A fresh isolated attempt and provider session will be queued."
-          : confirmation.kind === "remove-queue"
-            ? "The queue must be empty. Tasks and history are never silently deleted."
-            : confirmation.kind === "clean"
-              ? confirmation.force
-                ? "Force removal discards uncommitted work in the retained worktree."
-                : "Safe removal stops if the retained worktree has uncommitted changes."
-              : "Repository instructions will be installed in:";
+          : confirmation.kind === "delete-queue"
+            ? "Permanently deletes this queue and all inactive tasks, attempts, events, and logs. Active work or retained worktrees block deletion."
+            : confirmation.kind === "delete-task"
+              ? "Permanently deletes this task, its attempts, events, and logs. Active work or retained worktrees block deletion."
+              : confirmation.kind === "clean"
+                ? confirmation.force
+                  ? "Force removal discards uncommitted work in the retained worktree."
+                  : "Safe removal stops if the retained worktree has uncommitted changes."
+                : "Repository instructions will be installed in:";
     const destructive =
       confirmation.kind === "cancel" ||
-      confirmation.kind === "remove-queue" ||
+      confirmation.kind === "delete-queue" ||
+      confirmation.kind === "delete-task" ||
       (confirmation.kind === "clean" && confirmation.force);
     return (
       <Box width={columns} height={rows} flexDirection="column">

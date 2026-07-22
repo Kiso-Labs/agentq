@@ -77,6 +77,7 @@ export interface UiController {
   deleteQueue(queueId: string): Promise<void>;
   addTask(input: AddTaskInput): Promise<Task>;
   editTask(taskId: string, patch: UiTaskPatch, expectedUpdatedAt: string): Promise<Task>;
+  deleteTask(taskId: string): Promise<void>;
   cancelTask(taskId: string): Promise<void>;
   retryTask(taskId: string): Promise<void>;
   resumeTask(taskId: string): Promise<void>;

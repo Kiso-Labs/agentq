@@ -99,6 +99,7 @@ const createController = (overrides: Partial<UiController> = {}): UiController =
     deleteQueue: mock(async () => undefined),
     addTask: mock(async (input: AddTaskInput) => task({ title: input.title })),
     editTask: mock(async (_taskId: string, patch: UiTaskPatch) => task(patch)),
+    deleteTask: mock(async () => undefined),
     cancelTask: mock(async () => undefined),
     retryTask: mock(async () => undefined),
     resumeTask: mock(async () => undefined),
@@ -569,6 +570,8 @@ describe("AgentqApp", () => {
     expect(help).toContain("j / k");
     expect(help).toContain("[ / ]");
     expect(help).toContain("z");
+    expect(help).toContain("delete queue / task");
+    expect(help).toContain("clean");
 
     view.stdin.write("q");
     await settle();
@@ -895,7 +898,7 @@ describe("AgentqApp", () => {
     expect(view.lastFrame()).toContain("Created queue shipping");
   });
 
-  test("contextually edits and confirms removal of the selected queue", async () => {
+  test("contextually edits and confirms deletion of the selected queue", async () => {
     const updateQueue = mock(
       async (_queueId: string, patch: Parameters<UiController["updateQueue"]>[1]) =>
         queue({ ...patch, name: patch.name ?? "main" }),
@@ -926,7 +929,7 @@ describe("AgentqApp", () => {
 
     view.stdin.write("x");
     await settle();
-    expect(view.lastFrame()).toContain("REMOVE QUEUE?");
+    expect(view.lastFrame()).toContain("DELETE QUEUE?");
     expect(deleteQueue).not.toHaveBeenCalled();
     view.stdin.write("n");
     await settle();
@@ -935,7 +938,58 @@ describe("AgentqApp", () => {
     view.stdin.write("y");
     await settle();
     expect(deleteQueue).toHaveBeenCalledWith("queue-main");
-    expect(view.lastFrame()).toContain("Removed queue main");
+    expect(view.lastFrame()).toContain("Deleted queue main");
+  });
+
+  test("confirms deletion of an inactive selected task", async () => {
+    const selectedTask = task({ status: "queued", currentRunId: undefined });
+    const deleteTask = mock(async () => undefined);
+    const view = render(
+      <AgentqApp
+        controller={createController({
+          listTasks: mock(async () => [selectedTask]),
+          deleteTask,
+        })}
+        dimensions={{ columns: 90, rows: 26 }}
+      />,
+    );
+    await settle();
+
+    view.stdin.write("2");
+    await settle();
+    view.stdin.write("x");
+    await settle();
+    expect(view.lastFrame()).toContain("DELETE TASK?");
+    expect(deleteTask).not.toHaveBeenCalled();
+    view.stdin.write("n");
+    await settle();
+    view.stdin.write("x");
+    await settle();
+    view.stdin.write("y");
+    await settle();
+
+    expect(deleteTask).toHaveBeenCalledWith(selectedTask.id);
+    expect(view.lastFrame()).toContain(`Deleted task ${selectedTask.title}`);
+  });
+
+  test("keeps task deletion unavailable while work is active", async () => {
+    const deleteTask = mock(async () => undefined);
+    const view = render(
+      <AgentqApp
+        controller={createController({ deleteTask })}
+        dimensions={{ columns: 90, rows: 24 }}
+      />,
+    );
+    await settle();
+
+    view.stdin.write("2");
+    await settle();
+    view.stdin.write("x");
+    await settle();
+
+    expect(view.lastFrame()).toContain("Cancel active work before deleting this task");
+    expect(view.lastFrame()).not.toContain("DELETE TASK?");
+    expect(deleteTask).not.toHaveBeenCalled();
   });
 
   test("edits both queue workflow stages from the UI", async () => {
@@ -1400,7 +1454,7 @@ describe("AgentqApp", () => {
 
     view.stdin.write("2");
     await settle();
-    view.stdin.write("x");
+    view.stdin.write("X");
     await settle();
     expect(view.lastFrame()).toContain("CLEAN WORKTREE?");
     expect(view.lastFrame()).toContain("SAFE");
@@ -1514,7 +1568,7 @@ describe("AgentqApp", () => {
     await settle();
     view.stdin.write("2");
     await settle();
-    view.stdin.write("x");
+    view.stdin.write("X");
     await settle();
 
     expect(view.lastFrame()).toContain("Cancel or finish the task before cleaning");
@@ -1579,6 +1633,7 @@ describe("AgentqApp", () => {
     const actions = view.lastFrame() ?? "";
     expect(actions).toContain("ACTION CENTER");
     expect(actions).toContain("Create queue");
+    expect(actions).toContain("Delete selected task");
     expect(actions).toContain("Resume selected task");
     expect(actions).toContain("Integrate both providers");
     expect(actions).toContain("Doctor & providers");
@@ -1587,7 +1642,7 @@ describe("AgentqApp", () => {
     await settle();
     expect(view.lastFrame()).toContain("Planning and implementation models, guidance, and limits");
 
-    for (let index = 0; index < 11; index += 1) {
+    for (let index = 0; index < 12; index += 1) {
       view.stdin.write("\u001B[B");
       await Bun.sleep(5);
     }
@@ -1629,7 +1684,7 @@ describe("AgentqApp", () => {
 
     view.stdin.write(":");
     await settle();
-    for (let index = 0; index < 17; index += 1) {
+    for (let index = 0; index < 18; index += 1) {
       view.stdin.write("\u001B[B");
       await Bun.sleep(5);
     }
