@@ -212,20 +212,24 @@ describe("AgentQApp", () => {
     const value = await fixture();
     const queue = await value.app.createQueue({ name: "delete-tasks", repoPath: value.firstRepo });
     const removable = await value.app.addTask({ queue: queue.id, title: "Remove me" });
-    const active = await value.app.addTask({ queue: queue.id, title: "Keep active work" });
     const claim = value.app.store.claimNextTask({ queue: queue.id });
     if (!claim || claim.task.id !== removable.id) throw new Error("Expected the first task claim");
     value.app.store.finishRun(claim.run.id, { status: "cancelled" });
+    const active = await value.app.addTask({ queue: queue.id, title: "Keep active work" });
     const activeClaim = value.app.store.claimNextTask({ queue: queue.id });
     if (!activeClaim || activeClaim.task.id !== active.id) throw new Error("Expected active claim");
 
     const notifications: string[] = [];
     const unsubscribe = value.app.subscribe(() => notifications.push("changed"));
+    const taskLogDirectory = join(value.app.paths.logsDir, removable.id);
+    await mkdir(taskLogDirectory, { recursive: true });
+    await writeFile(join(taskLogDirectory, "run.jsonl"), "log\n");
 
     await value.app.deleteTask(removable.id);
     await expect(value.app.getTask(removable.id)).rejects.toMatchObject({
       code: "TASK_NOT_FOUND",
     } satisfies Partial<AgentQError>);
+    await expect(access(taskLogDirectory)).rejects.toBeDefined();
     expect(notifications).toHaveLength(1);
 
     await expect(value.app.deleteTask(active.id)).rejects.toMatchObject({
@@ -234,6 +238,74 @@ describe("AgentQApp", () => {
     expect((await value.app.getTask(active.id)).status).toBe("starting");
     expect(notifications).toHaveLength(1);
     unsubscribe();
+  });
+
+  test("deletes a queue with inactive task history while refusing active work", async () => {
+    const value = await fixture();
+    const removableQueue = await value.app.createQueue({
+      name: "delete-queue",
+      repoPath: value.firstRepo,
+    });
+    const removableTask = await value.app.addTask({
+      queue: removableQueue.id,
+      title: "Delete my history",
+    });
+    const completedClaim = value.app.store.claimNextTask({ queue: removableQueue.id });
+    if (!completedClaim) throw new Error("Expected completed claim");
+    value.app.store.appendEvent({
+      taskId: removableTask.id,
+      runId: completedClaim.run.id,
+      kind: "assistant",
+      payload: { text: "finished" },
+    });
+    value.app.store.finishRun(completedClaim.run.id, { status: "succeeded", exitCode: 0 });
+    const taskLogDirectory = join(value.app.paths.logsDir, removableTask.id);
+    await mkdir(taskLogDirectory, { recursive: true });
+    await writeFile(join(taskLogDirectory, `${completedClaim.run.id}.jsonl`), "log\n");
+
+    await value.app.deleteQueue(removableQueue.id);
+    await expect(value.app.getQueue(removableQueue.id)).rejects.toMatchObject({
+      code: "QUEUE_NOT_FOUND",
+    } satisfies Partial<AgentQError>);
+    await expect(value.app.getTask(removableTask.id)).rejects.toMatchObject({
+      code: "TASK_NOT_FOUND",
+    } satisfies Partial<AgentQError>);
+    expect(value.app.store.getRun(completedClaim.run.id)).toBeUndefined();
+    expect(value.app.store.listEvents({ taskId: removableTask.id })).toEqual([]);
+    await expect(access(taskLogDirectory)).rejects.toBeDefined();
+
+    const activeQueue = await value.app.createQueue({
+      name: "active-queue",
+      repoPath: value.firstRepo,
+    });
+    const activeTask = await value.app.addTask({ queue: activeQueue.id, title: "Still running" });
+    const activeClaim = value.app.store.claimNextTask({ queue: activeQueue.id });
+    if (!activeClaim) throw new Error("Expected active claim");
+
+    await expect(value.app.deleteQueue(activeQueue.id)).rejects.toMatchObject({
+      code: "QUEUE_HAS_ACTIVE_TASKS",
+    } satisfies Partial<AgentQError>);
+    expect((await value.app.getQueue(activeQueue.id)).id).toBe(activeQueue.id);
+    expect((await value.app.getTask(activeTask.id)).status).toBe("starting");
+  });
+
+  test("requires retained worktrees to be cleaned before task or queue deletion", async () => {
+    const value = await fixture();
+    const queue = await value.app.createQueue({ name: "retained", repoPath: value.firstRepo });
+    const task = await value.app.addTask({ queue: queue.id, title: "Keep my worktree" });
+    const retained = join(value.root, "retained-delete-guard");
+    await mkdir(retained);
+    await failedRun(value.app, queue, task, { worktreePath: retained });
+
+    await expect(value.app.deleteTask(task.id)).rejects.toMatchObject({
+      code: "TASK_HAS_WORKTREE",
+    } satisfies Partial<AgentQError>);
+    await expect(value.app.deleteQueue(queue.id)).rejects.toMatchObject({
+      code: "QUEUE_HAS_WORKTREES",
+    } satisfies Partial<AgentQError>);
+    expect((await value.app.getTask(task.id)).id).toBe(task.id);
+    expect((await value.app.getQueue(queue.id)).id).toBe(queue.id);
+    await access(retained);
   });
 
   test("lists run history and resumes only a session from the task's current provider", async () => {

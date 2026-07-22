@@ -832,6 +832,74 @@ export class AgentQStore {
     return remove.immediate();
   }
 
+  deleteQueueCascade(
+    idOrName: string,
+    repoKey?: string,
+  ): { queue: Queue; taskIds: string[] } | undefined {
+    const remove = this.#database.transaction(() => {
+      const queue = this.getQueue(idOrName, repoKey);
+      if (!queue) return undefined;
+
+      const activeTask = selectOne<{ id: string }, [string]>(
+        this.#database,
+        `
+          SELECT t.id
+          FROM tasks t
+          WHERE t.queue_id = ?
+            AND (
+              t.current_run_id IS NOT NULL
+              OR t.status IN ('starting', 'running', 'cancelling')
+              OR EXISTS (
+                SELECT 1
+                FROM runs r
+                WHERE r.task_id = t.id
+                  AND r.status IN ('starting', 'running', 'cancelling')
+              )
+            )
+          LIMIT 1
+        `,
+        [queue.id],
+      );
+      if (activeTask) {
+        throw new AgentQError(
+          `Cannot delete queue ${queue.name} while task ${activeTask.id} is active`,
+          "QUEUE_HAS_ACTIVE_TASKS",
+        );
+      }
+
+      const retainedWorktree = selectOne<{ task_id: string }, [string]>(
+        this.#database,
+        `
+          SELECT r.task_id
+          FROM runs r
+          JOIN tasks t ON t.id = r.task_id
+          WHERE t.queue_id = ? AND r.worktree_path IS NOT NULL
+          LIMIT 1
+        `,
+        [queue.id],
+      );
+      if (retainedWorktree) {
+        throw new AgentQError(
+          `Clean retained worktrees before deleting queue ${queue.name}`,
+          "QUEUE_HAS_WORKTREES",
+        );
+      }
+
+      const taskIds = selectAll<{ id: string }, [string]>(
+        this.#database,
+        "SELECT id FROM tasks WHERE queue_id = ? ORDER BY id",
+        [queue.id],
+      ).map(({ id }) => id);
+      const changed = this.#database.run("DELETE FROM queues WHERE id = ?", [queue.id]).changes;
+      if (changed < 1) {
+        throw new AgentQError(`Queue changed while being deleted: ${queue.name}`, "QUEUE_CHANGED");
+      }
+      return { queue, taskIds };
+    });
+
+    return remove.immediate();
+  }
+
   addTask(input: AddTaskInput, options: AddTaskOptions = {}): Task {
     const add = this.#database.transaction(() => {
       const queue = this.#requireQueue(input.queue);
@@ -1186,14 +1254,29 @@ export class AgentQStore {
         throw new AgentQError(`Cannot delete active task ${id}`, "TASK_ACTIVE");
       }
 
+      const retainedWorktree = selectOne<{ id: string }, [string]>(
+        this.#database,
+        "SELECT id FROM runs WHERE task_id = ? AND worktree_path IS NOT NULL LIMIT 1",
+        [id],
+      );
+      if (retainedWorktree) {
+        throw new AgentQError(
+          `Clean retained worktrees before deleting task ${id}`,
+          "TASK_HAS_WORKTREE",
+        );
+      }
+
       const changed = this.#database.run(
         `
           DELETE FROM tasks
           WHERE id = ?
             AND current_run_id IS NULL
             AND status NOT IN ('starting', 'running', 'cancelling')
+            AND NOT EXISTS (
+              SELECT 1 FROM runs WHERE task_id = ? AND worktree_path IS NOT NULL
+            )
         `,
-        [id],
+        [id, id],
       ).changes;
       // Bun reports cascaded run/event deletions in `changes`, so only zero
       // means the guarded task row was not removed.

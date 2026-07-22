@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { access, chmod, mkdir } from "node:fs/promises";
+import { access, chmod, mkdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { AgentQError, errorMessage } from "./core/errors.ts";
 import { resolvePaths } from "./core/paths.ts";
@@ -178,9 +178,11 @@ export class AgentQApp implements UiController {
 
   async deleteQueue(idOrName: string): Promise<void> {
     const queue = await this.getQueue(idOrName);
-    if (!this.store.deleteQueue(queue.id)) {
+    const removed = this.store.deleteQueueCascade(queue.id);
+    if (!removed) {
       throw new AgentQError(`Queue not found: ${idOrName}`, "QUEUE_NOT_FOUND");
     }
+    await this.removeTaskLogs(removed.taskIds);
     this.notify();
   }
 
@@ -234,7 +236,21 @@ export class AgentQApp implements UiController {
     if (!this.store.deleteTask(taskId)) {
       throw new AgentQError(`Task not found: ${taskId}`, "TASK_NOT_FOUND");
     }
+    await this.removeTaskLogs([taskId]);
     this.notify();
+  }
+
+  private async removeTaskLogs(taskIds: readonly string[]): Promise<void> {
+    await Promise.allSettled(
+      taskIds.map((taskId) =>
+        rm(join(this.paths.logsDir, taskId), {
+          recursive: true,
+          force: true,
+          maxRetries: 5,
+          retryDelay: 50,
+        }),
+      ),
+    );
   }
 
   async listEvents(

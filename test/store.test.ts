@@ -513,6 +513,67 @@ describe("AgentQStore", () => {
     expect(store.deleteQueue(queue.id)).toBe(true);
   });
 
+  test("cascades inactive queue history but preserves active or retained work", () => {
+    const store = open();
+    const removableQueue = store.createQueue({
+      name: "cascade-delete",
+      repoKey: "repo",
+      repoPath: "/repo",
+    });
+    const removableTask = store.addTask({
+      queue: removableQueue.id,
+      title: "remove all history",
+    });
+    const completed = store.claimNextTask({ queue: removableQueue.id });
+    if (!completed) throw new Error("Expected completed claim");
+    store.appendEvent({
+      taskId: removableTask.id,
+      runId: completed.run.id,
+      kind: "assistant",
+      payload: { text: "done" },
+    });
+    store.finishRun(completed.run.id, { status: "succeeded", exitCode: 0 });
+
+    expect(store.deleteQueueCascade(removableQueue.id)).toMatchObject({
+      queue: { id: removableQueue.id },
+      taskIds: [removableTask.id],
+    });
+    expect(store.getQueue(removableQueue.id)).toBeUndefined();
+    expect(store.getTask(removableTask.id)).toBeUndefined();
+    expect(store.getRun(completed.run.id)).toBeUndefined();
+    expect(store.listEvents({ taskId: removableTask.id })).toEqual([]);
+
+    const activeQueue = store.createQueue({
+      name: "cascade-active",
+      repoKey: "repo",
+      repoPath: "/repo",
+    });
+    const activeTask = store.addTask({ queue: activeQueue.id, title: "still active" });
+    const active = store.claimNextTask({ queue: activeQueue.id });
+    if (!active) throw new Error("Expected active claim");
+    try {
+      store.deleteQueueCascade(activeQueue.id);
+      throw new Error("Expected active queue deletion to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentQError);
+      expect((error as AgentQError).code).toBe("QUEUE_HAS_ACTIVE_TASKS");
+    }
+    expect(store.getQueue(activeQueue.id)?.id).toBe(activeQueue.id);
+    expect(store.getTask(activeTask.id)?.status).toBe("starting");
+
+    store.finishRun(active.run.id, { status: "failed", exitCode: 1 });
+    store.updateRun(active.run.id, { worktreePath: "/retained/worktree" });
+    try {
+      store.deleteQueueCascade(activeQueue.id);
+      throw new Error("Expected retained queue deletion to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentQError);
+      expect((error as AgentQError).code).toBe("QUEUE_HAS_WORKTREES");
+    }
+    expect(store.getQueue(activeQueue.id)?.id).toBe(activeQueue.id);
+    expect(store.getTask(activeTask.id)?.id).toBe(activeTask.id);
+  });
+
   test("serializes queue removal with a task added by another writer", async () => {
     const store = open();
     const queue = store.createQueue({ name: "delete-race", repoKey: "repo", repoPath: "/repo" });
