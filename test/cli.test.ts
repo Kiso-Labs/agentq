@@ -6,7 +6,11 @@ import { AgentQStore } from "../src/store/index.ts";
 
 const roots: string[] = [];
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await Promise.all(
+    roots
+      .splice(0)
+      .map((root) => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })),
+  );
 });
 
 const projectRoot = join(import.meta.dir, "..");
@@ -198,29 +202,37 @@ describe("agentq CLI", () => {
     const completed = await cli(stateDir, ["task", "complete", task.id, "--json"]);
     expect(JSON.parse(completed.stdout).status).toBe("succeeded");
 
-    const unconfirmedTaskRemoval = await cli(stateDir, ["task", "remove", task.id, "--json"]);
-    expect(unconfirmedTaskRemoval.exitCode).toBe(2);
-    expect(unconfirmedTaskRemoval.stderr).toContain("Task removal requires --yes");
-    const removedTask = await cli(stateDir, ["task", "remove", task.id, "--yes", "--json"]);
-    expect(JSON.parse(removedTask.stdout)).toEqual({ removed: true, task: task.id });
-
-    const queuedForCascade = await cli(stateDir, [
-      "task",
-      "add",
-      "Cascade me",
-      "--queue",
-      "work",
-      "--json",
-    ]);
-    const queuedTaskId = (JSON.parse(queuedForCascade.stdout) as { id: string }).id;
-    const removedQueue = await cli(stateDir, ["queue", "remove", "work", "--yes", "--json"]);
-    expect(JSON.parse(removedQueue.stdout)).toEqual({ removed: true, queue: "work" });
-    const missingTask = await cli(stateDir, ["task", "show", queuedTaskId, "--json"]);
-    expect(missingTask.exitCode).toBe(1);
-    expect(missingTask.stderr).toContain("Task not found");
-
     const removed = await cli(stateDir, ["queue", "remove", "empty", "--yes", "--json"]);
     expect(JSON.parse(removed.stdout)).toEqual({ removed: true, queue: "empty" });
+  });
+
+  test("requires confirmation before deleting an inactive task through the CLI", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-task-delete-"));
+    roots.push(stateDir);
+    await cli(stateDir, ["queue", "create", "work", "--repo", projectRoot, "--json"]);
+    const added = await cli(stateDir, ["task", "add", "Delete me", "--queue", "work", "--json"]);
+    const taskId = (JSON.parse(added.stdout) as { id: string }).id;
+
+    const unconfirmed = await cli(stateDir, ["task", "remove", taskId, "--json"]);
+    expect(unconfirmed.exitCode).toBe(2);
+    expect(unconfirmed.stderr).toContain("Task removal requires --yes");
+
+    const removed = await cli(stateDir, ["task", "remove", taskId, "--yes", "--json"]);
+    expect(JSON.parse(removed.stdout)).toEqual({ removed: true, task: taskId });
+  });
+
+  test("cascades inactive task history when deleting a queue through the CLI", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-queue-delete-"));
+    roots.push(stateDir);
+    await cli(stateDir, ["queue", "create", "work", "--repo", projectRoot, "--json"]);
+    const added = await cli(stateDir, ["task", "add", "Cascade me", "--queue", "work", "--json"]);
+    const taskId = (JSON.parse(added.stdout) as { id: string }).id;
+
+    const removed = await cli(stateDir, ["queue", "remove", "work", "--yes", "--json"]);
+    expect(JSON.parse(removed.stdout)).toEqual({ removed: true, queue: "work" });
+    const missingTask = await cli(stateDir, ["task", "show", taskId, "--json"]);
+    expect(missingTask.exitCode).toBe(1);
+    expect(missingTask.stderr).toContain("Task not found");
   });
 
   test("renders human task logs as an activity transcript and keeps JSON Lines raw", async () => {
