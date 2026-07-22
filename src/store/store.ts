@@ -10,7 +10,6 @@ import {
   canRetryTask,
   isTaskActive,
   PROVIDERS,
-  type Provider,
   type Queue,
   RUN_STATUSES,
   type Run,
@@ -22,6 +21,7 @@ import {
   type TaskStatus,
 } from "../core/types.ts";
 import { migrate } from "./migrations.ts";
+import { selectAll, selectOne } from "./sqlite.ts";
 import type {
   AddTaskOptions,
   AppendEventInput,
@@ -574,7 +574,7 @@ export class AgentQStore {
 
   close(): void {
     if (this.#closed) return;
-    this.#database.close();
+    this.#database.close(true);
     this.#closed = true;
   }
 
@@ -595,30 +595,14 @@ export class AgentQStore {
     const now = isoNow();
 
     try {
-      this.#database
-        .query<
-          unknown,
-          [
-            string,
-            string,
-            string,
-            string,
-            string,
-            Provider,
-            number,
-            number,
-            string,
-            number,
-            string,
-            string,
-          ]
-        >(`
+      this.#database.run(
+        `
           INSERT INTO queues(
             id, name, repo_key, repo_path, base_ref, default_provider, concurrency,
             max_attempts, verify_commands, auto_commit, created_at, updated_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `)
-        .run(
+        `,
+        [
           id,
           name,
           repoKey,
@@ -631,7 +615,8 @@ export class AgentQStore {
           input.autoCommit === true ? 1 : 0,
           now,
           now,
-        );
+        ],
+      );
     } catch (error) {
       constraint(
         error,
@@ -645,9 +630,11 @@ export class AgentQStore {
 
   getQueue(idOrName: string, repoKey?: string): Queue | undefined {
     const scope = repoKey === undefined ? undefined : nonEmpty(repoKey, "repoKey");
-    const byId = this.#database
-      .query<QueueRow, [string]>(`SELECT ${QUEUE_COLUMNS} FROM queues q WHERE q.id = ?`)
-      .get(idOrName);
+    const byId = selectOne<QueueRow, [string]>(
+      this.#database,
+      `SELECT ${QUEUE_COLUMNS} FROM queues q WHERE q.id = ?`,
+      [idOrName],
+    );
     if (byId) {
       const queue = mapQueue(byId);
       return scope === undefined || queue.repoKey === scope ? queue : undefined;
@@ -656,15 +643,17 @@ export class AgentQStore {
     const bindings: string[] = [idOrName];
     const scopeClause = scope === undefined ? "" : "AND q.repo_key = ?";
     if (scope !== undefined) bindings.push(scope);
-    const matches = this.#database
-      .query<QueueRow, string[]>(`
+    const matches = selectAll<QueueRow, string[]>(
+      this.#database,
+      `
         SELECT ${QUEUE_COLUMNS}
         FROM queues q
         WHERE q.name = ? COLLATE NOCASE ${scopeClause}
         ORDER BY q.id
         LIMIT 2
-      `)
-      .all(...bindings);
+      `,
+      bindings,
+    );
     if (matches.length > 1) {
       throw new AgentQError(
         `Queue name "${idOrName}" exists in multiple repositories; specify a repository scope or queue id`,
@@ -679,15 +668,14 @@ export class AgentQStore {
     const scope = repoKey === undefined ? undefined : nonEmpty(repoKey, "repoKey");
     const where = scope === undefined ? "" : "WHERE q.repo_key = ?";
     const bindings = scope === undefined ? [] : [scope];
-    return this.#database
-      .query<QueueRow, string[]>(
-        `SELECT ${QUEUE_COLUMNS}
+    return selectAll<QueueRow, string[]>(
+      this.#database,
+      `SELECT ${QUEUE_COLUMNS}
          FROM queues q
          ${where}
          ORDER BY q.name COLLATE NOCASE, q.id`,
-      )
-      .all(...bindings)
-      .map(mapQueue);
+      bindings,
+    ).map(mapQueue);
   }
 
   updateQueue(idOrName: string, patch: UpdateQueueInput, repoKey?: string): Queue {
@@ -725,9 +713,7 @@ export class AgentQStore {
     values.push(queue.id);
 
     try {
-      this.#database
-        .query<unknown, Binding[]>(`UPDATE queues SET ${fields.join(", ")} WHERE id = ?`)
-        .run(...values);
+      this.#database.run(`UPDATE queues SET ${fields.join(", ")} WHERE id = ?`, values);
     } catch (error) {
       constraint(
         error,
@@ -744,9 +730,11 @@ export class AgentQStore {
       const queue = this.getQueue(idOrName, repoKey);
       if (!queue) return false;
 
-      const task = this.#database
-        .query<{ id: string }, [string]>("SELECT id FROM tasks WHERE queue_id = ? LIMIT 1")
-        .get(queue.id);
+      const task = selectOne<{ id: string }, [string]>(
+        this.#database,
+        "SELECT id FROM tasks WHERE queue_id = ? LIMIT 1",
+        [queue.id],
+      );
       if (task) {
         throw new AgentQError(
           `Cannot delete queue ${queue.name} because it contains tasks`,
@@ -754,10 +742,7 @@ export class AgentQStore {
         );
       }
 
-      return (
-        this.#database.query<unknown, [string]>("DELETE FROM queues WHERE id = ?").run(queue.id)
-          .changes > 0
-      );
+      return this.#database.run("DELETE FROM queues WHERE id = ?", [queue.id]).changes > 0;
     });
 
     return remove.immediate();
@@ -772,14 +757,16 @@ export class AgentQStore {
           : nonEmpty(input.idempotencyKey, "idempotencyKey");
 
       if (idempotencyKey !== undefined) {
-        const existing = this.#database
-          .query<TaskRow, [string, string]>(`
+        const existing = selectOne<TaskRow, [string, string]>(
+          this.#database,
+          `
             SELECT ${TASK_COLUMNS}
             FROM tasks t
             JOIN queues q ON q.id = t.queue_id
             WHERE t.queue_id = ? AND t.idempotency_key = ?
-          `)
-          .get(queue.id, idempotencyKey);
+          `,
+          [queue.id, idempotencyKey],
+        );
         if (existing) return mapTask(existing);
       }
 
@@ -796,11 +783,11 @@ export class AgentQStore {
         }
         if (options.maxChildrenForParent !== undefined) {
           const maximum = integerInput(options.maxChildrenForParent, "maxChildrenForParent", 1);
-          const children = this.#database
-            .query<CountRow, [string]>(
-              "SELECT COUNT(*) AS count FROM tasks WHERE parent_task_id = ?",
-            )
-            .get(parent.id);
+          const children = selectOne<CountRow, [string]>(
+            this.#database,
+            "SELECT COUNT(*) AS count FROM tasks WHERE parent_task_id = ?",
+            [parent.id],
+          );
           if (
             integerValue(children?.count, "tasks", parent.id, "delegated child count") >= maximum
           ) {
@@ -824,31 +811,15 @@ export class AgentQStore {
       const priority = integerInput(input.priority ?? 0, "priority");
 
       try {
-        this.#database
-          .query<
-            unknown,
-            [
-              string,
-              string,
-              string,
-              string,
-              string,
-              Provider,
-              number,
-              Task["sourceKind"],
-              string | null,
-              string | null,
-              string,
-              string,
-            ]
-          >(`
+        this.#database.run(
+          `
             INSERT INTO tasks(
               id, queue_id, title, instructions, acceptance_criteria, provider,
               priority, status, source_kind, parent_task_id, idempotency_key,
               attempt_count, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?)
-          `)
-          .run(
+          `,
+          [
             id,
             queue.id,
             title,
@@ -861,7 +832,8 @@ export class AgentQStore {
             idempotencyKey ?? null,
             now,
             now,
-          );
+          ],
+        );
       } catch (error) {
         constraint(
           error,
@@ -877,14 +849,16 @@ export class AgentQStore {
   }
 
   getTask(id: string): Task | undefined {
-    const row = this.#database
-      .query<TaskRow, [string]>(`
+    const row = selectOne<TaskRow, [string]>(
+      this.#database,
+      `
         SELECT ${TASK_COLUMNS}
         FROM tasks t
         JOIN queues q ON q.id = t.queue_id
         WHERE t.id = ?
-      `)
-      .get(id);
+      `,
+      [id],
+    );
     return row ? mapTask(row) : undefined;
   }
 
@@ -921,17 +895,18 @@ export class AgentQStore {
     values.push(limit, offset);
     const clause = where.length === 0 ? "" : `WHERE ${where.join(" AND ")}`;
 
-    return this.#database
-      .query<TaskRow, Binding[]>(`
+    return selectAll<TaskRow, Binding[]>(
+      this.#database,
+      `
         SELECT ${TASK_COLUMNS}
         FROM tasks t
         JOIN queues q ON q.id = t.queue_id
         ${clause}
         ORDER BY t.priority DESC, t.created_at, t.id
         LIMIT ? OFFSET ?
-      `)
-      .all(...values)
-      .map(mapTask);
+      `,
+      values,
+    ).map(mapTask);
   }
 
   updateTask(id: string, patch: UpdateTaskInput): Task {
@@ -973,9 +948,7 @@ export class AgentQStore {
     set("updated_at", isoNow());
     values.push(id);
     try {
-      this.#database
-        .query<unknown, Binding[]>(`UPDATE tasks SET ${fields.join(", ")} WHERE id = ?`)
-        .run(...values);
+      this.#database.run(`UPDATE tasks SET ${fields.join(", ")} WHERE id = ?`, values);
     } catch (error) {
       constraint(
         error,
@@ -1035,16 +1008,17 @@ export class AgentQStore {
 
       let changed: number;
       try {
-        changed = this.#database
-          .query<unknown, Binding[]>(`
+        changed = this.#database.run(
+          `
             UPDATE tasks
             SET ${updateFields.join(", ")}
             WHERE id = ?
               AND current_run_id IS NULL
               AND status IN ('queued', 'failed', 'interrupted', 'cancelled')
               ${versionClause}
-          `)
-          .run(...bindings).changes;
+          `,
+          bindings,
+        ).changes;
       } catch (error) {
         constraint(error, "Task edit contains an invalid value", "INVALID_TASK");
       }
@@ -1092,16 +1066,17 @@ export class AgentQStore {
       }
 
       const completedAt = timestamp(at, "manual completion timestamp");
-      const changed = this.#database
-        .query<unknown, [string, string, string]>(`
+      const changed = this.#database.run(
+        `
           UPDATE tasks
           SET status = 'succeeded', completed_at = ?, cancel_requested_at = NULL,
               updated_at = ?
           WHERE id = ?
             AND current_run_id IS NULL
             AND status IN ('queued', 'failed', 'interrupted', 'cancelled')
-        `)
-        .run(completedAt, completedAt, id).changes;
+        `,
+        [completedAt, completedAt, id],
+      ).changes;
       if (changed !== 1) {
         throw new AgentQError(
           "Cancel the running task before completing it manually",
@@ -1127,14 +1102,15 @@ export class AgentQStore {
         throw new AgentQError(`Cannot delete active task ${id}`, "TASK_ACTIVE");
       }
 
-      const changed = this.#database
-        .query<unknown, [string]>(`
+      const changed = this.#database.run(
+        `
           DELETE FROM tasks
           WHERE id = ?
             AND current_run_id IS NULL
             AND status NOT IN ('starting', 'running', 'cancelling')
-        `)
-        .run(id).changes;
+        `,
+        [id],
+      ).changes;
       // Bun reports cascaded run/event deletions in `changes`, so only zero
       // means the guarded task row was not removed.
       if (changed < 1) {
@@ -1155,29 +1131,32 @@ export class AgentQStore {
 
       const requestedAt = timestamp(at, "cancellation timestamp");
       if (task.status === "queued") {
-        this.#database
-          .query<unknown, [string, string, string, string]>(`
+        this.#database.run(
+          `
             UPDATE tasks
             SET status = 'cancelled', cancel_requested_at = ?, completed_at = ?, updated_at = ?
             WHERE id = ?
-          `)
-          .run(requestedAt, requestedAt, requestedAt, id);
+          `,
+          [requestedAt, requestedAt, requestedAt, id],
+        );
       } else {
-        this.#database
-          .query<unknown, [string, string, string]>(`
+        this.#database.run(
+          `
             UPDATE tasks
             SET status = 'cancelling', cancel_requested_at = ?, updated_at = ?
             WHERE id = ?
-          `)
-          .run(requestedAt, requestedAt, id);
+          `,
+          [requestedAt, requestedAt, id],
+        );
         if (task.currentRunId) {
-          this.#database
-            .query<unknown, [string]>(`
+          this.#database.run(
+            `
               UPDATE runs
               SET status = 'cancelling'
               WHERE id = ? AND status IN ('starting', 'running', 'cancelling')
-            `)
-            .run(task.currentRunId);
+            `,
+            [task.currentRunId],
+          );
         }
       }
       return this.#requireTask(id);
@@ -1208,14 +1187,15 @@ export class AgentQStore {
         }
       }
       const updatedAt = timestamp(at, "requeue timestamp");
-      this.#database
-        .query<unknown, [string | null, string, string]>(`
+      this.#database.run(
+        `
           UPDATE tasks
           SET status = 'queued', attempt_count = 0, current_run_id = NULL,
               cancel_requested_at = NULL, completed_at = NULL, resume_run_id = ?, updated_at = ?
           WHERE id = ?
-        `)
-        .run(resumeRunId, updatedAt, id);
+        `,
+        [resumeRunId, updatedAt, id],
+      );
       return this.#requireTask(id);
     });
     return requeue.immediate();
@@ -1229,13 +1209,14 @@ export class AgentQStore {
   ): Task {
     const consume = this.#database.transaction(() => {
       this.#assertRunLease(currentRunId, leaseToken);
-      const changed = this.#database
-        .query<unknown, [string, string, string, string]>(`
+      const changed = this.#database.run(
+        `
           UPDATE tasks
           SET resume_run_id = NULL, updated_at = ?
           WHERE id = ? AND current_run_id = ? AND resume_run_id = ?
-        `)
-        .run(isoNow(), taskId, currentRunId, resumeRunId).changes;
+        `,
+        [isoNow(), taskId, currentRunId, resumeRunId],
+      ).changes;
       if (changed !== 1) {
         throw new AgentQError(
           `Resume intent for task ${taskId} is no longer active`,
@@ -1273,8 +1254,9 @@ export class AgentQStore {
             ) < ?`;
       if (maxConcurrency !== undefined) bindings.push(maxConcurrency);
 
-      const candidate = this.#database
-        .query<TaskRow, Binding[]>(`
+      const candidate = selectOne<TaskRow, Binding[]>(
+        this.#database,
+        `
           SELECT ${TASK_COLUMNS}
           FROM tasks t
           JOIN queues q ON q.id = t.queue_id
@@ -1293,8 +1275,9 @@ export class AgentQStore {
             ) < q.concurrency
           ORDER BY t.priority DESC, t.created_at, t.id
           LIMIT 1
-        `)
-        .get(...bindings);
+        `,
+        bindings,
+      );
 
       if (!candidate) return undefined;
 
@@ -1305,13 +1288,15 @@ export class AgentQStore {
       // so derive them from prior runs to preserve the unique (task, attempt)
       // invariant across manual retries and session resumes.
       const attemptNo =
-        this.#database
-          .query<{ next_attempt: number }, [string]>(`
+        selectOne<{ next_attempt: number }, [string]>(
+          this.#database,
+          `
             SELECT COALESCE(MAX(attempt_no), 0) + 1 AS next_attempt
             FROM runs
             WHERE task_id = ?
-          `)
-          .get(task.id)?.next_attempt ?? 1;
+          `,
+          [task.id],
+        )?.next_attempt ?? 1;
       const attemptCount = task.attemptCount + 1;
       const runId = makeId("run");
       const ownerToken =
@@ -1326,17 +1311,14 @@ export class AgentQStore {
         priority: task.priority,
       };
 
-      this.#database
-        .query<
-          unknown,
-          [string, string, number, Provider, string | null, number | null, string, string, string]
-        >(`
+      this.#database.run(
+        `
           INSERT INTO runs(
             id, task_id, attempt_no, provider, status, owner_token, owner_pid,
             task_snapshot, started_at, heartbeat_at
           ) VALUES (?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?)
-        `)
-        .run(
+        `,
+        [
           runId,
           task.id,
           attemptNo,
@@ -1346,15 +1328,17 @@ export class AgentQStore {
           JSON.stringify(snapshot),
           now,
           now,
-        );
+        ],
+      );
 
-      const changed = this.#database
-        .query<unknown, [number, string, string, string]>(`
+      const changed = this.#database.run(
+        `
           UPDATE tasks
           SET status = 'starting', attempt_count = ?, current_run_id = ?, updated_at = ?
           WHERE id = ? AND status = 'queued'
-        `)
-        .run(attemptCount, runId, now, task.id).changes;
+        `,
+        [attemptCount, runId, now, task.id],
+      ).changes;
 
       if (changed !== 1) {
         throw new AgentQError(`Task ${task.id} could not be claimed`, "CLAIM_CONFLICT");
@@ -1372,9 +1356,11 @@ export class AgentQStore {
   }
 
   getRun(id: string): Run | undefined {
-    const row = this.#database
-      .query<RunRow, [string]>(`SELECT ${RUN_COLUMNS} FROM runs r WHERE r.id = ?`)
-      .get(id);
+    const row = selectOne<RunRow, [string]>(
+      this.#database,
+      `SELECT ${RUN_COLUMNS} FROM runs r WHERE r.id = ?`,
+      [id],
+    );
     return row ? mapRun(row) : undefined;
   }
 
@@ -1404,17 +1390,18 @@ export class AgentQStore {
     values.push(limit, offset);
     const clause = where.length === 0 ? "" : `WHERE ${where.join(" AND ")}`;
 
-    return this.#database
-      .query<RunRow, Binding[]>(`
+    return selectAll<RunRow, Binding[]>(
+      this.#database,
+      `
         SELECT ${RUN_COLUMNS}
         FROM runs r
         ${join}
         ${clause}
         ORDER BY r.started_at DESC, r.id DESC
         LIMIT ? OFFSET ?
-      `)
-      .all(...values)
-      .map(mapRun);
+      `,
+      values,
+    ).map(mapRun);
   }
 
   recordWorktreeRemoval(
@@ -1432,13 +1419,14 @@ export class AgentQStore {
       }
 
       const removedAt = timestamp(at, "worktree removal timestamp");
-      const changed = this.#database
-        .query<unknown, [string, string]>(`
+      const changed = this.#database.run(
+        `
           UPDATE runs
           SET worktree_path = NULL
           WHERE id = ? AND worktree_path = ?
-        `)
-        .run(runId, worktreePath).changes;
+        `,
+        [runId, worktreePath],
+      ).changes;
       if (changed !== 1) {
         throw new AgentQError(
           `Run ${runId} worktree changed before cleanup completed`,
@@ -1447,13 +1435,14 @@ export class AgentQStore {
       }
 
       const task = this.#requireTask(run.taskId);
-      this.#database
-        .query<unknown, [string, string, string]>(`
+      this.#database.run(
+        `
           UPDATE tasks
           SET resume_run_id = NULL, updated_at = ?
           WHERE id = ? AND resume_run_id = ?
-        `)
-        .run(nextUpdatedAt(task.updatedAt), task.id, run.id);
+        `,
+        [nextUpdatedAt(task.updatedAt), task.id, run.id],
+      );
       this.appendEvent({
         taskId: run.taskId,
         runId,
@@ -1504,11 +1493,10 @@ export class AgentQStore {
     const activeCondition =
       patch.status === undefined ? "" : " AND status IN ('starting', 'running', 'cancelling')";
     const leaseCondition = leaseToken === undefined ? "" : " AND owner_token = ?";
-    const changed = this.#database
-      .query<unknown, Binding[]>(
-        `UPDATE runs SET ${fields.join(", ")} WHERE id = ?${activeCondition}${leaseCondition}`,
-      )
-      .run(...values).changes;
+    const changed = this.#database.run(
+      `UPDATE runs SET ${fields.join(", ")} WHERE id = ?${activeCondition}${leaseCondition}`,
+      values,
+    ).changes;
 
     if (changed === 0) {
       const run = this.#requireRun(id);
@@ -1558,19 +1546,19 @@ export class AgentQStore {
       values.push(id);
       if (leaseToken !== undefined) values.push(leaseToken);
       const leaseCondition = leaseToken === undefined ? "" : " AND owner_token = ?";
-      const changed = this.#database
-        .query<unknown, Binding[]>(
-          `UPDATE runs SET ${fields.join(", ")} WHERE id = ? AND status IN ('starting', 'running', 'cancelling')${leaseCondition}`,
-        )
-        .run(...values).changes;
+      const changed = this.#database.run(
+        `UPDATE runs SET ${fields.join(", ")} WHERE id = ? AND status IN ('starting', 'running', 'cancelling')${leaseCondition}`,
+        values,
+      ).changes;
       if (changed !== 1) throw new AgentQError(`Run ${id} lease was lost`, "RUN_LEASE_LOST");
 
       if (task.currentRunId === id) {
-        this.#database
-          .query<unknown, [TaskStatus, string, string]>(`
+        this.#database.run(
+          `
             UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?
-          `)
-          .run(status, at, task.id);
+          `,
+          [status, at, task.id],
+        );
       }
       return this.#requireRun(id);
     });
@@ -1582,14 +1570,15 @@ export class AgentQStore {
     const bindings: Binding[] = [heartbeatAt, id];
     if (leaseToken !== undefined) bindings.push(leaseToken);
     const leaseCondition = leaseToken === undefined ? "" : " AND owner_token = ?";
-    const changes = this.#database
-      .query<unknown, Binding[]>(`
+    const changes = this.#database.run(
+      `
         UPDATE runs
         SET heartbeat_at = ?
         WHERE id = ? AND status IN ('starting', 'running', 'cancelling')
           ${leaseCondition}
-      `)
-      .run(...bindings).changes;
+      `,
+      bindings,
+    ).changes;
     if (changes === 0) {
       const run = this.getRun(id);
       if (!run) throw new AgentQError(`Run ${id} does not exist`, "RUN_NOT_FOUND");
@@ -1612,26 +1601,14 @@ export class AgentQStore {
       const wasCancelled = input.status === "cancelled" || task.cancelRequestedAt !== undefined;
       const runStatus: RunStatus = wasCancelled ? "cancelled" : input.status;
 
-      this.#database
-        .query<
-          unknown,
-          [
-            RunStatus,
-            string,
-            string,
-            number | null,
-            string | null,
-            string | null,
-            string | null,
-            string,
-          ]
-        >(`
+      this.#database.run(
+        `
           UPDATE runs
           SET status = ?, heartbeat_at = ?, finished_at = ?, exit_code = ?,
               summary = ?, error = ?, provider_session_id = COALESCE(?, provider_session_id)
           WHERE id = ?
-        `)
-        .run(
+        `,
+        [
           runStatus,
           finishedAt,
           finishedAt,
@@ -1640,7 +1617,8 @@ export class AgentQStore {
           input.error ?? null,
           input.providerSessionId ?? null,
           id,
-        );
+        ],
+      );
 
       let taskStatus: TaskStatus;
       let completedAt: string | null;
@@ -1661,15 +1639,15 @@ export class AgentQStore {
       const restoredAttemptCount = input.requeue
         ? Math.max(0, task.attemptCount - 1)
         : task.attemptCount;
-      this.#database
-        .query<unknown, [TaskStatus, number, string | null, number, string, string, string]>(`
+      this.#database.run(
+        `
           UPDATE tasks
           SET status = ?, attempt_count = ?, current_run_id = NULL, completed_at = ?,
               resume_run_id = CASE WHEN ? = 1 THEN NULL ELSE resume_run_id END,
               updated_at = ?
           WHERE id = ? AND current_run_id = ?
-        `)
-        .run(
+        `,
+        [
           taskStatus,
           restoredAttemptCount,
           completedAt,
@@ -1677,7 +1655,8 @@ export class AgentQStore {
           finishedAt,
           task.id,
           id,
-        );
+        ],
+      );
 
       return { run: this.#requireRun(id), task: this.#requireTask(task.id) };
     });
@@ -1690,9 +1669,7 @@ export class AgentQStore {
     if (ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number])) {
       throw new AgentQError(`Cannot delete active run ${id}`, "RUN_ACTIVE");
     }
-    return (
-      this.#database.query<unknown, [string]>("DELETE FROM runs WHERE id = ?").run(id).changes > 0
-    );
+    return this.#database.run("DELETE FROM runs WHERE id = ?", [id]).changes > 0;
   }
 
   /**
@@ -1713,37 +1690,40 @@ export class AgentQStore {
         ? `AND r.id IN (${input.eligibleRunIds.map(() => "?").join(", ")})`
         : "";
       const bindings: Binding[] = [cutoff, ...(input.eligibleRunIds ?? [])];
-      const candidates = this.#database
-        .query<RunRow, Binding[]>(`
+      const candidates = selectAll<RunRow, Binding[]>(
+        this.#database,
+        `
           SELECT ${RUN_COLUMNS}
           FROM runs r
           WHERE r.status IN ('starting', 'running', 'cancelling')
             AND r.heartbeat_at < ?
             ${eligibleClause}
           ORDER BY r.heartbeat_at, r.id
-        `)
-        .all(...bindings)
-        .map(mapRun);
+        `,
+        bindings,
+      ).map(mapRun);
 
       const runIds: string[] = [];
       const taskIds = new Set<string>();
       for (const run of candidates) {
-        const changed = this.#database
-          .query<unknown, [string, string, string, string]>(`
+        const changed = this.#database.run(
+          `
             UPDATE runs
             SET status = 'cancelling', owner_token = ?, owner_pid = NULL,
                 heartbeat_at = ?, error = COALESCE(error, 'Supervisor heartbeat expired')
             WHERE id = ? AND status IN ('starting', 'running', 'cancelling')
               AND heartbeat_at < ?
-          `)
-          .run(ownerToken, fencedAt, run.id, cutoff).changes;
+          `,
+          [ownerToken, fencedAt, run.id, cutoff],
+        ).changes;
         if (changed !== 1) continue;
-        this.#database
-          .query<unknown, [string, string, string]>(`
+        this.#database.run(
+          `
             UPDATE tasks SET status = 'cancelling', updated_at = ?
             WHERE id = ? AND current_run_id = ?
-          `)
-          .run(fencedAt, run.taskId, run.id);
+          `,
+          [fencedAt, run.taskId, run.id],
+        );
         runIds.push(run.id);
         taskIds.add(run.taskId);
       }
@@ -1773,17 +1753,18 @@ export class AgentQStore {
         ? `AND r.id IN (${eligibleRunIds.map(() => "?").join(", ")})`
         : "";
       const bindings: Binding[] = [cutoff, ...(eligibleRunIds ?? [])];
-      const staleRuns = this.#database
-        .query<RunRow, Binding[]>(`
+      const staleRuns = selectAll<RunRow, Binding[]>(
+        this.#database,
+        `
           SELECT ${RUN_COLUMNS}
           FROM runs r
           WHERE r.status IN ('starting', 'running', 'cancelling')
             AND r.heartbeat_at < ?
             ${eligibleClause}
           ORDER BY r.heartbeat_at, r.id
-        `)
-        .all(...bindings)
-        .map(mapRun);
+        `,
+        bindings,
+      ).map(mapRun);
 
       const runIds: string[] = [];
       const taskIds = new Set<string>();
@@ -1793,14 +1774,15 @@ export class AgentQStore {
         const cancelled = task.cancelRequestedAt !== undefined;
         const runStatus: RunStatus = cancelled ? "cancelled" : "interrupted";
 
-        this.#database
-          .query<unknown, [RunStatus, string, string, string]>(`
+        this.#database.run(
+          `
             UPDATE runs
             SET status = ?, heartbeat_at = ?, finished_at = ?,
                 error = COALESCE(error, 'Supervisor heartbeat expired')
             WHERE id = ? AND status IN ('starting', 'running', 'cancelling')
-          `)
-          .run(runStatus, recoveredAt, recoveredAt, run.id);
+          `,
+          [runStatus, recoveredAt, recoveredAt, run.id],
+        );
 
         if (task.currentRunId === run.id) {
           let taskStatus: TaskStatus;
@@ -1815,13 +1797,14 @@ export class AgentQStore {
             taskStatus = "interrupted";
             completedAt = recoveredAt;
           }
-          this.#database
-            .query<unknown, [TaskStatus, string | null, string, string, string]>(`
+          this.#database.run(
+            `
               UPDATE tasks
               SET status = ?, current_run_id = NULL, completed_at = ?, updated_at = ?
               WHERE id = ? AND current_run_id = ?
-            `)
-            .run(taskStatus, completedAt, recoveredAt, task.id, run.id);
+            `,
+            [taskStatus, completedAt, recoveredAt, task.id, run.id],
+          );
           taskIds.add(task.id);
         }
         runIds.push(run.id);
@@ -1860,12 +1843,13 @@ export class AgentQStore {
       );
     }
     const createdAt = timestamp(input.createdAt, "event timestamp");
-    const result = this.#database
-      .query<unknown, [string, string | null, string, string, string]>(`
+    const result = this.#database.run(
+      `
         INSERT INTO task_events(task_id, run_id, kind, payload, created_at)
         VALUES (?, ?, ?, ?, ?)
-      `)
-      .run(input.taskId, input.runId ?? null, kind, payload, createdAt);
+      `,
+      [input.taskId, input.runId ?? null, kind, payload, createdAt],
+    );
     const id = integerValue(result.lastInsertRowid, "event", "<new>", "id");
     return this.#requireEvent(id);
   }
@@ -1883,16 +1867,17 @@ export class AgentQStore {
     }
     const [limit] = pagination(filter.limit, 0);
     values.push(limit);
-    return this.#database
-      .query<EventRow, Binding[]>(`
+    return selectAll<EventRow, Binding[]>(
+      this.#database,
+      `
         SELECT ${EVENT_COLUMNS}
         FROM task_events e
         WHERE ${where.join(" AND ")}
         ORDER BY e.id
         LIMIT ?
-      `)
-      .all(...values)
-      .map(mapEvent);
+      `,
+      values,
+    ).map(mapEvent);
   }
 
   deleteEvents(filter: EventFilter): number {
@@ -1906,16 +1891,17 @@ export class AgentQStore {
       where.push("id > ?");
       values.push(integerInput(filter.afterId, "afterId", 0));
     }
-    return this.#database
-      .query<unknown, Binding[]>(`DELETE FROM task_events WHERE ${where.join(" AND ")}`)
-      .run(...values).changes;
+    return this.#database.run(`DELETE FROM task_events WHERE ${where.join(" AND ")}`, values)
+      .changes;
   }
 
   counts(): StoreCounts {
     const count = (table: "queues" | "tasks" | "runs" | "task_events") => {
-      const row = this.#database
-        .query<CountRow, []>(`SELECT COUNT(*) AS count FROM ${table}`)
-        .get();
+      const row = selectOne<CountRow, []>(
+        this.#database,
+        `SELECT COUNT(*) AS count FROM ${table}`,
+        [],
+      );
       if (!row) throw new AgentQError(`Could not count ${table}`, "DATABASE_ERROR");
       return integerValue(row.count, table, "<count>", "count");
     };
@@ -1947,9 +1933,11 @@ export class AgentQStore {
 
   #assertRunLease(id: string, leaseToken?: string): void {
     if (leaseToken === undefined) return;
-    const row = this.#database
-      .query<{ owner_token: unknown }, [string]>("SELECT owner_token FROM runs WHERE id = ?")
-      .get(id);
+    const row = selectOne<{ owner_token: unknown }, [string]>(
+      this.#database,
+      "SELECT owner_token FROM runs WHERE id = ?",
+      [id],
+    );
     if (!row) throw new AgentQError(`Run ${id} does not exist`, "RUN_NOT_FOUND");
     if (row.owner_token !== leaseToken) {
       throw new AgentQError(`Run ${id} is owned by another supervisor`, "RUN_LEASE_LOST");
@@ -1957,9 +1945,11 @@ export class AgentQStore {
   }
 
   #requireEvent(id: number): TaskEvent {
-    const row = this.#database
-      .query<EventRow, [number]>(`SELECT ${EVENT_COLUMNS} FROM task_events e WHERE e.id = ?`)
-      .get(id);
+    const row = selectOne<EventRow, [number]>(
+      this.#database,
+      `SELECT ${EVENT_COLUMNS} FROM task_events e WHERE e.id = ?`,
+      [id],
+    );
     if (!row) throw new AgentQError(`Event ${id} does not exist`, "EVENT_NOT_FOUND");
     return mapEvent(row);
   }

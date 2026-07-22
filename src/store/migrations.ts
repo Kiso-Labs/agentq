@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { AgentQError } from "../core/errors.ts";
 import { isoNow } from "../core/paths.ts";
+import { selectOne } from "./sqlite.ts";
 
 interface Migration {
   version: number;
@@ -196,9 +197,11 @@ const migrations: readonly Migration[] = [
       database.run("ALTER TABLE queues_v4 RENAME TO queues");
       database.run("ALTER TABLE runs ADD COLUMN task_snapshot TEXT");
 
-      const violation = database
-        .query<ForeignKeyViolationRow, []>("PRAGMA foreign_key_check")
-        .get();
+      const violation = selectOne<ForeignKeyViolationRow, []>(
+        database,
+        "PRAGMA foreign_key_check",
+        [],
+      );
       if (violation) {
         throw new AgentQError(
           `Database migration would break ${violation.table} foreign key ${violation.fkid}`,
@@ -224,9 +227,11 @@ export function migrate(database: Database): void {
 
   const latestSupported = migrations.at(-1)?.version ?? 0;
   const latestApplied =
-    database
-      .query<VersionRow, []>("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations")
-      .get()?.version ?? 0;
+    selectOne<VersionRow, []>(
+      database,
+      "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
+      [],
+    )?.version ?? 0;
 
   if (latestApplied > latestSupported) {
     throw new AgentQError(
@@ -237,18 +242,20 @@ export function migrate(database: Database): void {
 
   for (const migration of migrations) {
     const apply = database.transaction(() => {
-      const alreadyApplied = database
-        .query<VersionRow, [number]>("SELECT version FROM schema_migrations WHERE version = ?")
-        .get(migration.version);
+      const alreadyApplied = selectOne<VersionRow, [number]>(
+        database,
+        "SELECT version FROM schema_migrations WHERE version = ?",
+        [migration.version],
+      );
 
       if (alreadyApplied) return;
 
       migration.up(database);
-      database
-        .query<unknown, [number, string, string]>(
-          "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-        )
-        .run(migration.version, migration.name, isoNow());
+      database.run("INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)", [
+        migration.version,
+        migration.name,
+        isoNow(),
+      ]);
     });
 
     if (migration.foreignKeysOff) database.run("PRAGMA foreign_keys = OFF");
