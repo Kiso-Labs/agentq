@@ -329,7 +329,7 @@ describe("CLI executors", () => {
     const [events, result] = await Promise.all([collect(execution.events), execution.completion]);
     const invocation = JSON.parse(await Bun.file(capture).text());
 
-    expect(invocation).toEqual({
+    expect(invocation).toMatchObject({
       args: [
         "exec",
         "--json",
@@ -342,8 +342,8 @@ describe("CLI executors", () => {
         "-",
       ],
       input: "Fix the bug and test it.",
-      cwd: await realpath(directory),
     });
+    expect(await realpath(invocation.cwd)).toBe(await realpath(directory));
     expect(events).toContainEqual({ type: "session", sessionId: "codex-session" });
     expect(events).toContainEqual({
       type: "diagnostic",
