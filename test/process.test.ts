@@ -34,6 +34,10 @@ async function executable(path: string, source = "#!/bin/sh\nexit 0\n"): Promise
   await chmod(path, 0o755);
 }
 
+function executableFixture(path: string): string {
+  return process.platform === "win32" ? `${path}.EXE` : path;
+}
+
 describe("BoundedAsyncQueue", () => {
   test("bounds buffered events by dropping the oldest event", async () => {
     const queue = new BoundedAsyncQueue<number>(2);
@@ -89,15 +93,16 @@ describe("lines", () => {
 describe("resolveBinary", () => {
   test("prefers the configured environment override", async () => {
     const directory = await temporaryDirectory();
-    const override = join(directory, "override");
-    const onPath = join(directory, "agent-tool");
+    const overrideInput = join(directory, "override");
+    const override = executableFixture(overrideInput);
+    const onPath = executableFixture(join(directory, "agent-tool"));
     await executable(override);
     await executable(onPath);
 
     const resolved = resolveBinary({
       name: "agent-tool",
       envVar: "AGENTQ_TEST_BIN",
-      env: { AGENTQ_TEST_BIN: override, PATH: directory },
+      env: { AGENTQ_TEST_BIN: overrideInput, PATH: directory },
       from: join(directory, "project", "src"),
     });
 
@@ -112,9 +117,9 @@ describe("resolveBinary", () => {
     await mkdir(sourceDirectory, { recursive: true });
     await mkdir(bundledDirectory, { recursive: true });
     await mkdir(pathDirectory, { recursive: true });
-    const bundled = join(bundledDirectory, "agent-tool");
+    const bundled = executableFixture(join(bundledDirectory, "agent-tool"));
     await executable(bundled);
-    await executable(join(pathDirectory, "agent-tool"));
+    await executable(executableFixture(join(pathDirectory, "agent-tool")));
 
     const resolved = resolveBinary({
       name: "agent-tool",
@@ -268,28 +273,36 @@ describe("spawnProcess", () => {
     const sentinels = Array.from({ length: 8 }, (_, index) =>
       join(directory, `released-${index}.txt`),
     );
-    const children = sentinels.map((sentinel) =>
-      spawnProcess({
-        command: process.execPath,
-        args: [script, sentinel],
-        cwd: directory,
-        env: { ...process.env },
-        gated: true,
-        identityDirectory: join(directory, "identities"),
-      }),
-    );
+    const children: ReturnType<typeof spawnProcess>[] = [];
 
-    await Promise.all(children.map((child) => child.identity));
-    expect(await Promise.all(sentinels.map((sentinel) => Bun.file(sentinel).exists()))).toEqual(
-      Array.from({ length: sentinels.length }, () => false),
-    );
-    await Promise.all(children.map((child) => child.release()));
-    const completions = await Promise.all(children.map((child) => child.completion));
+    try {
+      for (const sentinel of sentinels) {
+        children.push(
+          spawnProcess({
+            command: process.execPath,
+            args: [script, sentinel],
+            cwd: directory,
+            env: { ...process.env },
+            gated: true,
+            identityDirectory: join(directory, "identities"),
+          }),
+        );
+      }
+      await Promise.all(children.map((child) => child.identity));
+      expect(await Promise.all(sentinels.map((sentinel) => Bun.file(sentinel).exists()))).toEqual(
+        Array.from({ length: sentinels.length }, () => false),
+      );
+      await Promise.all(children.map((child) => child.release()));
+      const completions = await Promise.all(children.map((child) => child.completion));
 
-    expect(completions.every((completion) => completion.exitCode === 0)).toBe(true);
-    expect(await Promise.all(sentinels.map((sentinel) => Bun.file(sentinel).text()))).toEqual(
-      Array.from({ length: sentinels.length }, () => "released"),
-    );
+      expect(completions.every((completion) => completion.exitCode === 0)).toBe(true);
+      expect(await Promise.all(sentinels.map((sentinel) => Bun.file(sentinel).text()))).toEqual(
+        Array.from({ length: sentinels.length }, () => "released"),
+      );
+    } finally {
+      await Promise.allSettled(children.map((child) => child.cancel("test cleanup")));
+      await Promise.allSettled(children.map((child) => child.completion));
+    }
   });
 
   test.skipIf(process.platform === "win32")(

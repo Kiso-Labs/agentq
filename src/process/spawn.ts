@@ -67,7 +67,7 @@ const PROCESS_TERMINATE = 0x0000_0001;
 const PROCESS_SET_QUOTA = 0x0000_0100;
 
 const LAUNCHER_SOURCE = String.raw`
-import { chmodSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, ftruncateSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 
 const token = process.argv[1];
@@ -106,6 +106,7 @@ let launched = false;
 let heartbeat;
 let providerChild;
 let identityFailed = false;
+let windowsIdentityHandle;
 
 if (process.platform !== "win32") {
   // The supervisor signals the whole process group. Keep the launcher alive
@@ -120,21 +121,56 @@ if (process.platform !== "win32") {
 }
 
 function writeIdentity() {
-  const temporary = identityPath + "." + process.pid + ".tmp";
-  writeFileSync(temporary, JSON.stringify({
+  const serialized = JSON.stringify({
     pid: process.pid,
     token,
     startMarker,
     sequence: ++sequence,
     updatedAt: Date.now(),
-  }), { encoding: "utf8", mode: 0o600 });
+  });
+  if (process.platform === "win32") {
+    if (windowsIdentityHandle === undefined) {
+      windowsIdentityHandle = openSync(identityPath, "wx+", 0o600);
+      chmodSync(identityPath, 0o600);
+    }
+    const contents = Buffer.from(serialized, "utf8");
+    ftruncateSync(windowsIdentityHandle, 0);
+    let offset = 0;
+    while (offset < contents.length) {
+      const written = writeSync(
+        windowsIdentityHandle,
+        contents,
+        offset,
+        contents.length - offset,
+        offset,
+      );
+      if (written <= 0) throw new Error("Could not refresh the process identity lease");
+      offset += written;
+    }
+    // Reading the path back detects deletion or replacement while the retained
+    // handle prevents heartbeat updates from reopening an attacker-controlled path.
+    if (readFileSync(identityPath, "utf8") !== serialized) {
+      throw new Error("Process identity lease path changed during refresh");
+    }
+    return;
+  }
+  const temporary = identityPath + "." + process.pid + ".tmp";
+  writeFileSync(temporary, serialized, { encoding: "utf8", mode: 0o600 });
   chmodSync(temporary, 0o600);
   renameSync(temporary, identityPath);
 }
 
 function cleanup() {
   if (heartbeat) clearInterval(heartbeat);
-  try { unlinkSync(identityPath); } catch {}
+  if (windowsIdentityHandle !== undefined) {
+    try { closeSync(windowsIdentityHandle); } catch {}
+    windowsIdentityHandle = undefined;
+  }
+  // The supervisor verifies ownership before removing a Windows lease. Avoid
+  // unlinking a pathname here after a detected delete/replace race.
+  if (process.platform !== "win32") {
+    try { unlinkSync(identityPath); } catch {}
+  }
   try { unlinkSync(gatePath); } catch {}
 }
 
@@ -145,11 +181,20 @@ function failBeforeLaunch(error) {
   identityFailed = true;
   if (process.platform === "win32") {
     const killer = spawn("taskkill", ["/PID", String(process.pid), "/T", "/F"], {
-      detached: true,
+      detached: false,
       stdio: "ignore",
       windowsHide: true,
     });
-    killer.unref();
+    let exiting = false;
+    const forceExit = () => {
+      if (exiting) return;
+      exiting = true;
+      try { providerChild?.kill("SIGKILL"); } catch {}
+      process.exit(79);
+    };
+    killer.once("error", forceExit);
+    killer.once("close", forceExit);
+    setTimeout(forceExit, 1000);
     return;
   }
   try { process.kill(-process.pid, "SIGTERM"); }
@@ -448,7 +493,7 @@ async function writeReleaseGate(path: string, token: string): Promise<void> {
   }
 }
 
-async function readIdentityLease(path: string): Promise<IdentityLease | undefined> {
+async function readIdentityLeaseOnce(path: string): Promise<IdentityLease | undefined> {
   const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
@@ -473,12 +518,40 @@ async function readIdentityLease(path: string): Promise<IdentityLease | undefine
   }
 }
 
+async function readIdentityLease(path: string): Promise<IdentityLease | undefined> {
+  const attempts = process.platform === "win32" ? 4 : 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const lease = await readIdentityLeaseOnce(path);
+    if (lease) return lease;
+    if (attempt + 1 < attempts) await Bun.sleep(5);
+  }
+  return undefined;
+}
+
 function leaseMatches(lease: IdentityLease, identity: ProcessIdentity): boolean {
   return (
     lease.pid === identity.pid &&
     lease.token === identity.token &&
     lease.startMarker === identity.startMarker
   );
+}
+
+async function unlinkOwnedIdentityLease(
+  path: string,
+  pid: number,
+  token: string,
+  startMarker?: string,
+): Promise<void> {
+  const lease = await readIdentityLease(path);
+  if (
+    !lease ||
+    lease.pid !== pid ||
+    lease.token !== token ||
+    (startMarker !== undefined && lease.startMarker !== startMarker)
+  ) {
+    return;
+  }
+  await unlink(path).catch(() => undefined);
 }
 
 export async function matchesProcessIdentity(identity: ProcessIdentity): Promise<boolean> {
@@ -557,7 +630,14 @@ export async function terminateProcessTree(
   if (process.platform === "win32") {
     await runTaskkill(pid);
     if (isProcessAlive(pid)) throw new Error(`Process tree ${pid} survived taskkill`);
-    if (expectedIdentity) await unlink(expectedIdentity.path).catch(() => undefined);
+    if (expectedIdentity) {
+      await unlinkOwnedIdentityLease(
+        expectedIdentity.path,
+        expectedIdentity.pid,
+        expectedIdentity.token,
+        expectedIdentity.startMarker,
+      );
+    }
     return;
   }
 
@@ -575,7 +655,14 @@ export async function terminateProcessTree(
   if (isProcessGroupAlive(pid)) {
     throw new Error(`Process group ${pid} survived SIGKILL`);
   }
-  if (expectedIdentity) await unlink(expectedIdentity.path).catch(() => undefined);
+  if (expectedIdentity) {
+    await unlinkOwnedIdentityLease(
+      expectedIdentity.path,
+      expectedIdentity.pid,
+      expectedIdentity.token,
+      expectedIdentity.startMarker,
+    );
+  }
 }
 
 /** Spawn an argv-safe child in its own POSIX process group. */
@@ -661,7 +748,9 @@ export function spawnProcess(options: SpawnProcessOptions): ManagedProcess {
             spawnError ??= error instanceof Error ? error : new Error(String(error));
           }
         }
-        if (identityPath) await unlink(identityPath).catch(() => undefined);
+        if (identityPath && token) {
+          await unlinkOwnedIdentityLease(identityPath, processId, token);
+        }
         if (gatePath) await unlink(gatePath).catch(() => undefined);
         settled = true;
         options.signal?.removeEventListener("abort", abort);
