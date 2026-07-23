@@ -1,4 +1,13 @@
-# agentq
+<div align="center">
+
+<h1>🌮 agentq 🌮</h1>
+<h3>Plan it. Queue it. Ship it.</h3>
+<p>Durable parallel task queues for coding agents—with a fresh Git prep station for every task.</p>
+<p><code>Bun</code> · <code>Ink</code> · <code>SQLite</code> · <code>Git worktrees</code> · <code>Codex</code> · <code>Claude Code</code></p>
+
+</div>
+
+> **The taco workflow:** the queue is the shell, planning is the recipe, implementation is the filling, and isolated worktrees keep every agent at its own prep station.
 
 `agentq` is a local, durable task queue for running Codex and Claude Code agents in parallel. Every attempt gets its own Git branch and worktree, so agents can work simultaneously without writing into the same checkout.
 
@@ -6,7 +15,7 @@ Every task uses a mandatory two-agent workflow. A read-only planning process ins
 
 It includes a full-screen Ink interface, scriptable JSON commands, SQLite persistence, live event logs, cancellation, retries, provider-session resumption, verification commands, and agent-to-agent task delegation.
 
-## Install
+## 🌮 Install
 
 agentq runs on [Bun](https://bun.sh/) 1.3 or newer. Its package manifest includes the official Codex and Claude Code CLI packages. After the first public npm release, the global install will be:
 
@@ -31,7 +40,7 @@ bun run check
 bun link
 ```
 
-## Quick start
+## 🌮 Quick start
 
 Create a queue for an existing Git repository:
 
@@ -79,7 +88,7 @@ agentq run                 # continuous foreground worker
 agentq run app --once      # drain one queue, then exit
 ```
 
-### Repository scope
+### 🫘 Repository scope
 
 When started inside a Git working tree, agentq uses the repository's canonical Git common directory as its scope. The Ink UI shows and runs only queues for that repository, and linked worktrees share the same scope. Queue names are case-insensitively unique within a repository, so two different repositories can each have a queue named `app`.
 
@@ -93,7 +102,7 @@ agentq run --all
 
 In the UI, press `g` to switch between the current repository and all repositories. The running supervisor follows that scope change immediately; restarting the UI is not required.
 
-### Queue configuration
+### 🌶️ Queue configuration
 
 Queue settings can be changed from the CLI or the Ink queue form:
 
@@ -127,7 +136,7 @@ The four workflow settings are copied into the run's immutable snapshot when an 
 
 `--verify` is repeatable and replaces the complete verification-command list; `--clear-verify` removes it. The four `--clear-plan-*` and `--clear-implement-*` options restore provider-default models or remove stage guidance. Queue edits can also change the name, base ref, default provider, concurrency, attempt limit, verification commands, and auto-commit policy. The canonical repository identity and repository path stay fixed; create another queue to target a different repository.
 
-### Keyboard UI
+### 🧅 Keyboard UI
 
 The dashboard works in wide, medium, and narrow terminals. Its controls are:
 
@@ -143,7 +152,7 @@ Queue creation collects the name, repository path, optional base ref, provider, 
 
 Destructive and consequential actions are explicit. Task and queue deletion, task cancellation or retry, and provider-instruction installation require confirmation (`y`/`Enter` accepts; `n`/`Esc` cancels). Worktree cleanup also asks whether to use safe or force removal; press `f` or an arrow key to toggle that choice. Active work and retained worktrees block deletion, so cancel or finish active tasks and clean retained worktrees before deleting them. The doctor screen uses `R` to rerun checks, `c` for real Codex login, and `l` for real Claude Code login. agentq temporarily yields the terminal to the official provider CLI, then restores Ink and refreshes the checks. Integration can target Codex, Claude Code, or both and reports each instruction file as created, updated, or unchanged. Attempt and integration-result screens close with `v`/`Esc` and `Enter`/`Esc`, respectively.
 
-## Adding tasks from Codex or Claude Code
+## 🌮 Adding tasks from Codex or Claude Code
 
 Agents use the same durable intake as humans. JSON stdin is stable and avoids shell-quoting problems:
 
@@ -161,7 +170,7 @@ During a managed run, agentq injects `AGENTQ_QUEUE`, `AGENTQ_TASK_ID`, `AGENTQ_R
 
 Codex remains sandboxed while doing this: managed `task add` requests cross a per-run intake directory, and the supervisor atomically stages, validates, and inserts them. The agent never needs write access to the database or another task's worktree. Delegation defaults to 16 child tasks per parent and four ancestry levels; operators can lower those bounds with `AGENTQ_MAX_CHILD_TASKS_PER_RUN` and `AGENTQ_MAX_DELEGATION_DEPTH`.
 
-## Editing tasks safely
+## 🌮 Editing tasks safely
 
 Task specifications can be revised from either the CLI or the Ink edit form:
 
@@ -181,7 +190,7 @@ agentq task edit <task-id> --clear-acceptance
 
 Each claim atomically stores an immutable snapshot of those five task fields plus the queue's planning model/instructions and implementation model/instructions on its run. Editing a retryable task or its queue changes the next fresh claimed attempt without rewriting what any previous attempt was asked to do. A retained session resume continues the earlier run's snapshot.
 
-## Parallel execution model
+## 🌮 Parallel execution model
 
 The supervisor atomically claims queued work from SQLite. It enforces each queue's concurrency limit and launches every claimed task in a dedicated worktree:
 
@@ -207,13 +216,13 @@ An empty planner response or any Git-visible planner worktree change fails the p
 
 agentq never merges, pushes, or opens pull requests automatically.
 
-## Deleting tasks and queues safely
+## 🌮 Deleting tasks and queues safely
 
 Task and queue deletion require explicit confirmation in the Ink UI or `--yes` in the CLI. Deleting a task removes its attempts, events, and local logs. Deleting a queue atomically removes the queue and all of its inactive tasks, attempts, events, and local logs.
 
 Deletion refuses active work and any task that still has a retained worktree. Cancel or finish active tasks first, then run `agentq task clean <id> --yes` for each retained worktree before retrying deletion. This guard keeps agentq from orphaning an agent process or silently discarding an inspection/resume worktree. Both delete commands support `--json` for automation.
 
-## Commands
+## 🌮 Commands
 
 ```text
 agentq                              open the Ink UI and run workers
@@ -246,7 +255,7 @@ agentq integrate <codex|claude|all>  install agent task-creation instructions
 
 Every listing and mutation intended for automation supports JSON input or output. Run `agentq <command> --help` for the complete options.
 
-## State and recovery
+## 🌮 State and recovery
 
 State defaults to:
 
@@ -265,7 +274,7 @@ Use `AGENTQ_STATE_DIR`, `XDG_STATE_HOME`, or the global `--state-dir` option to 
 
 SQLite runs in WAL mode with foreign keys, a busy timeout, atomic claims, fenced supervisor leases, idempotency constraints, and append-only task events. Providers start behind a gate: their random process identity is persisted before the real Codex or Claude command is released. If a supervisor dies, a live peer first fences the stale run, verifies and terminates its orphan process tree, and only then makes the task retryable. Reused PIDs are never signalled, and ambiguous provider exits are never reported as successful.
 
-## Security model
+## 🌮 Security model
 
 - Codex planning runs with `read-only`; implementation runs with `workspace-write` and receives only its run's intake directory as an additional writable root.
 - Claude Code planning is restricted with `--tools Read,Glob,Grep`; implementation uses `acceptEdits` plus `--tools` and `--allowedTools` for the configured coding-tool set. Claude Code does not provide the same filesystem sandbox as Codex.
@@ -277,7 +286,7 @@ SQLite runs in WAL mode with foreign keys, a busy timeout, atomic claims, fenced
 
 See [docs/security.md](docs/security.md) for the exact trust boundaries.
 
-## Development
+## 🌮 Development
 
 ```bash
 bun install
@@ -291,6 +300,6 @@ bun run check
 Architecture details live in [docs/architecture.md](docs/architecture.md). Maintainers can follow
 [docs/releasing.md](docs/releasing.md) for the token-free npm release process.
 
-## License
+## 🌮 License
 
 MIT
