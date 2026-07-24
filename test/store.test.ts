@@ -231,7 +231,7 @@ describe("AgentQStore", () => {
       expect(
         inspection.query<CountRow, []>("SELECT COUNT(*) AS count FROM schema_migrations").get()
           ?.count,
-      ).toBe(7);
+      ).toBe(8);
     } finally {
       inspection.close();
     }

@@ -33,14 +33,16 @@ export type UpdateQueueInput = Partial<
     | "autoCommit"
     | "allowedPaths"
     | "deniedPaths"
-    | "maxChangedFiles"
     | "approvalCheckpoints"
     | "baseDriftPolicy"
     | "landStrategy"
     | "autoLand"
     | "fileConcurrency"
   >
->;
+> & {
+  /** `undefined` leaves the inherited limit unchanged; `null` clears it. */
+  maxChangedFiles?: number | null;
+};
 
 export type EditTaskInput = Partial<
   Pick<
@@ -55,7 +57,6 @@ export type EditTaskInput = Partial<
     | "expectedPaths"
     | "allowedPaths"
     | "deniedPaths"
-    | "maxChangedFiles"
     | "verifyCommands"
     | "approvalCheckpoints"
     | "baseDriftPolicy"
@@ -64,7 +65,10 @@ export type EditTaskInput = Partial<
     | "provider"
     | "priority"
   >
->;
+> & {
+  /** `undefined` leaves the inherited limit unchanged; `null` clears it. */
+  maxChangedFiles?: number | null;
+};
 
 export interface TaskFilter {
   queue?: string;

@@ -107,6 +107,7 @@ export const FAILURE_CLASSES = [
   "file_conflict",
   "policy_violation",
   "integration_conflict",
+  "integration_contention",
   "agent_failure",
   "cancelled",
   "unknown",
@@ -144,6 +145,22 @@ export type VerificationGateKind = (typeof VERIFICATION_GATE_KINDS)[number];
 export const VERIFICATION_STATUSES = ["pending", "passed", "failed", "skipped"] as const;
 export type VerificationStatus = (typeof VERIFICATION_STATUSES)[number];
 
+export const DELIVERY_OPERATION_KINDS = ["integrate", "land"] as const;
+export type DeliveryOperationKind = (typeof DELIVERY_OPERATION_KINDS)[number];
+
+export const DELIVERY_OPERATION_STATUSES = [
+  "queued",
+  "running",
+  "succeeded",
+  "failed",
+  "conflicted",
+  "cancelled",
+] as const;
+export type DeliveryOperationStatus = (typeof DELIVERY_OPERATION_STATUSES)[number];
+
+export const APPROVAL_STATUSES = ["pending", "approved", "rejected"] as const;
+export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
+
 export interface VerificationResult {
   kind: VerificationGateKind;
   status: VerificationStatus;
@@ -170,6 +187,189 @@ export interface TaskDependency {
   taskId: string;
   blockerTaskId: string;
   createdAt: string;
+}
+
+/**
+ * Immutable, durable evidence produced by one successful agent run.
+ *
+ * A result ref names the canonical commit even after worktree cleanup, while
+ * the verification and changed-file snapshots make later integration
+ * decisions independent from mutable task rows.
+ */
+export interface TaskArtifact {
+  id: string;
+  taskId: string;
+  runId: string;
+  repoKey: string;
+  targetRef: string;
+  baseSha: string;
+  resultSha: string;
+  resultRef: string;
+  changedFiles: string[];
+  verificationResults: VerificationResult[];
+  createdAt: string;
+}
+
+export interface RecordTaskArtifactInput {
+  runId: string;
+  baseSha: string;
+  resultSha: string;
+  resultRef: string;
+  changedFiles?: string[];
+  verificationResults?: VerificationResult[];
+  createdAt?: string;
+}
+
+/** A repository/target-scoped, serialized merge-train cursor. */
+export interface IntegrationLane {
+  id: string;
+  repoKey: string;
+  repoPath: string;
+  targetRef: string;
+  trainRef: string;
+  targetBaseSha: string;
+  headSha: string;
+  generation: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GetOrCreateIntegrationLaneInput {
+  repoKey: string;
+  repoPath: string;
+  targetRef: string;
+  trainRef: string;
+  initialHeadSha: string;
+  createdAt?: string;
+}
+
+export interface AdvanceIntegrationLaneInput {
+  expectedHeadSha: string;
+  newHeadSha: string;
+  updatedAt?: string;
+}
+
+/**
+ * Persisted integration or landing intent. `fenceToken` increases on every
+ * lease acquisition so a stale process can never finish a reclaimed operation.
+ */
+export interface DeliveryOperation {
+  id: string;
+  laneId: string;
+  taskId?: string;
+  artifactId?: string;
+  kind: DeliveryOperationKind;
+  status: DeliveryOperationStatus;
+  ownerToken?: string;
+  fenceToken: number;
+  expectedHeadSha?: string;
+  candidateSha?: string;
+  conflictFiles: string[];
+  error?: string;
+  createdAt: string;
+  startedAt?: string;
+  heartbeatAt?: string;
+  leaseExpiresAt?: string;
+  finishedAt?: string;
+}
+
+export interface DeliveryOperationClaim {
+  operation: DeliveryOperation;
+  leaseToken: string;
+  fenceToken: number;
+}
+
+export interface CreateDeliveryOperationInput {
+  laneId: string;
+  kind: DeliveryOperationKind;
+  taskId?: string;
+  artifactId?: string;
+  createdAt?: string;
+}
+
+export interface ClaimDeliveryOperationInput {
+  ownerToken: string;
+  operationId?: string;
+  laneId?: string;
+  now?: string;
+  leaseDurationMs?: number;
+}
+
+export interface FinishDeliveryOperationInput {
+  status: Extract<DeliveryOperationStatus, "succeeded" | "failed" | "conflicted" | "cancelled">;
+  candidateSha?: string;
+  conflictFiles?: string[];
+  error?: string;
+  finishedAt?: string;
+}
+
+export interface CompleteIntegrationInput {
+  operationId: string;
+  leaseToken: string;
+  fenceToken: number;
+  expectedLaneGeneration: number;
+  expectedHeadSha: string;
+  newHeadSha: string;
+  integrationBranch?: string;
+  completedAt?: string;
+}
+
+export interface RecordIntegrationFailureInput {
+  operationId: string;
+  leaseToken: string;
+  fenceToken: number;
+  status: Extract<DeliveryOperationStatus, "failed" | "conflicted">;
+  failureClass: Extract<
+    FailureClass,
+    "integration_conflict" | "integration_contention" | "policy_violation" | "test_regression"
+  >;
+  conflictFiles?: string[];
+  error: string;
+  finishedAt?: string;
+}
+
+export interface CompleteLandingInput {
+  laneId: string;
+  expectedLaneGeneration: number;
+  expectedHeadSha: string;
+  landedSha: string;
+  artifactIds: string[];
+  operationId?: string;
+  leaseToken?: string;
+  fenceToken?: number;
+  completedAt?: string;
+}
+
+/** Durable human approval state for one named task checkpoint. */
+export interface TaskApproval {
+  taskId: string;
+  checkpoint: string;
+  status: ApprovalStatus;
+  runId?: string;
+  requestedAt: string;
+  decidedAt?: string;
+  actor?: string;
+  note?: string;
+}
+
+export interface RequestTaskApprovalInput {
+  taskId: string;
+  checkpoint: string;
+  runId?: string;
+  requestedAt?: string;
+}
+
+export interface DecideTaskApprovalInput {
+  actor?: string;
+  note?: string;
+  decidedAt?: string;
+}
+
+export interface PauseRunForApprovalInput {
+  checkpoint: string;
+  planOutput?: string;
+  planSessionId?: string;
+  requestedAt?: string;
 }
 
 export interface QueueWorkflowSnapshot {
@@ -274,6 +474,7 @@ export interface Task {
   changedFiles: string[];
   verificationResults: VerificationResult[];
   integrationBranch?: string;
+  integrationConflictFiles: string[];
   integratedSha?: string;
   landedSha?: string;
   integratedAt?: string;

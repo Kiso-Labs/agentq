@@ -56,6 +56,7 @@ const task: Task = {
   deliveryStatus: "not_started",
   changedFiles: [],
   verificationResults: [],
+  integrationConflictFiles: [],
   inputTokens: 0,
   outputTokens: 0,
   costUsd: 0,

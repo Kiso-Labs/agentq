@@ -3,31 +3,51 @@ import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { AgentQError, errorMessage } from "../core/errors.ts";
 import { isoNow, makeId } from "../core/paths.ts";
-import { normalizeScopePattern } from "../core/scope-policy.ts";
+import { normalizeScopePattern, scopePatternSetsMayOverlap } from "../core/scope-policy.ts";
 import {
   type AddTaskInput,
+  type AdvanceIntegrationLaneInput,
+  APPROVAL_STATUSES,
   BASE_DRIFT_POLICIES,
+  type ClaimDeliveryOperationInput,
+  type CompleteIntegrationInput,
+  type CompleteLandingInput,
+  type CreateDeliveryOperationInput,
   type CreateQueueInput,
   CURRENT_PHASES,
   canCompleteTaskManually,
   canRetryTask,
+  DELIVERY_OPERATION_KINDS,
+  DELIVERY_OPERATION_STATUSES,
   DELIVERY_STATUSES,
+  type DecideTaskApprovalInput,
+  type DeliveryOperation,
+  type DeliveryOperationClaim,
   EXECUTION_PHASES,
   FAILURE_CLASSES,
   type FailureClass,
   FILE_CONCURRENCY_MODES,
+  type FinishDeliveryOperationInput,
+  type GetOrCreateIntegrationLaneInput,
+  type IntegrationLane,
   isTaskActive,
   LAND_STRATEGIES,
+  type PauseRunForApprovalInput,
   PROVIDERS,
   type Queue,
   type QueueWorkflowSnapshot,
   RETRY_DISPOSITIONS,
+  type RecordIntegrationFailureInput,
+  type RecordTaskArtifactInput,
+  type RequestTaskApprovalInput,
   type RetryDisposition,
   RUN_STATUSES,
   type Run,
   type RunStatus,
   TASK_STATUSES,
   type Task,
+  type TaskApproval,
+  type TaskArtifact,
   type TaskDependencySnapshot,
   type TaskEvent,
   type TaskSpecSnapshot,
@@ -74,6 +94,7 @@ function retryDispositionFor(failureClass: FailureClass): RetryDisposition {
     case "transient_infrastructure":
     case "agent_failure":
     case "unknown":
+    case "integration_contention":
       return "retry";
     case "stale_base":
       return "rebase_and_retry";
@@ -96,6 +117,7 @@ function spendsAttempt(failureClass: FailureClass): boolean {
     "stale_base",
     "blocked_dependency",
     "integration_conflict",
+    "integration_contention",
   ].includes(failureClass);
 }
 
@@ -160,6 +182,7 @@ interface TaskRow {
   changed_files: unknown;
   verification_results: unknown;
   integration_branch: unknown;
+  integration_conflict_files: unknown;
   integrated_sha: unknown;
   landed_sha: unknown;
   integrated_at: unknown;
@@ -224,6 +247,72 @@ interface EventRow {
   kind: unknown;
   payload: unknown;
   created_at: unknown;
+}
+
+interface TaskArtifactRow {
+  id: unknown;
+  task_id: unknown;
+  run_id: unknown;
+  repo_key: unknown;
+  target_ref: unknown;
+  base_sha: unknown;
+  result_sha: unknown;
+  result_ref: unknown;
+  changed_files: unknown;
+  verification_results: unknown;
+  created_at: unknown;
+}
+
+interface IntegrationLaneRow {
+  id: unknown;
+  repo_key: unknown;
+  repo_path: unknown;
+  target_ref: unknown;
+  train_ref: unknown;
+  target_base_sha: unknown;
+  head_sha: unknown;
+  generation: unknown;
+  created_at: unknown;
+  updated_at: unknown;
+}
+
+interface DeliveryOperationRow {
+  id: unknown;
+  lane_id: unknown;
+  task_id: unknown;
+  artifact_id: unknown;
+  kind: unknown;
+  status: unknown;
+  owner_token: unknown;
+  fence_token: unknown;
+  expected_head_sha: unknown;
+  candidate_sha: unknown;
+  conflict_files: unknown;
+  error: unknown;
+  created_at: unknown;
+  started_at: unknown;
+  heartbeat_at: unknown;
+  lease_expires_at: unknown;
+  finished_at: unknown;
+}
+
+interface TaskApprovalRow {
+  task_id: unknown;
+  checkpoint: unknown;
+  status: unknown;
+  run_id: unknown;
+  requested_at: unknown;
+  decided_at: unknown;
+  actor: unknown;
+  note: unknown;
+}
+
+interface ActiveFileScopeRow {
+  task_id: unknown;
+  expected_paths: unknown;
+  allowed_paths: unknown;
+  queue_allowed_paths: unknown;
+  file_concurrency: unknown;
 }
 
 interface CountRow {
@@ -291,7 +380,7 @@ const TASK_COLUMNS = `
   t.current_phase,
   t.delivery_status,
   t.blocked_reason,
-  t.failure_class,
+  COALESCE(t.delivery_failure_class, t.failure_class) AS failure_class,
   t.failure_reason,
   t.retry_disposition,
   t.result_run_id,
@@ -299,6 +388,7 @@ const TASK_COLUMNS = `
   t.changed_files,
   t.verification_results,
   t.integration_branch,
+  t.integration_conflict_files,
   t.integrated_sha,
   t.landed_sha,
   t.integrated_at,
@@ -342,7 +432,7 @@ const RUN_COLUMNS = `
   r.result_commit_sha,
   r.changed_files,
   r.verification_results,
-  r.failure_class,
+  COALESCE(r.delivery_failure_class, r.failure_class) AS failure_class,
   r.retry_disposition,
   r.input_tokens,
   r.output_tokens,
@@ -363,6 +453,64 @@ const EVENT_COLUMNS = `
   e.kind,
   e.payload,
   e.created_at
+`;
+
+const TASK_ARTIFACT_COLUMNS = `
+  a.id,
+  a.task_id,
+  a.run_id,
+  a.repo_key,
+  a.target_ref,
+  a.base_sha,
+  a.result_sha,
+  a.result_ref,
+  a.changed_files,
+  a.verification_results,
+  a.created_at
+`;
+
+const INTEGRATION_LANE_COLUMNS = `
+  lane.id,
+  lane.repo_key,
+  lane.repo_path,
+  lane.target_ref,
+  lane.train_ref,
+  lane.target_base_sha,
+  lane.head_sha,
+  lane.generation,
+  lane.created_at,
+  lane.updated_at
+`;
+
+const DELIVERY_OPERATION_COLUMNS = `
+  operation.id,
+  operation.lane_id,
+  operation.task_id,
+  operation.artifact_id,
+  operation.kind,
+  operation.status,
+  operation.owner_token,
+  operation.fence_token,
+  operation.expected_head_sha,
+  operation.candidate_sha,
+  operation.conflict_files,
+  operation.error,
+  operation.created_at,
+  operation.started_at,
+  operation.heartbeat_at,
+  operation.lease_expires_at,
+  operation.finished_at
+`;
+
+const TASK_APPROVAL_COLUMNS = `
+  approval.task_id,
+  approval.checkpoint,
+  approval.status,
+  approval.run_id,
+  approval.requested_at,
+  approval.decided_at,
+  approval.actor,
+  approval.note
 `;
 
 function corrupt(entity: string, id: string, column: string, expected: string): never {
@@ -913,6 +1061,12 @@ function mapTask(row: TaskRow): Task {
       "verification_results",
     ),
     ...(integrationBranch === undefined ? {} : { integrationBranch }),
+    integrationConflictFiles: jsonStringArray(
+      row.integration_conflict_files,
+      "task",
+      id,
+      "integration_conflict_files",
+    ),
     ...(integratedSha === undefined ? {} : { integratedSha }),
     ...(landedSha === undefined ? {} : { landedSha }),
     ...(integratedAt === undefined ? {} : { integratedAt }),
@@ -1029,10 +1183,159 @@ function mapEvent(row: EventRow): TaskEvent {
   };
 }
 
+function mapTaskArtifact(row: TaskArtifactRow): TaskArtifact {
+  const id = rowId(row, "task artifact");
+  return {
+    id,
+    taskId: stringValue(row.task_id, "task artifact", id, "task_id"),
+    runId: stringValue(row.run_id, "task artifact", id, "run_id"),
+    repoKey: stringValue(row.repo_key, "task artifact", id, "repo_key"),
+    targetRef: stringValue(row.target_ref, "task artifact", id, "target_ref"),
+    baseSha: stringValue(row.base_sha, "task artifact", id, "base_sha"),
+    resultSha: stringValue(row.result_sha, "task artifact", id, "result_sha"),
+    resultRef: stringValue(row.result_ref, "task artifact", id, "result_ref"),
+    changedFiles: jsonStringArray(row.changed_files, "task artifact", id, "changed_files"),
+    verificationResults: verificationResults(
+      row.verification_results,
+      "task artifact",
+      id,
+      "verification_results",
+    ),
+    createdAt: stringValue(row.created_at, "task artifact", id, "created_at"),
+  };
+}
+
+function mapIntegrationLane(row: IntegrationLaneRow): IntegrationLane {
+  const id = rowId(row, "integration lane");
+  return {
+    id,
+    repoKey: stringValue(row.repo_key, "integration lane", id, "repo_key"),
+    repoPath: stringValue(row.repo_path, "integration lane", id, "repo_path"),
+    targetRef: stringValue(row.target_ref, "integration lane", id, "target_ref"),
+    trainRef: stringValue(row.train_ref, "integration lane", id, "train_ref"),
+    targetBaseSha: stringValue(row.target_base_sha, "integration lane", id, "target_base_sha"),
+    headSha: stringValue(row.head_sha, "integration lane", id, "head_sha"),
+    generation: integerValue(row.generation, "integration lane", id, "generation"),
+    createdAt: stringValue(row.created_at, "integration lane", id, "created_at"),
+    updatedAt: stringValue(row.updated_at, "integration lane", id, "updated_at"),
+  };
+}
+
+function mapDeliveryOperation(row: DeliveryOperationRow): DeliveryOperation {
+  const id = rowId(row, "delivery operation");
+  const optional = <K extends keyof DeliveryOperation>(
+    key: K,
+    value: DeliveryOperation[K] | undefined,
+  ): Partial<Pick<DeliveryOperation, K>> =>
+    value === undefined ? {} : ({ [key]: value } as Pick<DeliveryOperation, K>);
+  return {
+    id,
+    laneId: stringValue(row.lane_id, "delivery operation", id, "lane_id"),
+    ...optional("taskId", optionalString(row.task_id, "delivery operation", id, "task_id")),
+    ...optional(
+      "artifactId",
+      optionalString(row.artifact_id, "delivery operation", id, "artifact_id"),
+    ),
+    kind: enumValue(row.kind, DELIVERY_OPERATION_KINDS, "delivery operation", id, "kind"),
+    status: enumValue(row.status, DELIVERY_OPERATION_STATUSES, "delivery operation", id, "status"),
+    ...optional(
+      "ownerToken",
+      optionalString(row.owner_token, "delivery operation", id, "owner_token"),
+    ),
+    fenceToken: integerValue(row.fence_token, "delivery operation", id, "fence_token"),
+    ...optional(
+      "expectedHeadSha",
+      optionalString(row.expected_head_sha, "delivery operation", id, "expected_head_sha"),
+    ),
+    ...optional(
+      "candidateSha",
+      optionalString(row.candidate_sha, "delivery operation", id, "candidate_sha"),
+    ),
+    conflictFiles: jsonStringArray(row.conflict_files, "delivery operation", id, "conflict_files"),
+    ...optional("error", optionalString(row.error, "delivery operation", id, "error")),
+    createdAt: stringValue(row.created_at, "delivery operation", id, "created_at"),
+    ...optional(
+      "startedAt",
+      optionalString(row.started_at, "delivery operation", id, "started_at"),
+    ),
+    ...optional(
+      "heartbeatAt",
+      optionalString(row.heartbeat_at, "delivery operation", id, "heartbeat_at"),
+    ),
+    ...optional(
+      "leaseExpiresAt",
+      optionalString(row.lease_expires_at, "delivery operation", id, "lease_expires_at"),
+    ),
+    ...optional(
+      "finishedAt",
+      optionalString(row.finished_at, "delivery operation", id, "finished_at"),
+    ),
+  };
+}
+
+function mapTaskApproval(row: TaskApprovalRow): TaskApproval {
+  const taskId = stringValue(row.task_id, "task approval", "<unknown>", "task_id");
+  const checkpoint = stringValue(row.checkpoint, "task approval", taskId, "checkpoint");
+  const optional = <K extends keyof TaskApproval>(
+    key: K,
+    value: TaskApproval[K] | undefined,
+  ): Partial<Pick<TaskApproval, K>> =>
+    value === undefined ? {} : ({ [key]: value } as Pick<TaskApproval, K>);
+  return {
+    taskId,
+    checkpoint,
+    status: enumValue(
+      row.status,
+      APPROVAL_STATUSES,
+      "task approval",
+      `${taskId}:${checkpoint}`,
+      "status",
+    ),
+    ...optional("runId", optionalString(row.run_id, "task approval", taskId, "run_id")),
+    requestedAt: stringValue(row.requested_at, "task approval", taskId, "requested_at"),
+    ...optional("decidedAt", optionalString(row.decided_at, "task approval", taskId, "decided_at")),
+    ...optional("actor", optionalString(row.actor, "task approval", taskId, "actor")),
+    ...optional("note", optionalString(row.note, "task approval", taskId, "note")),
+  };
+}
+
 function nonEmpty(value: string, field: string): string {
   const normalized = value.trim();
   if (!normalized) throw new AgentQError(`${field} cannot be empty`, "INVALID_INPUT", 2);
   return normalized;
+}
+
+function canonicalTargetRef(value: string): string {
+  const input = nonEmpty(value, "targetRef");
+  const ref = input.startsWith("refs/heads/") ? input : `refs/heads/${input}`;
+  const branch = ref.slice("refs/heads/".length);
+  const invalid =
+    !branch ||
+    branch.startsWith(".") ||
+    branch.startsWith("-") ||
+    branch === "@" ||
+    branch.endsWith(".") ||
+    branch.endsWith("/") ||
+    branch.includes("..") ||
+    branch.includes("@{") ||
+    branch.includes("//") ||
+    branch.includes("\\") ||
+    [...branch].some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 32 || code === 127;
+    }) ||
+    ["~", "^", ":", "?", "*", "["].some((character) => branch.includes(character)) ||
+    branch
+      .split("/")
+      .some((segment) => !segment || segment.startsWith(".") || segment.endsWith(".lock"));
+  if (invalid) {
+    throw new AgentQError(
+      `targetRef ${JSON.stringify(value)} is not a safe local branch ref`,
+      "INVALID_TARGET_REF",
+      2,
+    );
+  }
+  return ref;
 }
 
 function integerInput(value: number, field: string, minimum?: number): number {
@@ -1359,7 +1662,12 @@ export class AgentQStore {
       set("denied_paths", JSON.stringify(scopePatternArrayInput(patch.deniedPaths, "deniedPaths")));
     }
     if (patch.maxChangedFiles !== undefined) {
-      set("max_changed_files", integerInput(patch.maxChangedFiles, "maxChangedFiles", 1));
+      set(
+        "max_changed_files",
+        patch.maxChangedFiles === null
+          ? null
+          : integerInput(patch.maxChangedFiles, "maxChangedFiles", 1),
+      );
     }
     if (patch.approvalCheckpoints !== undefined) {
       set(
@@ -1573,7 +1881,7 @@ export class AgentQStore {
         input.handoffRequirements ?? [],
         "handoffRequirements",
       );
-      const expectedPaths = stringArrayInput(input.expectedPaths ?? [], "expectedPaths");
+      const expectedPaths = scopePatternArrayInput(input.expectedPaths ?? [], "expectedPaths");
       const allowedPaths = scopePatternArrayInput(input.allowedPaths ?? [], "allowedPaths");
       const deniedPaths = scopePatternArrayInput(input.deniedPaths ?? [], "deniedPaths");
       const maxChangedFiles =
@@ -1771,7 +2079,15 @@ export class AgentQStore {
     if (patch.currentPhase !== undefined) set("current_phase", patch.currentPhase);
     if (patch.deliveryStatus !== undefined) set("delivery_status", patch.deliveryStatus);
     if (patch.blockedReason !== undefined) set("blocked_reason", patch.blockedReason);
-    if (patch.failureClass !== undefined) set("failure_class", patch.failureClass);
+    if (patch.failureClass !== undefined) {
+      if (patch.failureClass === "integration_contention") {
+        set("failure_class", null);
+        set("delivery_failure_class", patch.failureClass);
+      } else {
+        set("failure_class", patch.failureClass);
+        set("delivery_failure_class", null);
+      }
+    }
     if (patch.failureReason !== undefined) set("failure_reason", patch.failureReason);
     if (patch.retryDisposition !== undefined) {
       set("retry_disposition", patch.retryDisposition);
@@ -1866,7 +2182,7 @@ export class AgentQStore {
       const value = patch[field];
       if (value !== undefined) {
         const checked =
-          field === "allowedPaths" || field === "deniedPaths"
+          field === "expectedPaths" || field === "allowedPaths" || field === "deniedPaths"
             ? scopePatternArrayInput(value, field)
             : stringArrayInput(value, field);
         set(field, column, JSON.stringify(checked));
@@ -1876,7 +2192,9 @@ export class AgentQStore {
       set(
         "maxChangedFiles",
         "max_changed_files",
-        integerInput(patch.maxChangedFiles, "maxChangedFiles", 1),
+        patch.maxChangedFiles === null
+          ? null
+          : integerInput(patch.maxChangedFiles, "maxChangedFiles", 1),
       );
     }
     if (patch.baseDriftPolicy !== undefined) {
@@ -2239,7 +2557,7 @@ export class AgentQStore {
             ) < ?`;
       if (maxConcurrency !== undefined) bindings.push(maxConcurrency);
 
-      const candidate = selectOne<TaskRow, Binding[]>(
+      const candidates = selectAll<TaskRow, Binding[]>(
         this.#database,
         `
           SELECT ${TASK_COLUMNS}
@@ -2248,6 +2566,12 @@ export class AgentQStore {
           WHERE t.status = 'queued'
             AND t.cancel_requested_at IS NULL
             AND t.attempt_count < q.max_attempts
+            AND NOT EXISTS (
+              SELECT 1
+              FROM task_approvals approval
+              WHERE approval.task_id = t.id
+                AND approval.status = 'pending'
+            )
             AND NOT EXISTS (
               SELECT 1
               FROM task_dependencies dependency
@@ -2292,10 +2616,14 @@ export class AgentQStore {
                 AND active_run.status IN ('starting', 'running', 'cancelling')
             ) < q.concurrency
           ORDER BY t.priority DESC, t.created_at, t.id
-          LIMIT 1
         `,
         bindings,
       );
+      const candidate = candidates.find((row) => {
+        const candidateTask = mapTask(row);
+        const candidateQueue = this.#requireQueue(candidateTask.queueId);
+        return this.#fileConcurrencyAllows(candidateTask, candidateQueue);
+      });
 
       if (!candidate) return undefined;
 
@@ -2324,6 +2652,12 @@ export class AgentQStore {
           : dependencySnapshot.length > 1
             ? (dependencySnapshot[0]?.landedSha ?? dependencySnapshot[0]?.integratedSha)
             : undefined;
+      const claimBaseSha =
+        dependencyBaseSha ??
+        (task.failureClass === "test_regression" &&
+        task.retryDisposition === "return_to_implementation"
+          ? task.createdBaseSha
+          : undefined);
       // attempt_count is the retry budget for the current enqueue cycle and is
       // reset by an explicit retry. Run attempt numbers are permanent history,
       // so derive them from prior runs to preserve the unique (task, attempt)
@@ -2420,7 +2754,7 @@ export class AgentQStore {
           ownerPid,
           JSON.stringify(snapshot),
           JSON.stringify(dependencySnapshot),
-          dependencyBaseSha ?? null,
+          claimBaseSha ?? null,
           planOutput,
           planSessionId,
           now,
@@ -2569,6 +2903,25 @@ export class AgentQStore {
       // Keep the lease check and guarded write under one IMMEDIATE lock so a
       // fenced supervisor can never report a metadata update as successful.
       this.#assertRunLease(id, leaseToken);
+      const evidenceMutation =
+        patch.resultCommitSha !== undefined ||
+        patch.changedFiles !== undefined ||
+        patch.verificationResults !== undefined ||
+        patch.failureClass !== undefined ||
+        patch.retryDisposition !== undefined ||
+        patch.inputTokens !== undefined ||
+        patch.outputTokens !== undefined ||
+        patch.costUsd !== undefined;
+      const current = this.#requireRun(id);
+      if (
+        evidenceMutation &&
+        !ACTIVE_RUN_STATUSES.includes(current.status as (typeof ACTIVE_RUN_STATUSES)[number])
+      ) {
+        throw new AgentQError(
+          `Run ${id} result evidence is immutable after completion`,
+          "RUN_EVIDENCE_IMMUTABLE",
+        );
+      }
       const fields: string[] = [];
       const values: Binding[] = [];
       const set = (column: string, value: Binding) => {
@@ -2616,7 +2969,15 @@ export class AgentQStore {
           ),
         );
       }
-      if (patch.failureClass !== undefined) set("failure_class", patch.failureClass);
+      if (patch.failureClass !== undefined) {
+        if (patch.failureClass === "integration_contention") {
+          set("failure_class", null);
+          set("delivery_failure_class", patch.failureClass);
+        } else {
+          set("failure_class", patch.failureClass);
+          set("delivery_failure_class", null);
+        }
+      }
       if (patch.retryDisposition !== undefined) {
         set("retry_disposition", patch.retryDisposition);
       }
@@ -2637,7 +2998,9 @@ export class AgentQStore {
       values.push(id);
       if (leaseToken !== undefined) values.push(leaseToken);
       const activeCondition =
-        patch.status === undefined ? "" : " AND status IN ('starting', 'running', 'cancelling')";
+        patch.status === undefined && !evidenceMutation
+          ? ""
+          : " AND status IN ('starting', 'running', 'cancelling')";
       const leaseCondition = leaseToken === undefined ? "" : " AND owner_token = ?";
       const changed = this.#database.run(
         `UPDATE runs SET ${fields.join(", ")} WHERE id = ?${activeCondition}${leaseCondition}`,
@@ -2842,7 +3205,8 @@ export class AgentQStore {
           SET status = ?, heartbeat_at = ?, finished_at = ?, exit_code = ?,
               summary = ?, error = ?, provider_session_id = COALESCE(?, provider_session_id),
               result_commit_sha = ?, changed_files = ?, verification_results = ?,
-              failure_class = ?, retry_disposition = ?, input_tokens = ?,
+              failure_class = ?, delivery_failure_class = ?,
+              retry_disposition = ?, input_tokens = ?,
               output_tokens = ?, cost_usd = ?
           WHERE id = ?
         `,
@@ -2857,7 +3221,8 @@ export class AgentQStore {
           input.resultCommitSha ?? null,
           JSON.stringify(changedFiles),
           JSON.stringify(checkedVerificationResults),
-          failureClass ?? null,
+          failureClass === "integration_contention" ? null : (failureClass ?? null),
+          failureClass === "integration_contention" ? failureClass : null,
           retryDisposition ?? null,
           inputTokens,
           outputTokens,
@@ -2921,6 +3286,7 @@ export class AgentQStore {
                 ELSE resume_run_id
               END,
               current_phase = ?, delivery_status = ?, failure_class = ?,
+              delivery_failure_class = ?,
               failure_reason = ?, retry_disposition = ?, result_run_id = ?,
               result_commit_sha = ?, changed_files = ?, verification_results = ?,
               input_tokens = input_tokens + ?, output_tokens = output_tokens + ?,
@@ -2936,7 +3302,8 @@ export class AgentQStore {
           taskStatus === "queued" ? 0 : 1,
           currentPhase,
           deliveryStatus,
-          failureClass ?? null,
+          failureClass === "integration_contention" ? null : (failureClass ?? null),
+          failureClass === "integration_contention" ? failureClass : null,
           runStatus === "succeeded" ? null : (input.error ?? null),
           retryDisposition ?? null,
           runStatus === "succeeded" && input.resultCommitSha ? id : null,
@@ -3222,6 +3589,1280 @@ export class AgentQStore {
       .changes;
   }
 
+  recordTaskArtifact(input: RecordTaskArtifactInput): TaskArtifact {
+    const record = this.#database.transaction(() => {
+      const runId = nonEmpty(input.runId, "runId");
+      const run = this.#requireRun(runId);
+      const task = this.#requireTask(run.taskId);
+      const queue = this.#requireQueue(task.queueId);
+      const baseSha = nonEmpty(input.baseSha, "baseSha");
+      const resultSha = nonEmpty(input.resultSha, "resultSha");
+      const resultRef = nonEmpty(input.resultRef, "resultRef");
+      const targetRef = canonicalTargetRef(queue.baseRef);
+      const expectedResultRef = `refs/agentq/results/${task.id}/${run.id}`;
+      if (resultRef !== expectedResultRef) {
+        throw new AgentQError(
+          `Artifact result ref must be ${expectedResultRef}`,
+          "TASK_ARTIFACT_RESULT_REF_INVALID",
+          2,
+        );
+      }
+
+      if (
+        run.status !== "succeeded" ||
+        task.status !== "succeeded" ||
+        !run.baseSha ||
+        run.baseSha !== baseSha ||
+        run.resultCommitSha !== resultSha ||
+        task.resultRunId !== run.id ||
+        task.resultCommitSha !== resultSha
+      ) {
+        throw new AgentQError(
+          `Run ${run.id} does not have matching successful result evidence`,
+          "TASK_ARTIFACT_EVIDENCE_MISMATCH",
+        );
+      }
+      if (run.verificationResults.some((result) => result.status !== "passed")) {
+        throw new AgentQError(
+          `Run ${run.id} contains verification that did not pass`,
+          "TASK_ARTIFACT_UNVERIFIED",
+        );
+      }
+
+      const changedFiles =
+        input.changedFiles === undefined
+          ? [...run.changedFiles]
+          : stringArrayInput(input.changedFiles, "changedFiles");
+      const checkedVerificationResults =
+        input.verificationResults === undefined
+          ? [...run.verificationResults]
+          : verificationResults(
+              JSON.stringify(input.verificationResults),
+              "task artifact",
+              run.id,
+              "verificationResults",
+            );
+      if (
+        JSON.stringify(changedFiles) !== JSON.stringify(run.changedFiles) ||
+        JSON.stringify(checkedVerificationResults) !== JSON.stringify(run.verificationResults)
+      ) {
+        throw new AgentQError(
+          `Artifact evidence for run ${run.id} differs from the persisted run`,
+          "TASK_ARTIFACT_EVIDENCE_MISMATCH",
+        );
+      }
+
+      const existing = this.getTaskArtifactByRun(run.id);
+      if (existing) {
+        if (
+          existing.taskId !== task.id ||
+          existing.repoKey !== queue.repoKey ||
+          existing.targetRef !== targetRef ||
+          existing.baseSha !== baseSha ||
+          existing.resultSha !== resultSha ||
+          existing.resultRef !== resultRef ||
+          JSON.stringify(existing.changedFiles) !== JSON.stringify(changedFiles) ||
+          JSON.stringify(existing.verificationResults) !==
+            JSON.stringify(checkedVerificationResults)
+        ) {
+          throw new AgentQError(
+            `Artifact for run ${run.id} is immutable`,
+            "TASK_ARTIFACT_IMMUTABLE",
+          );
+        }
+        return existing;
+      }
+
+      const id = makeId("artifact");
+      try {
+        this.#database.run(
+          `
+            INSERT INTO task_artifacts(
+              id, task_id, run_id, repo_key, target_ref, base_sha, result_sha,
+              result_ref, changed_files, verification_results, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `,
+          [
+            id,
+            task.id,
+            run.id,
+            queue.repoKey,
+            targetRef,
+            baseSha,
+            resultSha,
+            resultRef,
+            JSON.stringify(changedFiles),
+            JSON.stringify(checkedVerificationResults),
+            timestamp(input.createdAt, "artifact createdAt"),
+          ],
+        );
+      } catch (error) {
+        constraint(
+          error,
+          `Artifact evidence for run ${run.id} or ref ${resultRef} already exists`,
+          "TASK_ARTIFACT_CONFLICT",
+        );
+      }
+      return this.#requireTaskArtifact(id);
+    });
+    return record.immediate();
+  }
+
+  getTaskArtifact(id: string): TaskArtifact | undefined {
+    const row = selectOne<TaskArtifactRow, [string]>(
+      this.#database,
+      `SELECT ${TASK_ARTIFACT_COLUMNS} FROM task_artifacts a WHERE a.id = ?`,
+      [id],
+    );
+    return row ? mapTaskArtifact(row) : undefined;
+  }
+
+  getTaskArtifactByRun(runId: string): TaskArtifact | undefined {
+    const row = selectOne<TaskArtifactRow, [string]>(
+      this.#database,
+      `SELECT ${TASK_ARTIFACT_COLUMNS} FROM task_artifacts a WHERE a.run_id = ?`,
+      [runId],
+    );
+    return row ? mapTaskArtifact(row) : undefined;
+  }
+
+  listTaskArtifacts(taskId: string): TaskArtifact[] {
+    this.#requireTask(taskId);
+    return selectAll<TaskArtifactRow, [string]>(
+      this.#database,
+      `
+        SELECT ${TASK_ARTIFACT_COLUMNS}
+        FROM task_artifacts a
+        WHERE a.task_id = ?
+        ORDER BY a.created_at, a.id
+      `,
+      [taskId],
+    ).map(mapTaskArtifact);
+  }
+
+  getIntegrationLane(id: string): IntegrationLane | undefined {
+    const row = selectOne<IntegrationLaneRow, [string]>(
+      this.#database,
+      `SELECT ${INTEGRATION_LANE_COLUMNS} FROM integration_lanes lane WHERE lane.id = ?`,
+      [id],
+    );
+    return row ? mapIntegrationLane(row) : undefined;
+  }
+
+  getIntegrationLaneForTarget(repoKey: string, targetRef: string): IntegrationLane | undefined {
+    const row = selectOne<IntegrationLaneRow, [string, string]>(
+      this.#database,
+      `
+        SELECT ${INTEGRATION_LANE_COLUMNS}
+        FROM integration_lanes lane
+        WHERE lane.repo_key = ? AND lane.target_ref = ?
+      `,
+      [nonEmpty(repoKey, "repoKey"), canonicalTargetRef(targetRef)],
+    );
+    return row ? mapIntegrationLane(row) : undefined;
+  }
+
+  getOrCreateIntegrationLane(input: GetOrCreateIntegrationLaneInput): IntegrationLane {
+    const create = this.#database.transaction(() => {
+      const repoKey = nonEmpty(input.repoKey, "repoKey");
+      const repoPath = nonEmpty(input.repoPath, "repoPath");
+      const targetRef = canonicalTargetRef(input.targetRef);
+      const trainRef = nonEmpty(input.trainRef, "trainRef");
+      const initialHeadSha = nonEmpty(input.initialHeadSha, "initialHeadSha");
+      const existing = this.getIntegrationLaneForTarget(repoKey, targetRef);
+      if (existing) {
+        if (existing.repoPath !== repoPath || existing.trainRef !== trainRef) {
+          throw new AgentQError(
+            `Integration lane ${existing.id} is already bound to ${existing.repoPath} and ${existing.trainRef}`,
+            "INTEGRATION_LANE_CONFLICT",
+          );
+        }
+        return existing;
+      }
+
+      const id = makeId("lane");
+      const createdAt = timestamp(input.createdAt, "lane createdAt");
+      try {
+        this.#database.run(
+          `
+            INSERT INTO integration_lanes(
+              id, repo_key, repo_path, target_ref, train_ref, target_base_sha, head_sha,
+              generation, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+          `,
+          [
+            id,
+            repoKey,
+            repoPath,
+            targetRef,
+            trainRef,
+            initialHeadSha,
+            initialHeadSha,
+            createdAt,
+            createdAt,
+          ],
+        );
+      } catch (error) {
+        constraint(
+          error,
+          `An integration lane already owns ${repoKey}:${targetRef} or ${trainRef}`,
+          "INTEGRATION_LANE_CONFLICT",
+        );
+      }
+      return this.#requireIntegrationLane(id);
+    });
+    return create.immediate();
+  }
+
+  advanceIntegrationLaneHead(id: string, input: AdvanceIntegrationLaneInput): IntegrationLane {
+    const advance = this.#database.transaction(() => {
+      const lane = this.#requireIntegrationLane(id);
+      const expectedHeadSha = nonEmpty(input.expectedHeadSha, "expectedHeadSha");
+      const newHeadSha = nonEmpty(input.newHeadSha, "newHeadSha");
+      if (lane.headSha === newHeadSha) return lane;
+      if (lane.headSha !== expectedHeadSha) {
+        throw new AgentQError(
+          `Integration lane ${id} advanced from ${expectedHeadSha} to ${lane.headSha}`,
+          "INTEGRATION_LANE_HEAD_CHANGED",
+        );
+      }
+      const changed = this.#database.run(
+        `
+          UPDATE integration_lanes
+          SET head_sha = ?, generation = generation + 1, updated_at = ?
+          WHERE id = ? AND head_sha = ? AND generation = ?
+        `,
+        [
+          newHeadSha,
+          timestamp(input.updatedAt, "lane updatedAt"),
+          id,
+          expectedHeadSha,
+          lane.generation,
+        ],
+      ).changes;
+      if (changed !== 1) {
+        throw new AgentQError(
+          `Integration lane ${id} changed before its head could advance`,
+          "INTEGRATION_LANE_HEAD_CHANGED",
+        );
+      }
+      return this.#requireIntegrationLane(id);
+    });
+    return advance.immediate();
+  }
+
+  createDeliveryOperation(input: CreateDeliveryOperationInput): DeliveryOperation {
+    const create = this.#database.transaction(() => {
+      const lane = this.#requireIntegrationLane(nonEmpty(input.laneId, "laneId"));
+      const kind = enumValue(
+        input.kind,
+        DELIVERY_OPERATION_KINDS,
+        "delivery operation",
+        "<new>",
+        "kind",
+      );
+      let taskId: string | null = null;
+      let artifactId: string | null = null;
+      let existing: DeliveryOperation | undefined;
+
+      if (kind === "integrate") {
+        taskId = nonEmpty(input.taskId ?? "", "taskId");
+        artifactId = nonEmpty(input.artifactId ?? "", "artifactId");
+        const task = this.#requireTask(taskId);
+        const artifact = this.#requireTaskArtifact(artifactId);
+        if (
+          artifact.taskId !== task.id ||
+          artifact.repoKey !== lane.repoKey ||
+          artifact.targetRef !== lane.targetRef ||
+          task.status !== "succeeded" ||
+          task.resultRunId !== artifact.runId ||
+          task.resultCommitSha !== artifact.resultSha
+        ) {
+          throw new AgentQError(
+            `Artifact ${artifact.id} does not belong to lane ${lane.id}`,
+            "DELIVERY_ARTIFACT_LANE_MISMATCH",
+          );
+        }
+        const existingRow = selectOne<DeliveryOperationRow, [string]>(
+          this.#database,
+          `
+            SELECT ${DELIVERY_OPERATION_COLUMNS}
+            FROM delivery_operations operation
+            WHERE operation.artifact_id = ?
+              AND operation.kind = 'integrate'
+              AND operation.status IN ('queued', 'running')
+            LIMIT 1
+          `,
+          [artifact.id],
+        );
+        existing = existingRow ? mapDeliveryOperation(existingRow) : undefined;
+      } else {
+        if (input.taskId !== undefined || input.artifactId !== undefined) {
+          throw new AgentQError(
+            "Landing operations are lane-scoped and cannot name a task or artifact",
+            "INVALID_DELIVERY_OPERATION",
+            2,
+          );
+        }
+        const existingRow = selectOne<DeliveryOperationRow, [string]>(
+          this.#database,
+          `
+            SELECT ${DELIVERY_OPERATION_COLUMNS}
+            FROM delivery_operations operation
+            WHERE operation.lane_id = ?
+              AND operation.kind = 'land'
+              AND operation.status IN ('queued', 'running')
+            LIMIT 1
+          `,
+          [lane.id],
+        );
+        existing = existingRow ? mapDeliveryOperation(existingRow) : undefined;
+      }
+      if (existing) return existing;
+
+      const id = makeId("delivery");
+      try {
+        this.#database.run(
+          `
+            INSERT INTO delivery_operations(
+              id, lane_id, task_id, artifact_id, kind, status, conflict_files, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'queued', '[]', ?)
+          `,
+          [
+            id,
+            lane.id,
+            taskId,
+            artifactId,
+            kind,
+            timestamp(input.createdAt, "delivery operation createdAt"),
+          ],
+        );
+      } catch (error) {
+        constraint(
+          error,
+          "A nonterminal delivery operation already exists for this result",
+          "DELIVERY_OPERATION_EXISTS",
+        );
+      }
+      return this.#requireDeliveryOperation(id);
+    });
+    return create.immediate();
+  }
+
+  getDeliveryOperation(id: string): DeliveryOperation | undefined {
+    const row = selectOne<DeliveryOperationRow, [string]>(
+      this.#database,
+      `
+        SELECT ${DELIVERY_OPERATION_COLUMNS}
+        FROM delivery_operations operation
+        WHERE operation.id = ?
+      `,
+      [id],
+    );
+    return row ? mapDeliveryOperation(row) : undefined;
+  }
+
+  listDeliveryOperations(
+    filter: {
+      laneId?: string;
+      taskId?: string;
+      statuses?: readonly DeliveryOperation["status"][];
+    } = {},
+  ): DeliveryOperation[] {
+    const where: string[] = [];
+    const bindings: Binding[] = [];
+    if (filter.laneId !== undefined) {
+      where.push("operation.lane_id = ?");
+      bindings.push(nonEmpty(filter.laneId, "laneId"));
+    }
+    if (filter.taskId !== undefined) {
+      where.push("operation.task_id = ?");
+      bindings.push(nonEmpty(filter.taskId, "taskId"));
+    }
+    if (filter.statuses !== undefined) {
+      if (filter.statuses.length === 0) {
+        throw new AgentQError("statuses cannot be empty", "INVALID_INPUT", 2);
+      }
+      const statuses = filter.statuses.map((status, index) =>
+        enumValue(
+          status,
+          DELIVERY_OPERATION_STATUSES,
+          "delivery operation filter",
+          String(index),
+          "status",
+        ),
+      );
+      where.push(`operation.status IN (${statuses.map(() => "?").join(", ")})`);
+      bindings.push(...statuses);
+    }
+    return selectAll<DeliveryOperationRow, Binding[]>(
+      this.#database,
+      `
+        SELECT ${DELIVERY_OPERATION_COLUMNS}
+        FROM delivery_operations operation
+        ${where.length === 0 ? "" : `WHERE ${where.join(" AND ")}`}
+        ORDER BY operation.created_at, operation.id
+      `,
+      bindings,
+    ).map(mapDeliveryOperation);
+  }
+
+  claimDeliveryOperation(input: ClaimDeliveryOperationInput): DeliveryOperationClaim | undefined {
+    const claim = this.#database.transaction(() => {
+      const ownerToken = nonEmpty(input.ownerToken, "ownerToken");
+      const now = timestamp(input.now, "delivery lease timestamp");
+      const leaseDurationMs = integerInput(input.leaseDurationMs ?? 30_000, "leaseDurationMs", 1);
+      const leaseExpiresAt = new Date(Date.parse(now) + leaseDurationMs).toISOString();
+      const laneClause = input.laneId === undefined ? "" : "AND operation.lane_id = ?";
+      const operationClause = input.operationId === undefined ? "" : "AND operation.id = ?";
+      const bindings: Binding[] = [now];
+      const requestedOperation =
+        input.operationId === undefined
+          ? undefined
+          : this.#requireDeliveryOperation(input.operationId);
+      if (input.laneId !== undefined) {
+        const requestedLane = this.#requireIntegrationLane(input.laneId);
+        if (requestedOperation && requestedOperation.laneId !== requestedLane.id) {
+          throw new AgentQError(
+            `Delivery operation ${requestedOperation.id} does not belong to lane ${requestedLane.id}`,
+            "INVALID_DELIVERY_OPERATION",
+            2,
+          );
+        }
+        bindings.push(requestedLane.id);
+      }
+      if (requestedOperation) bindings.push(requestedOperation.id);
+      const candidate = selectOne<DeliveryOperationRow, Binding[]>(
+        this.#database,
+        `
+          SELECT ${DELIVERY_OPERATION_COLUMNS}
+          FROM delivery_operations operation
+          WHERE (
+              (
+                operation.status = 'queued'
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM delivery_operations active
+                  WHERE active.lane_id = operation.lane_id
+                    AND active.status = 'running'
+                )
+              )
+              OR (
+                operation.status = 'running'
+                AND operation.lease_expires_at <= ?
+              )
+            )
+            ${laneClause}
+            ${operationClause}
+          ORDER BY
+            CASE WHEN operation.status = 'running' THEN 0 ELSE 1 END,
+            operation.created_at,
+            operation.id
+          LIMIT 1
+        `,
+        bindings,
+      );
+      if (!candidate) return undefined;
+
+      const operation = mapDeliveryOperation(candidate);
+      const lane = this.#requireIntegrationLane(operation.laneId);
+      const changed = this.#database.run(
+        `
+          UPDATE delivery_operations
+          SET status = 'running', owner_token = ?, fence_token = fence_token + 1,
+              expected_head_sha = ?, candidate_sha = NULL, conflict_files = '[]',
+              error = NULL, started_at = COALESCE(started_at, ?), heartbeat_at = ?,
+              lease_expires_at = ?, finished_at = NULL
+          WHERE id = ? AND fence_token = ?
+            AND (
+              status = 'queued'
+              OR (status = 'running' AND lease_expires_at <= ?)
+            )
+        `,
+        [
+          ownerToken,
+          lane.headSha,
+          now,
+          now,
+          leaseExpiresAt,
+          operation.id,
+          operation.fenceToken,
+          now,
+        ],
+      ).changes;
+      if (changed !== 1) {
+        throw new AgentQError(
+          `Delivery operation ${operation.id} changed before it could be claimed`,
+          "DELIVERY_CLAIM_CONFLICT",
+        );
+      }
+      const claimed = this.#requireDeliveryOperation(operation.id);
+      return {
+        operation: claimed,
+        leaseToken: ownerToken,
+        fenceToken: claimed.fenceToken,
+      };
+    });
+    return claim.immediate();
+  }
+
+  heartbeatDeliveryOperation(
+    id: string,
+    leaseToken: string,
+    fenceToken: number,
+    input: { at?: string; leaseDurationMs?: number } = {},
+  ): DeliveryOperation {
+    const now = timestamp(input.at, "delivery heartbeat timestamp");
+    const leaseDurationMs = integerInput(input.leaseDurationMs ?? 30_000, "leaseDurationMs", 1);
+    const leaseExpiresAt = new Date(Date.parse(now) + leaseDurationMs).toISOString();
+    const changed = this.#database.run(
+      `
+        UPDATE delivery_operations
+        SET heartbeat_at = ?, lease_expires_at = ?
+        WHERE id = ? AND status = 'running' AND owner_token = ? AND fence_token = ?
+      `,
+      [
+        now,
+        leaseExpiresAt,
+        nonEmpty(id, "delivery operation id"),
+        nonEmpty(leaseToken, "leaseToken"),
+        integerInput(fenceToken, "fenceToken", 1),
+      ],
+    ).changes;
+    if (changed !== 1) {
+      throw new AgentQError(`Delivery operation ${id} lease was lost`, "DELIVERY_LEASE_LOST");
+    }
+    return this.#requireDeliveryOperation(id);
+  }
+
+  finishDeliveryOperation(
+    id: string,
+    input: FinishDeliveryOperationInput,
+    leaseToken: string,
+    fenceToken: number,
+  ): DeliveryOperation {
+    const status = enumValue(
+      input.status,
+      ["succeeded", "failed", "conflicted", "cancelled"] as const,
+      "delivery operation",
+      id,
+      "status",
+    );
+    const conflictFiles = stringArrayInput(input.conflictFiles ?? [], "conflictFiles");
+    if (status === "conflicted" && conflictFiles.length === 0) {
+      throw new AgentQError(
+        "A conflicted delivery operation must record conflict files",
+        "INVALID_DELIVERY_OPERATION",
+        2,
+      );
+    }
+    const finishedAt = timestamp(input.finishedAt, "delivery operation finishedAt");
+    const changed = this.#database.run(
+      `
+        UPDATE delivery_operations
+        SET status = ?, candidate_sha = ?, conflict_files = ?, error = ?,
+            heartbeat_at = ?, lease_expires_at = NULL, finished_at = ?
+        WHERE id = ? AND status = 'running' AND owner_token = ? AND fence_token = ?
+      `,
+      [
+        status,
+        input.candidateSha === undefined ? null : nonEmpty(input.candidateSha, "candidateSha"),
+        JSON.stringify(conflictFiles),
+        input.error ?? null,
+        finishedAt,
+        finishedAt,
+        nonEmpty(id, "delivery operation id"),
+        nonEmpty(leaseToken, "leaseToken"),
+        integerInput(fenceToken, "fenceToken", 1),
+      ],
+    ).changes;
+    if (changed !== 1) {
+      throw new AgentQError(`Delivery operation ${id} lease was lost`, "DELIVERY_LEASE_LOST");
+    }
+    return this.#requireDeliveryOperation(id);
+  }
+
+  completeIntegration(input: CompleteIntegrationInput): {
+    lane: IntegrationLane;
+    task: Task;
+    operation: DeliveryOperation;
+  } {
+    const complete = this.#database.transaction(() => {
+      const operation = this.#requireClaimedDeliveryOperation(
+        input.operationId,
+        input.leaseToken,
+        input.fenceToken,
+        "integrate",
+      );
+      if (!operation.artifactId || !operation.taskId) {
+        throw new AgentQError(
+          `Integration operation ${operation.id} has no artifact task`,
+          "CORRUPT_DATABASE",
+        );
+      }
+      const artifact = this.#requireTaskArtifact(operation.artifactId);
+      const task = this.#requireTask(operation.taskId);
+      const lane = this.#requireIntegrationLane(operation.laneId);
+      const expectedHeadSha = nonEmpty(input.expectedHeadSha, "expectedHeadSha");
+      const newHeadSha = nonEmpty(input.newHeadSha, "newHeadSha");
+      const expectedGeneration = integerInput(
+        input.expectedLaneGeneration,
+        "expectedLaneGeneration",
+        0,
+      );
+      if (
+        artifact.taskId !== task.id ||
+        artifact.repoKey !== lane.repoKey ||
+        artifact.targetRef !== lane.targetRef ||
+        operation.expectedHeadSha !== expectedHeadSha ||
+        lane.headSha !== expectedHeadSha ||
+        lane.generation !== expectedGeneration
+      ) {
+        throw new AgentQError(
+          `Integration lane ${lane.id} changed before ${operation.id} completed`,
+          "INTEGRATION_LANE_HEAD_CHANGED",
+        );
+      }
+      const completedAt = timestamp(input.completedAt, "integration completedAt");
+      const laneChanged = this.#database.run(
+        `
+          UPDATE integration_lanes
+          SET head_sha = ?, generation = generation + 1, updated_at = ?
+          WHERE id = ? AND head_sha = ? AND generation = ?
+        `,
+        [newHeadSha, completedAt, lane.id, expectedHeadSha, expectedGeneration],
+      ).changes;
+      if (laneChanged !== 1) {
+        throw new AgentQError(
+          `Integration lane ${lane.id} changed before its head could advance`,
+          "INTEGRATION_LANE_HEAD_CHANGED",
+        );
+      }
+      const taskChanged = this.#database.run(
+        `
+          UPDATE tasks
+          SET delivery_status = 'integrated', current_phase = 'land',
+              integration_branch = ?, integrated_sha = ?, integrated_at = ?,
+              integration_conflict_files = '[]', failure_class = NULL,
+              delivery_failure_class = NULL, failure_reason = NULL,
+              retry_disposition = NULL, updated_at = ?
+          WHERE id = ? AND result_run_id = ? AND result_commit_sha = ?
+            AND status = 'succeeded'
+        `,
+        [
+          input.integrationBranch?.trim() || lane.trainRef,
+          newHeadSha,
+          completedAt,
+          completedAt,
+          task.id,
+          artifact.runId,
+          artifact.resultSha,
+        ],
+      ).changes;
+      if (taskChanged !== 1) {
+        throw new AgentQError(
+          `Task ${task.id} result changed before integration completed`,
+          "TASK_STATE_CHANGED",
+        );
+      }
+      const operationChanged = this.#database.run(
+        `
+          UPDATE delivery_operations
+          SET status = 'succeeded', candidate_sha = ?, conflict_files = '[]',
+              error = NULL, heartbeat_at = ?, lease_expires_at = NULL, finished_at = ?
+          WHERE id = ? AND status = 'running' AND owner_token = ? AND fence_token = ?
+        `,
+        [newHeadSha, completedAt, completedAt, operation.id, input.leaseToken, input.fenceToken],
+      ).changes;
+      if (operationChanged !== 1) {
+        throw new AgentQError(
+          `Delivery operation ${operation.id} lease was lost`,
+          "DELIVERY_LEASE_LOST",
+        );
+      }
+      return {
+        lane: this.#requireIntegrationLane(lane.id),
+        task: this.#requireTask(task.id),
+        operation: this.#requireDeliveryOperation(operation.id),
+      };
+    });
+    return complete.immediate();
+  }
+
+  recordIntegrationFailure(input: RecordIntegrationFailureInput): {
+    task: Task;
+    operation: DeliveryOperation;
+  } {
+    const record = this.#database.transaction(() => {
+      const operation = this.#requireClaimedDeliveryOperation(
+        input.operationId,
+        input.leaseToken,
+        input.fenceToken,
+        "integrate",
+      );
+      if (!operation.taskId || !operation.artifactId) {
+        throw new AgentQError(
+          `Integration operation ${operation.id} has no artifact task`,
+          "CORRUPT_DATABASE",
+        );
+      }
+      const artifact = this.#requireTaskArtifact(operation.artifactId);
+      const task = this.#requireTask(operation.taskId);
+      const lane = this.#requireIntegrationLane(operation.laneId);
+      if (artifact.taskId !== task.id) {
+        throw new AgentQError(
+          `Integration operation ${operation.id} artifact no longer matches its task`,
+          "DELIVERY_ARTIFACT_LANE_MISMATCH",
+        );
+      }
+      const status = enumValue(
+        input.status,
+        ["failed", "conflicted"] as const,
+        "delivery operation",
+        operation.id,
+        "status",
+      );
+      const failureClass = enumValue(
+        input.failureClass,
+        [
+          "integration_conflict",
+          "integration_contention",
+          "policy_violation",
+          "test_regression",
+        ] as const,
+        "delivery operation",
+        operation.id,
+        "failureClass",
+      );
+      const expectedStatus = failureClass === "integration_conflict" ? "conflicted" : "failed";
+      if (status !== expectedStatus) {
+        throw new AgentQError(
+          `${failureClass} must finish its delivery operation as ${expectedStatus}`,
+          "INVALID_DELIVERY_OPERATION",
+          2,
+        );
+      }
+      const suppliedConflictFiles = stringArrayInput(input.conflictFiles ?? [], "conflictFiles");
+      if (failureClass === "integration_conflict" && suppliedConflictFiles.length === 0) {
+        throw new AgentQError(
+          "A conflicted integration must record conflict files",
+          "INVALID_DELIVERY_OPERATION",
+          2,
+        );
+      }
+      const conflictFiles = failureClass === "integration_conflict" ? suppliedConflictFiles : [];
+      const error = nonEmpty(input.error, "error");
+      const finishedAt = timestamp(input.finishedAt, "integration failure finishedAt");
+      const operationChanged = this.#database.run(
+        `
+          UPDATE delivery_operations
+          SET status = ?, conflict_files = ?, error = ?, heartbeat_at = ?,
+              lease_expires_at = NULL, finished_at = ?
+          WHERE id = ? AND status = 'running' AND owner_token = ? AND fence_token = ?
+        `,
+        [
+          status,
+          JSON.stringify(conflictFiles),
+          error,
+          finishedAt,
+          finishedAt,
+          operation.id,
+          input.leaseToken,
+          input.fenceToken,
+        ],
+      ).changes;
+      if (operationChanged !== 1) {
+        throw new AgentQError(
+          `Delivery operation ${operation.id} lease was lost`,
+          "DELIVERY_LEASE_LOST",
+        );
+      }
+      let taskChanged: number;
+      if (failureClass === "test_regression") {
+        taskChanged = this.#database.run(
+          `
+            UPDATE tasks
+            SET status = 'queued', attempt_count = CASE
+                  WHEN attempt_count > 0 THEN attempt_count - 1
+                  ELSE 0
+                END,
+                current_phase = 'queued', delivery_status = 'implemented',
+                current_run_id = NULL, resume_run_id = NULL, completed_at = NULL,
+                created_base_sha = ?, result_run_id = NULL, result_commit_sha = NULL,
+                integration_conflict_files = '[]', failure_class = NULL,
+                delivery_failure_class = 'test_regression', failure_reason = ?,
+                retry_disposition = 'return_to_implementation', updated_at = ?
+            WHERE id = ? AND status = 'succeeded'
+          `,
+          [lane.headSha, error, finishedAt, task.id],
+        ).changes;
+      } else if (failureClass === "policy_violation") {
+        taskChanged = this.#database.run(
+          `
+            UPDATE tasks
+            SET status = 'failed', current_phase = 'complete',
+                delivery_status = 'implemented', resume_run_id = NULL,
+                completed_at = ?, integration_conflict_files = '[]',
+                failure_class = NULL, delivery_failure_class = 'policy_violation',
+                failure_reason = ?, retry_disposition = 'stop', updated_at = ?
+            WHERE id = ? AND status = 'succeeded'
+          `,
+          [finishedAt, error, finishedAt, task.id],
+        ).changes;
+      } else {
+        taskChanged = this.#database.run(
+          `
+            UPDATE tasks
+            SET delivery_status = 'ready_to_integrate', current_phase = 'integrate',
+                integration_conflict_files = ?, failure_class = NULL,
+                delivery_failure_class = ?, failure_reason = ?,
+                retry_disposition = ?, updated_at = ?
+            WHERE id = ? AND status = 'succeeded'
+          `,
+          [
+            JSON.stringify(conflictFiles),
+            failureClass,
+            error,
+            failureClass === "integration_conflict" ? "manual_resolution" : "retry",
+            finishedAt,
+            task.id,
+          ],
+        ).changes;
+      }
+      if (taskChanged !== 1) {
+        throw new AgentQError(
+          `Task ${task.id} changed before integration failure was stored`,
+          "TASK_STATE_CHANGED",
+        );
+      }
+      return {
+        task: this.#requireTask(task.id),
+        operation: this.#requireDeliveryOperation(operation.id),
+      };
+    });
+    return record.immediate();
+  }
+
+  completeLanding(input: CompleteLandingInput): {
+    lane: IntegrationLane;
+    tasks: Task[];
+    operation?: DeliveryOperation;
+  } {
+    const complete = this.#database.transaction(() => {
+      const lane = this.#requireIntegrationLane(nonEmpty(input.laneId, "laneId"));
+      const expectedHeadSha = nonEmpty(input.expectedHeadSha, "expectedHeadSha");
+      const landedSha = nonEmpty(input.landedSha, "landedSha");
+      const expectedGeneration = integerInput(
+        input.expectedLaneGeneration,
+        "expectedLaneGeneration",
+        0,
+      );
+      if (
+        lane.headSha !== expectedHeadSha ||
+        landedSha !== expectedHeadSha ||
+        lane.generation !== expectedGeneration
+      ) {
+        throw new AgentQError(
+          `Landing cursor for lane ${lane.id} does not match its train head`,
+          "INTEGRATION_LANE_HEAD_CHANGED",
+        );
+      }
+      let operation: DeliveryOperation | undefined;
+      if (input.operationId !== undefined) {
+        if (input.leaseToken === undefined || input.fenceToken === undefined) {
+          throw new AgentQError(
+            "Completing a claimed landing operation requires its lease and fence token",
+            "INVALID_DELIVERY_OPERATION",
+            2,
+          );
+        }
+        operation = this.#requireClaimedDeliveryOperation(
+          input.operationId,
+          input.leaseToken,
+          input.fenceToken,
+          "land",
+        );
+        if (operation.laneId !== lane.id || operation.expectedHeadSha !== expectedHeadSha) {
+          throw new AgentQError(
+            `Landing operation ${operation.id} does not match lane ${lane.id}`,
+            "INTEGRATION_LANE_HEAD_CHANGED",
+          );
+        }
+      }
+      const artifactIds = [
+        ...new Set(
+          stringArrayInput(input.artifactIds, "artifactIds").map((id) =>
+            nonEmpty(id, "artifactId"),
+          ),
+        ),
+      ];
+      const taskIds: string[] = [];
+      for (const artifactId of artifactIds) {
+        const artifact = this.#requireTaskArtifact(artifactId);
+        const task = this.#requireTask(artifact.taskId);
+        if (
+          artifact.repoKey !== lane.repoKey ||
+          artifact.targetRef !== lane.targetRef ||
+          !task.integratedSha
+        ) {
+          throw new AgentQError(
+            `Artifact ${artifact.id} is not integrated into lane ${lane.id}`,
+            "DELIVERY_ARTIFACT_LANE_MISMATCH",
+          );
+        }
+        taskIds.push(task.id);
+      }
+
+      const completedAt = timestamp(input.completedAt, "landing completedAt");
+      const laneChanged = this.#database.run(
+        `
+          UPDATE integration_lanes
+          SET target_base_sha = ?, generation = generation + 1, updated_at = ?
+          WHERE id = ? AND head_sha = ? AND generation = ?
+        `,
+        [landedSha, completedAt, lane.id, expectedHeadSha, expectedGeneration],
+      ).changes;
+      if (laneChanged !== 1) {
+        throw new AgentQError(
+          `Landing cursor for lane ${lane.id} changed concurrently`,
+          "INTEGRATION_LANE_HEAD_CHANGED",
+        );
+      }
+      for (const taskId of taskIds) {
+        this.#database.run(
+          `
+            UPDATE tasks
+            SET delivery_status = 'landed', current_phase = 'complete',
+                landed_sha = integrated_sha, landed_at = ?,
+                integration_conflict_files = '[]', failure_class = NULL,
+                delivery_failure_class = NULL, failure_reason = NULL,
+                retry_disposition = NULL, updated_at = ?
+            WHERE id = ? AND delivery_status = 'integrated'
+          `,
+          [completedAt, completedAt, taskId],
+        );
+      }
+      if (operation) {
+        const operationChanged = this.#database.run(
+          `
+            UPDATE delivery_operations
+            SET status = 'succeeded', candidate_sha = ?, conflict_files = '[]',
+                error = NULL, heartbeat_at = ?, lease_expires_at = NULL, finished_at = ?
+            WHERE id = ? AND status = 'running' AND owner_token = ? AND fence_token = ?
+          `,
+          [
+            landedSha,
+            completedAt,
+            completedAt,
+            operation.id,
+            input.leaseToken as string,
+            input.fenceToken as number,
+          ],
+        ).changes;
+        if (operationChanged !== 1) {
+          throw new AgentQError(
+            `Delivery operation ${operation.id} lease was lost`,
+            "DELIVERY_LEASE_LOST",
+          );
+        }
+      }
+      return {
+        lane: this.#requireIntegrationLane(lane.id),
+        tasks: taskIds.map((taskId) => this.#requireTask(taskId)),
+        ...(operation === undefined
+          ? {}
+          : { operation: this.#requireDeliveryOperation(operation.id) }),
+      };
+    });
+    return complete.immediate();
+  }
+
+  reconcileIntegrationLaneHead(
+    id: string,
+    input: AdvanceIntegrationLaneInput & { expectedLaneGeneration: number },
+  ): IntegrationLane {
+    const reconcile = this.#database.transaction(() => {
+      const lane = this.#requireIntegrationLane(id);
+      const expectedGeneration = integerInput(
+        input.expectedLaneGeneration,
+        "expectedLaneGeneration",
+        0,
+      );
+      const expectedHeadSha = nonEmpty(input.expectedHeadSha, "expectedHeadSha");
+      const newHeadSha = nonEmpty(input.newHeadSha, "newHeadSha");
+      if (
+        lane.generation !== expectedGeneration ||
+        (lane.headSha !== expectedHeadSha && lane.headSha !== newHeadSha)
+      ) {
+        throw new AgentQError(
+          `Integration lane ${lane.id} changed before reconciliation`,
+          "INTEGRATION_LANE_HEAD_CHANGED",
+        );
+      }
+      if (lane.headSha === newHeadSha) return lane;
+      const changed = this.#database.run(
+        `
+          UPDATE integration_lanes
+          SET head_sha = ?, generation = generation + 1, updated_at = ?
+          WHERE id = ? AND head_sha = ? AND generation = ?
+        `,
+        [
+          newHeadSha,
+          timestamp(input.updatedAt, "lane reconciliation updatedAt"),
+          lane.id,
+          expectedHeadSha,
+          expectedGeneration,
+        ],
+      ).changes;
+      if (changed !== 1) {
+        throw new AgentQError(
+          `Integration lane ${lane.id} changed before reconciliation`,
+          "INTEGRATION_LANE_HEAD_CHANGED",
+        );
+      }
+      return this.#requireIntegrationLane(lane.id);
+    });
+    return reconcile.immediate();
+  }
+
+  requestTaskApproval(input: RequestTaskApprovalInput): TaskApproval {
+    const request = this.#database.transaction(() => {
+      const task = this.#requireTask(nonEmpty(input.taskId, "taskId"));
+      const checkpoint = nonEmpty(input.checkpoint, "checkpoint");
+      let runId: string | null = null;
+      if (input.runId !== undefined) {
+        const run = this.#requireRun(nonEmpty(input.runId, "runId"));
+        if (run.taskId !== task.id) {
+          throw new AgentQError(
+            `Run ${run.id} does not belong to task ${task.id}`,
+            "APPROVAL_RUN_MISMATCH",
+          );
+        }
+        runId = run.id;
+      }
+      const existing = this.getTaskApproval(task.id, checkpoint);
+      if (existing && existing.status !== "pending") return existing;
+      const requestedAt = timestamp(input.requestedAt, "approval requestedAt");
+      this.#database.run(
+        `
+          INSERT INTO task_approvals(
+            task_id, checkpoint, status, run_id, requested_at,
+            decided_at, actor, note
+          ) VALUES (?, ?, 'pending', ?, ?, NULL, NULL, NULL)
+          ON CONFLICT(task_id, checkpoint) DO UPDATE SET
+            run_id = excluded.run_id,
+            requested_at = excluded.requested_at,
+            decided_at = NULL,
+            actor = NULL,
+            note = NULL
+          WHERE task_approvals.status = 'pending'
+        `,
+        [task.id, checkpoint, runId, requestedAt],
+      );
+      if (task.status === "queued") {
+        this.#database.run(
+          `
+            UPDATE tasks
+            SET current_phase = 'approval', blocked_reason = ?,
+                failure_class = 'blocked_dependency', failure_reason = ?,
+                retry_disposition = 'wait', updated_at = ?
+            WHERE id = ? AND status = 'queued'
+          `,
+          [
+            `Waiting for approval: ${checkpoint}`,
+            `Approval checkpoint ${checkpoint} is pending`,
+            requestedAt,
+            task.id,
+          ],
+        );
+      }
+      return this.#requireTaskApproval(task.id, checkpoint);
+    });
+    return request.immediate();
+  }
+
+  getTaskApproval(taskId: string, checkpoint: string): TaskApproval | undefined {
+    const row = selectOne<TaskApprovalRow, [string, string]>(
+      this.#database,
+      `
+        SELECT ${TASK_APPROVAL_COLUMNS}
+        FROM task_approvals approval
+        WHERE approval.task_id = ? AND approval.checkpoint = ?
+      `,
+      [taskId, checkpoint],
+    );
+    return row ? mapTaskApproval(row) : undefined;
+  }
+
+  listTaskApprovals(taskId: string): TaskApproval[] {
+    this.#requireTask(taskId);
+    return selectAll<TaskApprovalRow, [string]>(
+      this.#database,
+      `
+        SELECT ${TASK_APPROVAL_COLUMNS}
+        FROM task_approvals approval
+        WHERE approval.task_id = ?
+        ORDER BY approval.requested_at, approval.checkpoint
+      `,
+      [taskId],
+    ).map(mapTaskApproval);
+  }
+
+  pauseRunForApproval(
+    id: string,
+    input: PauseRunForApprovalInput,
+    leaseToken?: string,
+  ): { run: Run; task: Task; approval: TaskApproval } {
+    const pause = this.#database.transaction(() => {
+      const run = this.#requireRun(id);
+      const task = this.#requireTask(run.taskId);
+      if (!ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number])) {
+        throw new AgentQError(`Run ${id} is already terminal`, "RUN_NOT_ACTIVE");
+      }
+      this.#assertRunLease(id, leaseToken);
+      if (!run.worktreePath || !run.branchName || !run.baseSha) {
+        throw new AgentQError(
+          `Run ${id} cannot resume because its durable worktree metadata is incomplete`,
+          "RUN_NOT_RESUMABLE",
+        );
+      }
+      const checkpoint = nonEmpty(input.checkpoint, "checkpoint");
+      const existing = this.getTaskApproval(task.id, checkpoint);
+      if (existing?.status === "approved") {
+        throw new AgentQError(
+          `Approval checkpoint ${checkpoint} is already approved`,
+          "APPROVAL_ALREADY_DECIDED",
+        );
+      }
+      if (existing?.status === "rejected") {
+        throw new AgentQError(
+          `Approval checkpoint ${checkpoint} was rejected`,
+          "APPROVAL_REJECTED",
+        );
+      }
+
+      const requestedAt = timestamp(input.requestedAt, "approval requestedAt");
+      const planOutput =
+        input.planOutput === undefined ? run.planOutput : nonEmpty(input.planOutput, "planOutput");
+      if (!planOutput) {
+        throw new AgentQError(
+          `Run ${id} must persist a planner handoff before approval`,
+          "RUN_NOT_RESUMABLE",
+        );
+      }
+      if (planOutput.length > MAX_PLAN_OUTPUT_LENGTH) {
+        throw new AgentQError(
+          `planOutput cannot exceed ${MAX_PLAN_OUTPUT_LENGTH} characters`,
+          "INVALID_INPUT",
+          2,
+        );
+      }
+      const planSessionId = input.planSessionId?.trim() || run.planSessionId || null;
+
+      this.#database.run(
+        `
+          INSERT INTO task_approvals(
+            task_id, checkpoint, status, run_id, requested_at,
+            decided_at, actor, note
+          ) VALUES (?, ?, 'pending', ?, ?, NULL, NULL, NULL)
+          ON CONFLICT(task_id, checkpoint) DO UPDATE SET
+            status = 'pending',
+            run_id = excluded.run_id,
+            requested_at = excluded.requested_at,
+            decided_at = NULL,
+            actor = NULL,
+            note = NULL
+          WHERE task_approvals.status = 'pending'
+        `,
+        [task.id, checkpoint, run.id, requestedAt],
+      );
+
+      const bindings: Binding[] = [
+        planOutput,
+        planSessionId,
+        requestedAt,
+        requestedAt,
+        `Waiting for approval: ${checkpoint}`,
+        id,
+      ];
+      if (leaseToken !== undefined) bindings.push(leaseToken);
+      const leaseCondition = leaseToken === undefined ? "" : " AND owner_token = ?";
+      const changed = this.#database.run(
+        `
+          UPDATE runs
+          SET status = 'interrupted', phase = 'implement', plan_output = ?,
+              plan_session_id = COALESCE(?, plan_session_id),
+              heartbeat_at = ?, finished_at = ?, error = ?,
+              failure_class = 'blocked_dependency', retry_disposition = 'wait'
+          WHERE id = ? AND status IN ('starting', 'running', 'cancelling')
+            ${leaseCondition}
+        `,
+        bindings,
+      ).changes;
+      if (changed !== 1) {
+        throw new AgentQError(`Run ${id} lease was lost`, "RUN_LEASE_LOST");
+      }
+
+      const taskChanged = this.#database.run(
+        `
+          UPDATE tasks
+          SET status = 'queued', attempt_count = CASE
+                WHEN attempt_count > 0 THEN attempt_count - 1
+                ELSE 0
+              END,
+              current_run_id = NULL, resume_run_id = ?, current_phase = 'approval',
+              blocked_reason = ?, failure_class = 'blocked_dependency',
+              failure_reason = ?, retry_disposition = 'wait',
+              completed_at = NULL, updated_at = ?
+          WHERE id = ? AND current_run_id = ?
+        `,
+        [
+          run.id,
+          `Waiting for approval: ${checkpoint}`,
+          `Approval checkpoint ${checkpoint} is pending`,
+          requestedAt,
+          task.id,
+          run.id,
+        ],
+      ).changes;
+      if (taskChanged !== 1) {
+        throw new AgentQError(
+          `Task ${task.id} changed before approval could be requested`,
+          "TASK_STATE_CHANGED",
+        );
+      }
+      this.appendEvent({
+        taskId: task.id,
+        runId: run.id,
+        kind: "task.approval_requested",
+        payload: { checkpoint },
+        createdAt: requestedAt,
+      });
+      return {
+        run: this.#requireRun(run.id),
+        task: this.#requireTask(task.id),
+        approval: this.#requireTaskApproval(task.id, checkpoint),
+      };
+    });
+    return pause.immediate();
+  }
+
+  approveTaskCheckpoint(
+    taskId: string,
+    checkpoint: string,
+    input: DecideTaskApprovalInput = {},
+  ): TaskApproval {
+    return this.#decideTaskCheckpoint(taskId, checkpoint, "approved", input);
+  }
+
+  rejectTaskCheckpoint(
+    taskId: string,
+    checkpoint: string,
+    input: DecideTaskApprovalInput = {},
+  ): TaskApproval {
+    return this.#decideTaskCheckpoint(taskId, checkpoint, "rejected", input);
+  }
+
   counts(): StoreCounts {
     const count = (table: "queues" | "tasks" | "runs" | "task_events") => {
       const row = selectOne<CountRow, []>(
@@ -3256,6 +4897,245 @@ export class AgentQStore {
     const run = this.getRun(id);
     if (!run) throw new AgentQError(`Run ${id} does not exist`, "RUN_NOT_FOUND");
     return run;
+  }
+
+  #requireTaskArtifact(id: string): TaskArtifact {
+    const artifact = this.getTaskArtifact(id);
+    if (!artifact) {
+      throw new AgentQError(`Task artifact ${id} does not exist`, "TASK_ARTIFACT_NOT_FOUND");
+    }
+    return artifact;
+  }
+
+  #requireIntegrationLane(id: string): IntegrationLane {
+    const lane = this.getIntegrationLane(id);
+    if (!lane) {
+      throw new AgentQError(`Integration lane ${id} does not exist`, "INTEGRATION_LANE_NOT_FOUND");
+    }
+    return lane;
+  }
+
+  #requireDeliveryOperation(id: string): DeliveryOperation {
+    const operation = this.getDeliveryOperation(id);
+    if (!operation) {
+      throw new AgentQError(
+        `Delivery operation ${id} does not exist`,
+        "DELIVERY_OPERATION_NOT_FOUND",
+      );
+    }
+    return operation;
+  }
+
+  #requireClaimedDeliveryOperation(
+    id: string,
+    leaseToken: string,
+    fenceToken: number,
+    kind: DeliveryOperation["kind"],
+  ): DeliveryOperation {
+    const operation = this.#requireDeliveryOperation(nonEmpty(id, "operationId"));
+    if (
+      operation.kind !== kind ||
+      operation.status !== "running" ||
+      operation.ownerToken !== nonEmpty(leaseToken, "leaseToken") ||
+      operation.fenceToken !== integerInput(fenceToken, "fenceToken", 1)
+    ) {
+      throw new AgentQError(
+        `Delivery operation ${operation.id} lease was lost`,
+        "DELIVERY_LEASE_LOST",
+      );
+    }
+    return operation;
+  }
+
+  #requireTaskApproval(taskId: string, checkpoint: string): TaskApproval {
+    const approval = this.getTaskApproval(taskId, checkpoint);
+    if (!approval) {
+      throw new AgentQError(
+        `Approval checkpoint ${checkpoint} does not exist for task ${taskId}`,
+        "APPROVAL_NOT_FOUND",
+      );
+    }
+    return approval;
+  }
+
+  #decideTaskCheckpoint(
+    taskId: string,
+    checkpoint: string,
+    decision: Extract<TaskApproval["status"], "approved" | "rejected">,
+    input: DecideTaskApprovalInput,
+  ): TaskApproval {
+    const decide = this.#database.transaction(() => {
+      const task = this.#requireTask(nonEmpty(taskId, "taskId"));
+      const checkedCheckpoint = nonEmpty(checkpoint, "checkpoint");
+      const approval = this.#requireTaskApproval(task.id, checkedCheckpoint);
+      if (approval.status === decision) return approval;
+      if (approval.status !== "pending") {
+        throw new AgentQError(
+          `Approval checkpoint ${checkedCheckpoint} is already ${approval.status}`,
+          "APPROVAL_ALREADY_DECIDED",
+        );
+      }
+      const decidedAt = timestamp(input.decidedAt, "approval decidedAt");
+      const actor = input.actor === undefined ? null : nonEmpty(input.actor, "actor");
+      const note = input.note?.trim() || null;
+      const changed = this.#database.run(
+        `
+          UPDATE task_approvals
+          SET status = ?, decided_at = ?, actor = ?, note = ?
+          WHERE task_id = ? AND checkpoint = ? AND status = 'pending'
+        `,
+        [decision, decidedAt, actor, note, task.id, checkedCheckpoint],
+      ).changes;
+      if (changed !== 1) {
+        throw new AgentQError(
+          `Approval checkpoint ${checkedCheckpoint} changed before the decision was stored`,
+          "APPROVAL_DECISION_CONFLICT",
+        );
+      }
+
+      const pendingApprovals =
+        decision === "approved"
+          ? integerValue(
+              selectOne<CountRow, [string]>(
+                this.#database,
+                `
+                  SELECT COUNT(*) AS count
+                  FROM task_approvals
+                  WHERE task_id = ? AND status = 'pending'
+                `,
+                [task.id],
+              )?.count,
+              "task approvals",
+              task.id,
+              "pending count",
+            )
+          : 0;
+      const taskChanged =
+        decision === "approved"
+          ? this.#database.run(
+              `
+                UPDATE tasks
+                SET current_phase = ?,
+                    blocked_reason = ?,
+                    failure_class = ?,
+                    failure_reason = ?,
+                    retry_disposition = ?,
+                    updated_at = ?
+                WHERE id = ? AND status = 'queued'
+                  AND current_phase = 'approval'
+              `,
+              [
+                pendingApprovals > 0 ? "approval" : task.resumeRunId ? "implement" : "queued",
+                pendingApprovals > 0
+                  ? `Waiting for ${pendingApprovals} approval checkpoint${pendingApprovals === 1 ? "" : "s"}`
+                  : null,
+                pendingApprovals > 0 ? "blocked_dependency" : null,
+                pendingApprovals > 0 ? "One or more approval checkpoints are pending" : null,
+                pendingApprovals > 0 ? "wait" : null,
+                decidedAt,
+                task.id,
+              ],
+            ).changes
+          : this.#database.run(
+              `
+                UPDATE tasks
+                SET status = 'failed', current_phase = 'complete',
+                    blocked_reason = NULL, failure_class = 'policy_violation',
+                    failure_reason = ?, retry_disposition = 'stop',
+                    resume_run_id = NULL, completed_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'queued' AND current_phase = 'approval'
+              `,
+              [
+                note
+                  ? `Approval checkpoint ${checkedCheckpoint} rejected: ${note}`
+                  : `Approval checkpoint ${checkedCheckpoint} rejected`,
+                decidedAt,
+                decidedAt,
+                task.id,
+              ],
+            ).changes;
+      if (taskChanged !== 1) {
+        throw new AgentQError(
+          `Task ${task.id} is no longer waiting at ${checkedCheckpoint}`,
+          "TASK_STATE_CHANGED",
+        );
+      }
+      this.appendEvent({
+        taskId: task.id,
+        kind: `task.approval_${decision}`,
+        payload: {
+          checkpoint: checkedCheckpoint,
+          ...(actor === null ? {} : { actor }),
+          ...(note === null ? {} : { note }),
+        },
+        createdAt: decidedAt,
+      });
+      return this.#requireTaskApproval(task.id, checkedCheckpoint);
+    });
+    return decide.immediate();
+  }
+
+  #fileConcurrencyAllows(task: Task, queue: Queue): boolean {
+    const activeScopes = selectAll<ActiveFileScopeRow, [string, string]>(
+      this.#database,
+      `
+        SELECT active_task.id AS task_id,
+               active_task.expected_paths,
+               active_task.allowed_paths,
+               active_queue.allowed_paths AS queue_allowed_paths,
+               active_queue.file_concurrency
+        FROM runs active_run
+        JOIN tasks active_task ON active_task.id = active_run.task_id
+        JOIN queues active_queue ON active_queue.id = active_task.queue_id
+        WHERE active_queue.repo_key = ?
+          AND active_task.id <> ?
+          AND active_run.status IN ('starting', 'running', 'cancelling')
+      `,
+      [queue.repoKey, task.id],
+    );
+    const taskScope =
+      task.expectedPaths.length > 0
+        ? task.expectedPaths
+        : task.allowedPaths.length > 0
+          ? task.allowedPaths
+          : queue.allowedPaths;
+
+    return !activeScopes.some((row) => {
+      const activeTaskId = stringValue(row.task_id, "active file scope", "<unknown>", "task_id");
+      const activeMode = enumValue(
+        row.file_concurrency,
+        FILE_CONCURRENCY_MODES,
+        "active file scope",
+        activeTaskId,
+        "file_concurrency",
+      );
+      if (queue.fileConcurrency !== "enforced" && activeMode !== "enforced") return false;
+      const expectedPaths = jsonStringArray(
+        row.expected_paths,
+        "active file scope",
+        activeTaskId,
+        "expected_paths",
+      );
+      const allowedPaths = jsonStringArray(
+        row.allowed_paths,
+        "active file scope",
+        activeTaskId,
+        "allowed_paths",
+      );
+      const queueAllowedPaths = jsonStringArray(
+        row.queue_allowed_paths,
+        "active file scope",
+        activeTaskId,
+        "queue_allowed_paths",
+      );
+      const activeScope =
+        expectedPaths.length > 0
+          ? expectedPaths
+          : allowedPaths.length > 0
+            ? allowedPaths
+            : queueAllowedPaths;
+      return scopePatternSetsMayOverlap(taskScope, activeScope);
+    });
   }
 
   #assertRunLease(id: string, leaseToken?: string): void {

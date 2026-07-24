@@ -319,7 +319,7 @@ const migrations: readonly Migration[] = [
       );
       database.run("ALTER TABLE tasks ADD COLUMN blocked_reason TEXT");
       database.run(
-        "ALTER TABLE tasks ADD COLUMN failure_class TEXT CHECK (failure_class IS NULL OR failure_class IN ('transient_infrastructure', 'stale_base', 'test_regression', 'blocked_dependency', 'file_conflict', 'policy_violation', 'integration_conflict', 'agent_failure', 'cancelled', 'unknown'))",
+        "ALTER TABLE tasks ADD COLUMN failure_class TEXT CHECK (failure_class IS NULL OR failure_class IN ('transient_infrastructure', 'stale_base', 'test_regression', 'blocked_dependency', 'file_conflict', 'policy_violation', 'integration_conflict', 'integration_contention', 'agent_failure', 'cancelled', 'unknown'))",
       );
       database.run("ALTER TABLE tasks ADD COLUMN failure_reason TEXT");
       database.run(
@@ -363,7 +363,7 @@ const migrations: readonly Migration[] = [
         "ALTER TABLE runs ADD COLUMN verification_results TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(verification_results))",
       );
       database.run(
-        "ALTER TABLE runs ADD COLUMN failure_class TEXT CHECK (failure_class IS NULL OR failure_class IN ('transient_infrastructure', 'stale_base', 'test_regression', 'blocked_dependency', 'file_conflict', 'policy_violation', 'integration_conflict', 'agent_failure', 'cancelled', 'unknown'))",
+        "ALTER TABLE runs ADD COLUMN failure_class TEXT CHECK (failure_class IS NULL OR failure_class IN ('transient_infrastructure', 'stale_base', 'test_regression', 'blocked_dependency', 'file_conflict', 'policy_violation', 'integration_conflict', 'integration_contention', 'agent_failure', 'cancelled', 'unknown'))",
       );
       database.run(
         "ALTER TABLE runs ADD COLUMN retry_disposition TEXT CHECK (retry_disposition IS NULL OR retry_disposition IN ('retry', 'rebase_and_retry', 'return_to_implementation', 'wait', 'stop', 'manual_resolution'))",
@@ -407,6 +407,141 @@ const migrations: readonly Migration[] = [
         SET delivery_status = 'verified',
             current_phase = 'complete'
         WHERE status = 'succeeded'
+      `);
+    },
+  },
+  {
+    version: 8,
+    name: "durable_delivery_and_approvals",
+    up(database) {
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN integration_conflict_files TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(integration_conflict_files))",
+      );
+      // Older v7 databases cannot widen the anonymous failure_class CHECK.
+      // Delivery failures therefore use an additive projection column while
+      // task mapping exposes one unified typed failure class.
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN delivery_failure_class TEXT CHECK (delivery_failure_class IS NULL OR delivery_failure_class IN ('integration_conflict', 'integration_contention', 'policy_violation', 'test_regression'))",
+      );
+      database.run(
+        "ALTER TABLE runs ADD COLUMN delivery_failure_class TEXT CHECK (delivery_failure_class IS NULL OR delivery_failure_class IN ('integration_conflict', 'integration_contention', 'policy_violation', 'test_regression'))",
+      );
+
+      database.run(`
+        CREATE TABLE task_artifacts (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+          repo_key TEXT NOT NULL,
+          target_ref TEXT NOT NULL,
+          base_sha TEXT NOT NULL,
+          result_sha TEXT NOT NULL,
+          result_ref TEXT NOT NULL,
+          changed_files TEXT NOT NULL CHECK (json_valid(changed_files)),
+          verification_results TEXT NOT NULL CHECK (json_valid(verification_results)),
+          created_at TEXT NOT NULL,
+          UNIQUE(run_id),
+          UNIQUE(result_ref)
+        )
+      `);
+      database.run(`
+        CREATE INDEX task_artifacts_by_task
+        ON task_artifacts(task_id, created_at, id)
+      `);
+      // Result evidence may only be replaced by deleting its owning task/run.
+      // This prevents a mutable row from silently changing what was verified.
+      database.run(`
+        CREATE TRIGGER task_artifacts_are_immutable
+        BEFORE UPDATE ON task_artifacts
+        BEGIN
+          SELECT RAISE(ABORT, 'task artifacts are immutable');
+        END
+      `);
+
+      database.run(`
+        CREATE TABLE integration_lanes (
+          id TEXT PRIMARY KEY,
+          repo_key TEXT NOT NULL,
+          repo_path TEXT NOT NULL,
+          target_ref TEXT NOT NULL,
+          train_ref TEXT NOT NULL,
+          target_base_sha TEXT NOT NULL,
+          head_sha TEXT NOT NULL,
+          generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(repo_key, target_ref),
+          UNIQUE(repo_key, train_ref)
+        )
+      `);
+
+      database.run(`
+        CREATE TABLE delivery_operations (
+          id TEXT PRIMARY KEY,
+          lane_id TEXT NOT NULL REFERENCES integration_lanes(id) ON DELETE RESTRICT,
+          task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+          artifact_id TEXT REFERENCES task_artifacts(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL CHECK (kind IN ('integrate', 'land')),
+          status TEXT NOT NULL CHECK (
+            status IN ('queued', 'running', 'succeeded', 'failed', 'conflicted', 'cancelled')
+          ),
+          owner_token TEXT,
+          fence_token INTEGER NOT NULL DEFAULT 0 CHECK (fence_token >= 0),
+          expected_head_sha TEXT,
+          candidate_sha TEXT,
+          conflict_files TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(conflict_files)),
+          error TEXT,
+          created_at TEXT NOT NULL,
+          started_at TEXT,
+          heartbeat_at TEXT,
+          lease_expires_at TEXT,
+          finished_at TEXT,
+          CHECK (
+            kind = 'land'
+            OR (task_id IS NOT NULL AND artifact_id IS NOT NULL)
+          )
+        )
+      `);
+      database.run(`
+        CREATE INDEX delivery_operations_claim_order
+        ON delivery_operations(status, lease_expires_at, created_at, id)
+      `);
+      database.run(`
+        CREATE INDEX delivery_operations_lane_history
+        ON delivery_operations(lane_id, created_at, id)
+      `);
+      database.run(`
+        CREATE UNIQUE INDEX delivery_operations_one_running_per_lane
+        ON delivery_operations(lane_id)
+        WHERE status = 'running'
+      `);
+      database.run(`
+        CREATE UNIQUE INDEX delivery_operations_one_open_artifact
+        ON delivery_operations(artifact_id)
+        WHERE kind = 'integrate' AND status IN ('queued', 'running')
+      `);
+      database.run(`
+        CREATE UNIQUE INDEX delivery_operations_one_open_land
+        ON delivery_operations(lane_id)
+        WHERE kind = 'land' AND status IN ('queued', 'running')
+      `);
+
+      database.run(`
+        CREATE TABLE task_approvals (
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          checkpoint TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected')),
+          run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+          requested_at TEXT NOT NULL,
+          decided_at TEXT,
+          actor TEXT,
+          note TEXT,
+          PRIMARY KEY (task_id, checkpoint)
+        )
+      `);
+      database.run(`
+        CREATE INDEX task_approvals_pending
+        ON task_approvals(task_id, status, requested_at)
       `);
     },
   },
