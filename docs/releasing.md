@@ -8,7 +8,7 @@ short-lived OIDC identity, contains no npm token, and lets npm generate package 
 After the package exists on npm, configure its trusted publisher with these exact values:
 
 - Provider: GitHub Actions
-- Organization or user: `Luke-Pitstick`
+- Organization or user: `Kiso-Labs`
 - Repository: `agentq`
 - Workflow filename: `release.yml`
 - Allowed action: `npm publish`

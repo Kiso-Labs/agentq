@@ -42,12 +42,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Luke-Pitstick/agentq.git"
+    "url": "git+https://github.com/Kiso-Labs/agentq.git"
   },
   "bugs": {
-    "url": "https://github.com/Luke-Pitstick/agentq/issues"
+    "url": "https://github.com/Kiso-Labs/agentq/issues"
   },
-  "homepage": "https://github.com/Luke-Pitstick/agentq#readme",
+  "homepage": "https://github.com/Kiso-Labs/agentq#readme",
   "author": "Luke Pitstick",
   "license": "MIT",
   "dependencies": {
