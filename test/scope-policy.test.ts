@@ -5,6 +5,8 @@ import {
   matchesScopePattern,
   normalizeScopePattern,
   resolveEffectiveScopePolicy,
+  scopePatternSetsMayOverlap,
+  scopePatternsMayOverlap,
 } from "../src/core/scope-policy.ts";
 
 describe("scope policy patterns", () => {
@@ -152,6 +154,28 @@ describe("scope pattern matching", () => {
     expect(
       matchesScopePattern("src/client/generated/nested/types.ts", "src/**/generated/*.ts"),
     ).toBe(false);
+  });
+
+  test("proves only distinct literal path regions are safe to run concurrently", () => {
+    expect(scopePatternsMayOverlap("src/services/**", "src/api/**")).toBe(false);
+    expect(scopePatternsMayOverlap("packages/web/**", "packages/worker/**")).toBe(false);
+    expect(scopePatternsMayOverlap("src/services/**", "src/services/orders/**")).toBe(true);
+    expect(scopePatternsMayOverlap("src/**/*.ts", "src/**/*.test.ts")).toBe(true);
+    expect(scopePatternsMayOverlap("*.md", "packages/app/**")).toBe(true);
+    expect(scopePatternsMayOverlap("src/api.ts", "src/api/**")).toBe(false);
+  });
+
+  test("treats undeclared or ambiguous task scopes as repository-wide", () => {
+    expect(scopePatternSetsMayOverlap([], ["src/api/**"])).toBe(true);
+    expect(scopePatternSetsMayOverlap(["src/api/**"], [])).toBe(true);
+    expect(scopePatternSetsMayOverlap(["src/api/**"], ["src/services/**"])).toBe(false);
+    expect(
+      scopePatternSetsMayOverlap(
+        ["src/api/**", "tests/api/**"],
+        ["src/services/**", "tests/services/**"],
+      ),
+    ).toBe(false);
+    expect(scopePatternSetsMayOverlap(["src/**"], ["src/services/**"])).toBe(true);
   });
 });
 

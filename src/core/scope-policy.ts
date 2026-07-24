@@ -2,6 +2,7 @@ import { AgentQError } from "./errors.ts";
 
 const WINDOWS_ABSOLUTE_PATH = /^[A-Za-z]:\//;
 const REGEXP_SPECIAL_CHARACTER = /[\\^$.*+?()[\]{}|]/;
+const GLOB_META_CHARACTER = /[*?[]/;
 const compiledPatterns = new Map<string, RegExp>();
 
 export interface ScopePolicy {
@@ -249,6 +250,43 @@ export function matchesScopePattern(path: string, pattern: string): boolean {
   return matchesNormalizedPattern(normalizedPath, normalizedPattern);
 }
 
+/**
+ * Returns false only when two path patterns are provably disjoint.
+ *
+ * Glob intersection is intentionally conservative. Shared literal prefixes,
+ * basename patterns, and differing wildcard suffixes may overlap and therefore
+ * serialize under enforced file concurrency. Distinct literal directory
+ * prefixes can safely execute in parallel.
+ */
+export function scopePatternsMayOverlap(left: string, right: string): boolean {
+  const normalizedLeft = normalizeScopePattern(left);
+  const normalizedRight = normalizeScopePattern(right);
+  if (normalizedLeft === normalizedRight) return true;
+
+  const leftPrefix = literalDirectoryPrefix(normalizedLeft);
+  const rightPrefix = literalDirectoryPrefix(normalizedRight);
+  if (!leftPrefix || !rightPrefix) return true;
+
+  return (
+    leftPrefix === rightPrefix ||
+    leftPrefix.startsWith(`${rightPrefix}/`) ||
+    rightPrefix.startsWith(`${leftPrefix}/`)
+  );
+}
+
+/**
+ * Missing declarations represent repository-wide access and must serialize.
+ */
+export function scopePatternSetsMayOverlap(
+  left: readonly string[],
+  right: readonly string[],
+): boolean {
+  if (left.length === 0 || right.length === 0) return true;
+  return left.some((leftPattern) =>
+    right.some((rightPattern) => scopePatternsMayOverlap(leftPattern, rightPattern)),
+  );
+}
+
 function matchesNormalizedPattern(path: string, pattern: string): boolean {
   let matcher = compiledPatterns.get(pattern);
   if (!matcher) {
@@ -256,6 +294,21 @@ function matchesNormalizedPattern(path: string, pattern: string): boolean {
     compiledPatterns.set(pattern, matcher);
   }
   return matcher.test(path);
+}
+
+function literalDirectoryPrefix(pattern: string): string {
+  const segments = pattern.split("/");
+  const literalSegments: string[] = [];
+  for (const segment of segments) {
+    if (segment === "**" || GLOB_META_CHARACTER.test(segment)) break;
+    literalSegments.push(segment);
+  }
+
+  if (literalSegments.length === 0) return "";
+  if (literalSegments.length === segments.length) {
+    return literalSegments.join("/");
+  }
+  return literalSegments.join("/");
 }
 
 /**
