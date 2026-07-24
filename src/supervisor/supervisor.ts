@@ -749,6 +749,10 @@ export class Supervisor {
       };
     }
 
+    this.app.store.updateTask(task.id, {
+      currentPhase: "verify",
+      deliveryStatus: "implemented",
+    });
     const changed = await snapshotChangedFiles(prepared.worktreePath, prepared.baseSha, {
       signal,
     });
@@ -870,6 +874,7 @@ export class Supervisor {
       };
     }
 
+    this.app.store.updateTask(task.id, { deliveryStatus: "verified" });
     // A dependency edge is an executable Git relationship, not just metadata.
     // Even when queue auto-commit is disabled, blockers must publish an
     // immutable commit that their dependents can use as an exact base.

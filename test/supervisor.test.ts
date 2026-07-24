@@ -642,6 +642,58 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     app.close();
   });
 
+  test("exposes implemented and verify lifecycle state while mandatory gates run", async () => {
+    const { root, repo, app } = await setup();
+    const codex = join(root, "codex");
+    const verificationStarted = join(root, "verification-started");
+    const releaseVerification = join(root, "release-verification");
+    await executable(
+      codex,
+      `
+      ${codexPlanningGate("Implement the change, then wait for the mandatory verification gate.")}
+      await Bun.write("implemented.txt", "implemented\\n");
+      console.log(JSON.stringify({type:"thread.started",thread_id:"lifecycle-state"}));
+      console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:"Implementation finished"}}));
+      console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:2,output_tokens:2}}));
+      `,
+    );
+    process.env.AGENTQ_CODEX_BIN = codex;
+    const verify = `bun -e 'await Bun.write(${JSON.stringify(
+      verificationStarted,
+    )}, "ready"); while (!(await Bun.file(${JSON.stringify(
+      releaseVerification,
+    )}).exists())) await Bun.sleep(10)'`;
+    const queue = await app.createQueue({
+      name: "lifecycle-state",
+      repoPath: repo,
+      maxAttempts: 1,
+      verifyCommands: [verify],
+      autoCommit: true,
+    });
+    const task = await app.addTask({ queue: queue.id, title: "Expose lifecycle state" });
+    const running = new Supervisor(app, { pollIntervalMs: 10 }).run({ once: true });
+
+    const deadline = Date.now() + 3_000;
+    while (!(await Bun.file(verificationStarted).exists())) {
+      if (Date.now() > deadline) throw new Error("verification did not start");
+      await Bun.sleep(10);
+    }
+    expect(app.store.getTask(task.id)).toMatchObject({
+      status: "running",
+      currentPhase: "verify",
+      deliveryStatus: "implemented",
+    });
+
+    await Bun.write(releaseVerification, "release");
+    await running;
+    expect(app.store.getTask(task.id)).toMatchObject({
+      status: "succeeded",
+      currentPhase: "complete",
+      deliveryStatus: "ready_to_integrate",
+    });
+    app.close();
+  });
+
   test("stops permanently when authoritative Git changes violate path policy", async () => {
     const { root, repo, app } = await setup();
     const codex = join(root, "codex");
