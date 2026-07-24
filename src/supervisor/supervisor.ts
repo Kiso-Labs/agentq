@@ -44,6 +44,31 @@ interface EventBudget {
   costUsd: number;
 }
 
+function approvalBoundary(checkpoint: string): "implement" | "integrate" | "land" {
+  const normalized = checkpoint.trim().toLowerCase().replaceAll("_", "-").replaceAll(" ", "-");
+  if (normalized === "before-land" || normalized === "land" || normalized === "after-integrate") {
+    return "land";
+  }
+  if (
+    normalized === "before-integrate" ||
+    normalized === "integrate" ||
+    normalized === "after-verify"
+  ) {
+    return "integrate";
+  }
+  return "implement";
+}
+
+function uniqueCheckpoints(queue: Queue, task: Task): string[] {
+  return [
+    ...new Set(
+      [...queue.approvalCheckpoints, ...task.approvalCheckpoints]
+        .map((checkpoint) => checkpoint.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
 export interface SupervisorOptions {
   queue?: string;
   /** Restrict claims to queues owned by one canonical Git repository. */
@@ -432,6 +457,46 @@ export class Supervisor {
           summary: truncate(planOutput),
         });
         phaseFinished = true;
+
+        const pendingApprovals = uniqueCheckpoints(executionQueue, executionTask).filter(
+          (checkpoint) =>
+            approvalBoundary(checkpoint) === "implement" &&
+            this.app.store.getTaskApproval(task.id, checkpoint)?.status !== "approved",
+        );
+        if (pendingApprovals.length > 0) {
+          controller.signal.throwIfAborted();
+          const [firstCheckpoint, ...additionalCheckpoints] = pendingApprovals;
+          if (!firstCheckpoint) {
+            throw new AgentQError("Approval checkpoint resolution failed", "APPROVAL_INVALID");
+          }
+          this.app.store.pauseRunForApproval(
+            run.id,
+            {
+              checkpoint: firstCheckpoint,
+              planOutput,
+              ...(planned.sessionId ? { planSessionId: planned.sessionId } : {}),
+            },
+            claim.leaseToken,
+          );
+          for (const checkpoint of additionalCheckpoints) {
+            this.app.store.requestTaskApproval({
+              taskId: task.id,
+              runId: run.id,
+              checkpoint,
+            });
+            this.app.store.appendEvent({
+              taskId: task.id,
+              runId: run.id,
+              kind: "task.approval_requested",
+              payload: { checkpoint },
+            });
+          }
+          await this.log(logPath, {
+            type: "task.approval_requested",
+            checkpoints: pendingApprovals,
+          });
+          return;
+        }
       }
 
       if (!planOutput?.trim()) {

@@ -694,6 +694,90 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     app.close();
   });
 
+  test("pauses after planning until every implementation approval is durable", async () => {
+    const { root, repo, app } = await setup();
+    const codex = join(root, "codex");
+    const capture = join(root, "approval-invocations.jsonl");
+    const plan = "Implement approved.txt from the retained worktree and run the focused gate.";
+    await executable(
+      codex,
+      `
+      import { appendFileSync } from "node:fs";
+      const input = await Bun.stdin.text();
+      appendFileSync(${JSON.stringify(capture)}, JSON.stringify({input,args:process.argv.slice(2)}) + "\\n");
+      if (input.includes(${JSON.stringify(planningPromptMarker)})) {
+        console.log(JSON.stringify({type:"thread.started",thread_id:"approval-plan"}));
+        console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:${JSON.stringify(plan)}}}));
+        console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:2,output_tokens:2}}));
+        process.exit(0);
+      }
+      await Bun.write("approved.txt", "approved\\n");
+      console.log(JSON.stringify({type:"thread.started",thread_id:"approval-implementation"}));
+      console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:"Implemented after approval"}}));
+      console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:2,output_tokens:2}}));
+      `,
+    );
+    process.env.AGENTQ_CODEX_BIN = codex;
+    const queue = await app.createQueue({
+      name: "approval",
+      repoPath: repo,
+      maxAttempts: 1,
+      approvalCheckpoints: ["after-plan"],
+      verifyCommands: ["test -f approved.txt"],
+      autoCommit: true,
+    });
+    const task = await app.addTask({
+      queue: queue.id,
+      title: "Wait for review",
+      approvalCheckpoints: ["security-review"],
+    });
+
+    await new Supervisor(app, { pollIntervalMs: 20 }).run({ once: true });
+
+    expect(app.store.getTask(task.id)).toMatchObject({
+      status: "queued",
+      currentPhase: "approval",
+      attemptCount: 0,
+      retryDisposition: "wait",
+    });
+    const pausedRun = app.store.listRuns({ taskId: task.id })[0];
+    expect(pausedRun).toMatchObject({
+      status: "interrupted",
+      phase: "implement",
+      planOutput: plan,
+    });
+    expect(app.store.listTaskApprovals(task.id)).toMatchObject([
+      { checkpoint: "after-plan", status: "pending" },
+      { checkpoint: "security-review", status: "pending" },
+    ]);
+    expect(await Bun.file(join(pausedRun?.worktreePath ?? "", "approved.txt")).exists()).toBe(
+      false,
+    );
+
+    app.store.approveTaskCheckpoint(task.id, "after-plan", { actor: "operator" });
+    await new Supervisor(app, { pollIntervalMs: 20 }).run({ once: true });
+    expect(app.store.listRuns({ taskId: task.id })).toHaveLength(1);
+    expect(app.store.getTask(task.id)?.currentPhase).toBe("approval");
+
+    app.store.approveTaskCheckpoint(task.id, "security-review", { actor: "operator" });
+    await new Supervisor(app, { pollIntervalMs: 20 }).run({ once: true });
+
+    expect(app.store.getTask(task.id)).toMatchObject({
+      status: "succeeded",
+      deliveryStatus: "ready_to_integrate",
+      attemptCount: 1,
+    });
+    const invocations = (await readFile(capture, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { input: string; args: string[] });
+    expect(invocations).toHaveLength(2);
+    expect(invocations.filter(({ input }) => input.includes(planningPromptMarker))).toHaveLength(1);
+    expect(invocations[1]?.args).not.toContain("resume");
+    expect(invocations[1]?.input).toContain(plan);
+    app.close();
+  });
+
   test("stops permanently when authoritative Git changes violate path policy", async () => {
     const { root, repo, app } = await setup();
     const codex = join(root, "codex");
