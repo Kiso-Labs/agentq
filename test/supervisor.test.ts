@@ -887,7 +887,9 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     const run = app.store.listRuns({ taskId: task.id })[0];
     expect(stored).toMatchObject({
       status: "succeeded",
-      deliveryStatus: "ready_to_integrate",
+      deliveryStatus: "integrated",
+      currentPhase: "land",
+      integrationBranch: `refs/heads/agentq/train/${queue.id}`,
       changedFiles: ["src/service.ts", "test/service.test.ts"],
       inputTokens: 12,
       outputTokens: 8,
@@ -910,6 +912,17 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
         ])
       ).stdout.trim(),
     ).toBe(resultSha);
+    expect(stored?.integratedSha).toBeTruthy();
+    expect(
+      (
+        await runCommand("git", ["-C", repo, "rev-parse", `refs/heads/agentq/train/${queue.id}`])
+      ).stdout.trim(),
+    ).toBe(stored?.integratedSha);
+    expect(
+      app.store
+        .listDeliveryOperations({ taskId: task.id })
+        .some((operation) => operation.kind === "integrate" && operation.status === "succeeded"),
+    ).toBeTrue();
     expect((await runCommand("git", ["-C", repo, "rev-parse", "main"])).stdout.trim()).toBe(
       initialMain,
     );
