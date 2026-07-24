@@ -949,6 +949,21 @@ describe("AgentQStore", () => {
 
     expect(store.deleteTask(dependent.id)).toBe(true);
     expect(store.deleteTask(blocker.id)).toBe(true);
+    expect(() =>
+      store.createQueue({
+        name: "unsafe-policy",
+        repoKey: "repo",
+        repoPath: "/repo",
+        allowedPaths: ["../outside/**"],
+      }),
+    ).toThrow(AgentQError);
+    expect(() =>
+      store.addTask({
+        queue: queue.id,
+        title: "Unsafe task policy",
+        deniedPaths: ["/absolute/**"],
+      }),
+    ).toThrow(AgentQError);
   });
 
   test("blocks claims without spending attempts and snapshots the blocker result commit", () => {
@@ -1014,6 +1029,90 @@ describe("AgentQStore", () => {
         },
       ],
     });
+  });
+
+  test("classifies failures into deterministic retry and attempt-budget behavior", () => {
+    const store = open();
+    const queue = store.createQueue({
+      name: "failure-policy",
+      repoKey: "repo",
+      repoPath: "/repo",
+      maxAttempts: 3,
+    });
+
+    const transientTask = store.addTask({ queue: queue.id, title: "Transient failure" });
+    const transient = store.claimNextTask({ queue: queue.id });
+    if (!transient) throw new Error("Expected transient claim");
+    const transientResult = store.finishRun(transient.run.id, {
+      status: "failed",
+      error: "temporary provider outage",
+      failureClass: "transient_infrastructure",
+    });
+    expect(transientResult.task).toMatchObject({
+      status: "queued",
+      attemptCount: 0,
+      failureClass: "transient_infrastructure",
+      retryDisposition: "retry",
+    });
+    const transientRetry = store.claimNextTask({ queue: queue.id });
+    expect(transientRetry?.run.attemptNo).toBe(2);
+    if (!transientRetry) throw new Error("Expected transient retry");
+    store.finishRun(transientRetry.run.id, { status: "succeeded" });
+    expect(store.getTask(transientTask.id)?.status).toBe("succeeded");
+
+    const regressionTask = store.addTask({ queue: queue.id, title: "Regression failure" });
+    const regression = store.claimNextTask({ queue: queue.id });
+    if (!regression) throw new Error("Expected regression claim");
+    store.markRunRunning(regression.run.id, {
+      baseSha: "base-sha",
+      branchName: "agentq/regression",
+      worktreePath: "/tmp/regression",
+      planSessionId: "planner",
+    });
+    store.advanceRunToImplementation(regression.run.id, {
+      planOutput: "Fix the regression and rerun the focused gate.",
+    });
+    const regressionResult = store.finishRun(regression.run.id, {
+      status: "failed",
+      error: "focused gate failed",
+      failureClass: "test_regression",
+      changedFiles: ["src/regression.ts"],
+    });
+    expect(regressionResult.task).toMatchObject({
+      status: "queued",
+      attemptCount: 1,
+      currentPhase: "implement",
+      deliveryStatus: "implemented",
+      failureClass: "test_regression",
+      retryDisposition: "return_to_implementation",
+      resumeRunId: regression.run.id,
+      changedFiles: ["src/regression.ts"],
+    });
+    const regressionRetry = store.claimNextTask({ queue: queue.id });
+    expect(regressionRetry?.run.phase).toBe("implement");
+    if (!regressionRetry) throw new Error("Expected regression implementation retry");
+    store.finishRun(regressionRetry.run.id, { status: "succeeded" });
+    expect(store.getTask(regressionTask.id)?.status).toBe("succeeded");
+
+    const policyTask = store.addTask({ queue: queue.id, title: "Policy violation" });
+    const policy = store.claimNextTask({ queue: queue.id });
+    if (!policy) throw new Error("Expected policy claim");
+    expect(policy.task.id).toBe(policyTask.id);
+    const policyResult = store.finishRun(policy.run.id, {
+      status: "failed",
+      error: "src/api/private.ts is denied",
+      failureClass: "policy_violation",
+      changedFiles: ["src/api/private.ts"],
+    });
+    expect(policyResult.task).toMatchObject({
+      status: "failed",
+      attemptCount: 1,
+      deliveryStatus: "implemented",
+      failureClass: "policy_violation",
+      retryDisposition: "stop",
+      changedFiles: ["src/api/private.ts"],
+    });
+    expect(store.claimNextTask({ queue: queue.id })).toBeUndefined();
   });
 
   test("edits only operator-owned task fields and appends one atomic audit event", () => {
@@ -1153,6 +1252,14 @@ describe("AgentQStore", () => {
         planInstructions: "Inspect dependencies first.",
         implementModel: "builder-v1",
         implementInstructions: "Run focused checks.",
+        allowedPaths: [],
+        deniedPaths: [],
+        verifyCommands: [],
+        approvalCheckpoints: [],
+        baseDriftPolicy: "replan",
+        landStrategy: "none",
+        autoLand: false,
+        fileConcurrency: "off",
       },
     });
     store.finishRun(first.run.id, { status: "failed", error: "Needs revision" });
@@ -1187,6 +1294,14 @@ describe("AgentQStore", () => {
         planInstructions: "Inspect dependencies first.",
         implementModel: "",
         implementInstructions: "Run focused checks.",
+        allowedPaths: [],
+        deniedPaths: [],
+        verifyCommands: [],
+        approvalCheckpoints: [],
+        baseDriftPolicy: "replan",
+        landStrategy: "none",
+        autoLand: false,
+        fileConcurrency: "off",
       },
     });
     expect(store.getRun(first.run.id)?.taskSnapshot).toEqual({
@@ -1201,6 +1316,14 @@ describe("AgentQStore", () => {
         planInstructions: "Inspect dependencies first.",
         implementModel: "builder-v1",
         implementInstructions: "Run focused checks.",
+        allowedPaths: [],
+        deniedPaths: [],
+        verifyCommands: [],
+        approvalCheckpoints: [],
+        baseDriftPolicy: "replan",
+        landStrategy: "none",
+        autoLand: false,
+        fileConcurrency: "off",
       },
     });
   });

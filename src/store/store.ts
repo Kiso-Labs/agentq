@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { AgentQError, errorMessage } from "../core/errors.ts";
 import { isoNow, makeId } from "../core/paths.ts";
+import { normalizeScopePattern } from "../core/scope-policy.ts";
 import {
   type AddTaskInput,
   BASE_DRIFT_POLICIES,
@@ -13,6 +14,7 @@ import {
   DELIVERY_STATUSES,
   EXECUTION_PHASES,
   FAILURE_CLASSES,
+  type FailureClass,
   FILE_CONCURRENCY_MODES,
   isTaskActive,
   LAND_STRATEGIES,
@@ -20,6 +22,7 @@ import {
   type Queue,
   type QueueWorkflowSnapshot,
   RETRY_DISPOSITIONS,
+  type RetryDisposition,
   RUN_STATUSES,
   type Run,
   type RunStatus,
@@ -65,6 +68,36 @@ const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
 const DEFAULT_LIST_LIMIT = 1_000;
 const MAX_LIST_LIMIT = 10_000;
 const MAX_PLAN_OUTPUT_LENGTH = 262_144;
+
+function retryDispositionFor(failureClass: FailureClass): RetryDisposition {
+  switch (failureClass) {
+    case "transient_infrastructure":
+    case "agent_failure":
+    case "unknown":
+      return "retry";
+    case "stale_base":
+      return "rebase_and_retry";
+    case "test_regression":
+      return "return_to_implementation";
+    case "blocked_dependency":
+      return "wait";
+    case "file_conflict":
+    case "integration_conflict":
+      return "manual_resolution";
+    case "policy_violation":
+    case "cancelled":
+      return "stop";
+  }
+}
+
+function spendsAttempt(failureClass: FailureClass): boolean {
+  return ![
+    "transient_infrastructure",
+    "stale_base",
+    "blocked_dependency",
+    "integration_conflict",
+  ].includes(failureClass);
+}
 
 interface QueueRow {
   id: unknown;
@@ -544,6 +577,68 @@ function taskSpecSnapshot(
       return corrupt(entity, id, `${column}.workflow`, "a queue workflow snapshot");
     }
     const value = parsed.workflow as Record<string, unknown>;
+    const workflowAllowedPaths =
+      value.allowedPaths === undefined
+        ? undefined
+        : parsedStringArray(value.allowedPaths, entity, id, `${column}.workflow.allowedPaths`);
+    const workflowDeniedPaths =
+      value.deniedPaths === undefined
+        ? undefined
+        : parsedStringArray(value.deniedPaths, entity, id, `${column}.workflow.deniedPaths`);
+    const workflowMaxChangedFiles =
+      value.maxChangedFiles === undefined
+        ? undefined
+        : integerValue(value.maxChangedFiles, entity, id, `${column}.workflow.maxChangedFiles`);
+    const workflowVerifyCommands =
+      value.verifyCommands === undefined
+        ? undefined
+        : parsedStringArray(value.verifyCommands, entity, id, `${column}.workflow.verifyCommands`);
+    const workflowApprovalCheckpoints =
+      value.approvalCheckpoints === undefined
+        ? undefined
+        : parsedStringArray(
+            value.approvalCheckpoints,
+            entity,
+            id,
+            `${column}.workflow.approvalCheckpoints`,
+          );
+    const workflowBaseDriftPolicy =
+      value.baseDriftPolicy === undefined
+        ? undefined
+        : enumValue(
+            value.baseDriftPolicy,
+            BASE_DRIFT_POLICIES,
+            entity,
+            id,
+            `${column}.workflow.baseDriftPolicy`,
+          );
+    const workflowLandStrategy =
+      value.landStrategy === undefined
+        ? undefined
+        : enumValue(
+            value.landStrategy,
+            LAND_STRATEGIES,
+            entity,
+            id,
+            `${column}.workflow.landStrategy`,
+          );
+    const workflowFileConcurrency =
+      value.fileConcurrency === undefined
+        ? undefined
+        : enumValue(
+            value.fileConcurrency,
+            FILE_CONCURRENCY_MODES,
+            entity,
+            id,
+            `${column}.workflow.fileConcurrency`,
+          );
+    let workflowAutoLand: boolean | undefined;
+    if (value.autoLand !== undefined) {
+      if (typeof value.autoLand !== "boolean") {
+        return corrupt(entity, id, `${column}.workflow.autoLand`, "a boolean");
+      }
+      workflowAutoLand = value.autoLand;
+    }
     workflow = {
       planModel: stringValue(value.planModel, entity, id, `${column}.workflow.planModel`),
       planInstructions: stringValue(
@@ -564,6 +659,23 @@ function taskSpecSnapshot(
         id,
         `${column}.workflow.implementInstructions`,
       ),
+      ...(workflowAllowedPaths === undefined ? {} : { allowedPaths: workflowAllowedPaths }),
+      ...(workflowDeniedPaths === undefined ? {} : { deniedPaths: workflowDeniedPaths }),
+      ...(workflowMaxChangedFiles === undefined
+        ? {}
+        : { maxChangedFiles: workflowMaxChangedFiles }),
+      ...(workflowVerifyCommands === undefined ? {} : { verifyCommands: workflowVerifyCommands }),
+      ...(workflowApprovalCheckpoints === undefined
+        ? {}
+        : { approvalCheckpoints: workflowApprovalCheckpoints }),
+      ...(workflowBaseDriftPolicy === undefined
+        ? {}
+        : { baseDriftPolicy: workflowBaseDriftPolicy }),
+      ...(workflowLandStrategy === undefined ? {} : { landStrategy: workflowLandStrategy }),
+      ...(workflowAutoLand === undefined ? {} : { autoLand: workflowAutoLand }),
+      ...(workflowFileConcurrency === undefined
+        ? {}
+        : { fileConcurrency: workflowFileConcurrency }),
     };
   }
   const optionalText = (key: keyof TaskSpecSnapshot): string | undefined =>
@@ -941,6 +1053,12 @@ function stringArrayInput(value: readonly string[], field: string): string[] {
   return [...value];
 }
 
+function scopePatternArrayInput(value: readonly string[], field: string): string[] {
+  return [
+    ...new Set(stringArrayInput(value, field).map((pattern) => normalizeScopePattern(pattern))),
+  ];
+}
+
 function timestamp(value: string | undefined, field = "timestamp"): string {
   if (value === undefined) return isoNow();
   const milliseconds = Date.parse(value);
@@ -1076,8 +1194,8 @@ export class AgentQStore {
     const concurrency = integerInput(input.concurrency ?? 1, "concurrency", 1);
     const maxAttempts = integerInput(input.maxAttempts ?? 3, "maxAttempts", 1);
     const verifyCommands = stringArrayInput(input.verifyCommands ?? [], "verifyCommands");
-    const allowedPaths = stringArrayInput(input.allowedPaths ?? [], "allowedPaths");
-    const deniedPaths = stringArrayInput(input.deniedPaths ?? [], "deniedPaths");
+    const allowedPaths = scopePatternArrayInput(input.allowedPaths ?? [], "allowedPaths");
+    const deniedPaths = scopePatternArrayInput(input.deniedPaths ?? [], "deniedPaths");
     const maxChangedFiles =
       input.maxChangedFiles === undefined
         ? null
@@ -1232,10 +1350,13 @@ export class AgentQStore {
     }
     if (patch.autoCommit !== undefined) set("auto_commit", patch.autoCommit ? 1 : 0);
     if (patch.allowedPaths !== undefined) {
-      set("allowed_paths", JSON.stringify(stringArrayInput(patch.allowedPaths, "allowedPaths")));
+      set(
+        "allowed_paths",
+        JSON.stringify(scopePatternArrayInput(patch.allowedPaths, "allowedPaths")),
+      );
     }
     if (patch.deniedPaths !== undefined) {
-      set("denied_paths", JSON.stringify(stringArrayInput(patch.deniedPaths, "deniedPaths")));
+      set("denied_paths", JSON.stringify(scopePatternArrayInput(patch.deniedPaths, "deniedPaths")));
     }
     if (patch.maxChangedFiles !== undefined) {
       set("max_changed_files", integerInput(patch.maxChangedFiles, "maxChangedFiles", 1));
@@ -1453,8 +1574,8 @@ export class AgentQStore {
         "handoffRequirements",
       );
       const expectedPaths = stringArrayInput(input.expectedPaths ?? [], "expectedPaths");
-      const allowedPaths = stringArrayInput(input.allowedPaths ?? [], "allowedPaths");
-      const deniedPaths = stringArrayInput(input.deniedPaths ?? [], "deniedPaths");
+      const allowedPaths = scopePatternArrayInput(input.allowedPaths ?? [], "allowedPaths");
+      const deniedPaths = scopePatternArrayInput(input.deniedPaths ?? [], "deniedPaths");
       const maxChangedFiles =
         input.maxChangedFiles === undefined
           ? null
@@ -1744,7 +1865,11 @@ export class AgentQStore {
     ] as const) {
       const value = patch[field];
       if (value !== undefined) {
-        set(field, column, JSON.stringify(stringArrayInput(value, field)));
+        const checked =
+          field === "allowedPaths" || field === "deniedPaths"
+            ? scopePatternArrayInput(value, field)
+            : stringArrayInput(value, field);
+        set(field, column, JSON.stringify(checked));
       }
     }
     if (patch.maxChangedFiles !== undefined) {
@@ -2245,6 +2370,17 @@ export class AgentQStore {
           planInstructions: queue.planInstructions,
           implementModel: useConfiguredModels ? queue.implementModel : "",
           implementInstructions: queue.implementInstructions,
+          allowedPaths: [...queue.allowedPaths],
+          deniedPaths: [...queue.deniedPaths],
+          ...(queue.maxChangedFiles === undefined
+            ? {}
+            : { maxChangedFiles: queue.maxChangedFiles }),
+          verifyCommands: [...queue.verifyCommands],
+          approvalCheckpoints: [...queue.approvalCheckpoints],
+          baseDriftPolicy: queue.baseDriftPolicy,
+          landStrategy: queue.landStrategy,
+          autoLand: queue.autoLand,
+          fileConcurrency: queue.fileConcurrency,
         },
       };
       const resumeCandidate = task.resumeRunId ? this.#requireRun(task.resumeRunId) : undefined;
@@ -2673,6 +2809,19 @@ export class AgentQStore {
       const finishedAt = timestamp(input.finishedAt, "finishedAt");
       const wasCancelled = input.status === "cancelled" || task.cancelRequestedAt !== undefined;
       const runStatus: RunStatus = wasCancelled ? "cancelled" : input.status;
+      const failureClass: FailureClass | undefined =
+        runStatus === "succeeded"
+          ? undefined
+          : (input.failureClass ??
+            (wasCancelled
+              ? "cancelled"
+              : runStatus === "failed"
+                ? "agent_failure"
+                : "transient_infrastructure"));
+      const retryDisposition =
+        failureClass === undefined
+          ? undefined
+          : (input.retryDisposition ?? retryDispositionFor(failureClass));
       const changedFiles = stringArrayInput(input.changedFiles ?? [], "changedFiles");
       const checkedVerificationResults = verificationResults(
         JSON.stringify(input.verificationResults ?? []),
@@ -2708,8 +2857,8 @@ export class AgentQStore {
           input.resultCommitSha ?? null,
           JSON.stringify(changedFiles),
           JSON.stringify(checkedVerificationResults),
-          input.failureClass ?? (wasCancelled ? "cancelled" : null),
-          input.retryDisposition ?? null,
+          failureClass ?? null,
+          retryDisposition ?? null,
           inputTokens,
           outputTokens,
           costUsd,
@@ -2725,7 +2874,14 @@ export class AgentQStore {
       } else if (runStatus === "succeeded") {
         taskStatus = "succeeded";
         completedAt = finishedAt;
-      } else if (input.requeue || task.attemptCount < queue.maxAttempts) {
+      } else if (retryDisposition === "stop" || retryDisposition === "manual_resolution") {
+        taskStatus = runStatus === "failed" ? "failed" : "interrupted";
+        completedAt = finishedAt;
+      } else if (
+        input.requeue ||
+        (failureClass !== undefined && !spendsAttempt(failureClass)) ||
+        task.attemptCount < queue.maxAttempts
+      ) {
         taskStatus = "queued";
         completedAt = null;
       } else {
@@ -2733,22 +2889,37 @@ export class AgentQStore {
         completedAt = finishedAt;
       }
 
-      const restoredAttemptCount = input.requeue
-        ? Math.max(0, task.attemptCount - 1)
-        : task.attemptCount;
+      const restoredAttemptCount =
+        input.requeue || (failureClass !== undefined && !spendsAttempt(failureClass))
+          ? Math.max(0, task.attemptCount - 1)
+          : task.attemptCount;
       const deliveryStatus =
         runStatus === "succeeded"
           ? input.resultCommitSha
             ? "ready_to_integrate"
             : "verified"
-          : task.deliveryStatus;
+          : failureClass === "test_regression" ||
+              failureClass === "policy_violation" ||
+              failureClass === "file_conflict"
+            ? "implemented"
+            : task.deliveryStatus;
       const currentPhase =
-        taskStatus === "queued" ? (task.blockedBy.length > 0 ? "blocked" : "queued") : "complete";
+        taskStatus === "queued"
+          ? failureClass === "test_regression"
+            ? "implement"
+            : task.blockedBy.length > 0
+              ? "blocked"
+              : "queued"
+          : "complete";
       this.#database.run(
         `
           UPDATE tasks
           SET status = ?, attempt_count = ?, current_run_id = NULL, completed_at = ?,
-              resume_run_id = CASE WHEN ? = 1 THEN NULL ELSE resume_run_id END,
+              resume_run_id = CASE
+                WHEN ? = 1 THEN ?
+                WHEN ? = 1 THEN NULL
+                ELSE resume_run_id
+              END,
               current_phase = ?, delivery_status = ?, failure_class = ?,
               failure_reason = ?, retry_disposition = ?, result_run_id = ?,
               result_commit_sha = ?, changed_files = ?, verification_results = ?,
@@ -2760,18 +2931,18 @@ export class AgentQStore {
           taskStatus,
           restoredAttemptCount,
           completedAt,
+          taskStatus === "queued" && failureClass === "test_regression" ? 1 : 0,
+          taskStatus === "queued" && failureClass === "test_regression" ? id : null,
           taskStatus === "queued" ? 0 : 1,
           currentPhase,
           deliveryStatus,
-          input.failureClass ?? (wasCancelled ? "cancelled" : null),
-          input.error ?? null,
-          input.retryDisposition ?? null,
+          failureClass ?? null,
+          runStatus === "succeeded" ? null : (input.error ?? null),
+          retryDisposition ?? null,
           runStatus === "succeeded" && input.resultCommitSha ? id : null,
           runStatus === "succeeded" ? (input.resultCommitSha ?? null) : null,
-          JSON.stringify(runStatus === "succeeded" ? changedFiles : task.changedFiles),
-          JSON.stringify(
-            runStatus === "succeeded" ? checkedVerificationResults : task.verificationResults,
-          ),
+          JSON.stringify(changedFiles),
+          JSON.stringify(checkedVerificationResults),
           inputTokens,
           outputTokens,
           costUsd,

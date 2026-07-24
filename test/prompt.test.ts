@@ -19,8 +19,9 @@ const queue: Queue = {
   maxAttempts: 2,
   verifyCommands: ["bun test"],
   autoCommit: true,
-  allowedPaths: [],
-  deniedPaths: [],
+  allowedPaths: ["src/**", "test/**"],
+  deniedPaths: ["src/api/**"],
+  maxChangedFiles: 20,
   approvalCheckpoints: [],
   baseDriftPolicy: "replan",
   landStrategy: "none",
@@ -37,13 +38,14 @@ const task: Task = {
   instructions: "Stop expired sessions from redirecting in a loop.",
   acceptanceCriteria: ["A regression test covers the expired session"],
   objective: "Stop expired sessions from redirecting in a loop.",
-  invariants: [],
-  handoffRequirements: [],
-  blockedBy: [],
-  expectedPaths: [],
-  allowedPaths: [],
-  deniedPaths: [],
-  verifyCommands: [],
+  invariants: ["The public session API remains stable"],
+  handoffRequirements: ["Explain the redirect ownership boundary"],
+  blockedBy: ["task-auth-seam"],
+  expectedPaths: ["src/session.ts", "test/session.test.ts"],
+  allowedPaths: ["src/session.ts", "test/session.test.ts"],
+  deniedPaths: ["test/api/**"],
+  maxChangedFiles: 10,
+  verifyCommands: ["bun run lint"],
   approvalCheckpoints: [],
   baseDriftPolicy: "replan",
   landStrategy: "none",
@@ -71,6 +73,13 @@ describe("pipeline prompts", () => {
     expect(prompt).toContain("Stop expired sessions from redirecting in a loop.");
     expect(prompt).toContain("Trace the current data flow before choosing files.");
     expect(prompt).toContain("specific files and symbols");
+    expect(prompt).toContain("The public session API remains stable");
+    expect(prompt).toContain("task-auth-seam");
+    expect(prompt).toContain("src/api/**");
+    expect(prompt).toContain("Maximum changed files:\n10");
+    expect(prompt).toContain("bun test");
+    expect(prompt).toContain("bun run lint");
+    expect(prompt).toContain("Explain the redirect ownership boundary");
     expect(prompt).toContain("Do not modify files");
     expect(prompt).not.toContain("/plan");
   });
@@ -82,6 +91,9 @@ describe("pipeline prompts", () => {
     expect(prompt).toContain("implementation agent");
     expect(prompt).toContain("Keep public APIs stable and add focused tests.");
     expect(prompt).toContain(handoff);
+    expect(prompt).toContain("src/session.ts");
+    expect(prompt).toContain("test/api/**");
+    expect(prompt).toContain("The public session API remains stable");
     expect(prompt).toContain("original task and acceptance criteria remain authoritative");
   });
 

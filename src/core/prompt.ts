@@ -7,6 +7,43 @@ function acceptanceCriteria(task: Task): string {
     : "No additional acceptance criteria were supplied. Derive appropriate verification from the repository.";
 }
 
+function bullets(values: readonly string[], empty: string): string {
+  return values.length > 0 ? values.map((value) => `- ${value}`).join("\n") : empty;
+}
+
+function structuredSpecification(task: Task, queue: Queue): string {
+  const effectiveVerification = [...queue.verifyCommands, ...task.verifyCommands];
+  return `Objective:
+${task.objective}
+
+Invariants:
+${bullets(task.invariants, "- No additional invariants were supplied.")}
+
+Dependency blockers:
+${bullets(task.blockedBy, "- None.")}
+
+Expected paths:
+${bullets(task.expectedPaths, "- Not declared; determine them from repository evidence.")}
+
+Allowed path scopes:
+${bullets(
+  [...queue.allowedPaths, ...task.allowedPaths],
+  "- Unrestricted except for denied path scopes.",
+)}
+
+Denied path scopes:
+${bullets([...queue.deniedPaths, ...task.deniedPaths], "- None.")}
+
+Maximum changed files:
+${task.maxChangedFiles ?? queue.maxChangedFiles ?? "No explicit limit."}
+
+Mandatory verification:
+${bullets(effectiveVerification, "- Derive the appropriate repository checks.")}
+
+Handoff requirements:
+${bullets(task.handoffRequirements, "- No additional handoff requirements were supplied.")}`;
+}
+
 export function buildPlanningPrompt(task: Task, queue: Queue): string {
   const guidance =
     queue.planInstructions.trim() || "No additional queue-level planning guidance was supplied.";
@@ -20,6 +57,9 @@ Title: ${task.title}
 
 Original instructions:
 ${task.instructions || task.title}
+
+Structured task specification:
+${structuredSpecification(task, queue)}
 
 Acceptance criteria:
 ${acceptanceCriteria(task)}
@@ -62,6 +102,9 @@ Title: ${task.title}
 
 Instructions:
 ${task.instructions || task.title}
+
+Structured task specification:
+${structuredSpecification(task, queue)}
 
 Acceptance criteria:
 ${acceptance}

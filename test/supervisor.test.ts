@@ -177,12 +177,29 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
       planOutput: plan,
       planSessionId: "plan-session",
       providerSessionId: "implementation-session",
+      changedFiles: ["implemented.txt"],
+      inputTokens: 30,
+      outputTokens: 12,
     });
     expect(run?.taskSnapshot?.workflow).toEqual({
       planModel: "planner-model",
       planInstructions: "Identify exact files and symbols before handing off.",
       implementModel: "builder-model",
       implementInstructions: "Follow the handoff and keep APIs stable.",
+      allowedPaths: [],
+      deniedPaths: [],
+      verifyCommands: ["test -f implemented.txt"],
+      approvalCheckpoints: [],
+      baseDriftPolicy: "replan",
+      landStrategy: "none",
+      autoLand: false,
+      fileConcurrency: "off",
+    });
+    expect(app.store.getTask(task.id)).toMatchObject({
+      deliveryStatus: "verified",
+      changedFiles: ["implemented.txt"],
+      inputTokens: 30,
+      outputTokens: 12,
     });
     const invocations = (await readFile(capture, "utf8"))
       .trim()
@@ -622,6 +639,144 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
         (event) => event.kind === "verification.completed" && event.payload.exitCode !== 0,
       ),
     ).toBeTrue();
+    app.close();
+  });
+
+  test("stops permanently when authoritative Git changes violate path policy", async () => {
+    const { root, repo, app } = await setup();
+    const codex = join(root, "codex");
+    await executable(
+      codex,
+      `
+      import { mkdirSync } from "node:fs";
+      ${codexPlanningGate("Change only the service implementation and its focused test.")}
+      mkdirSync("src/api", {recursive:true});
+      await Bun.write("src/api/private.ts", "forbidden\\n");
+      console.log(JSON.stringify({type:"thread.started",thread_id:"policy-implementation"}));
+      console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:"Changed a denied path"}}));
+      console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:7,output_tokens:3}}));
+      `,
+    );
+    process.env.AGENTQ_CODEX_BIN = codex;
+    const queue = await app.createQueue({
+      name: "policy-enforcement",
+      repoPath: repo,
+      maxAttempts: 3,
+      allowedPaths: ["src/**"],
+      deniedPaths: ["src/api/**"],
+      verifyCommands: ["touch verification-must-not-run"],
+      autoCommit: true,
+    });
+    const task = await app.addTask({ queue: queue.id, title: "Respect service scope" });
+    const initialMain = (await runCommand("git", ["-C", repo, "rev-parse", "main"])).stdout.trim();
+
+    await new Supervisor(app, { pollIntervalMs: 20 }).run({ once: true });
+
+    const stored = app.store.getTask(task.id);
+    const run = app.store.listRuns({ taskId: task.id })[0];
+    expect(stored).toMatchObject({
+      status: "failed",
+      deliveryStatus: "implemented",
+      failureClass: "policy_violation",
+      retryDisposition: "stop",
+      changedFiles: ["src/api/private.ts"],
+    });
+    expect(run).toMatchObject({
+      status: "failed",
+      failureClass: "policy_violation",
+      retryDisposition: "stop",
+      changedFiles: ["src/api/private.ts"],
+    });
+    expect(run?.resultCommitSha).toBeUndefined();
+    expect(
+      await Bun.file(join(run?.worktreePath ?? "", "verification-must-not-run")).exists(),
+    ).toBe(false);
+    expect((await runCommand("git", ["-C", repo, "rev-parse", "main"])).stdout.trim()).toBe(
+      initialMain,
+    );
+    expect(
+      app.store
+        .listEvents({ taskId: task.id, limit: 1_000 })
+        .some(
+          (event) =>
+            event.kind === "policy.completed" &&
+            event.payload.passed === false &&
+            Array.isArray(event.payload.violations),
+        ),
+    ).toBeTrue();
+    app.close();
+  });
+
+  test("runs inherited and task gates then persists one immutable landable result", async () => {
+    const { root, repo, app } = await setup();
+    const codex = join(root, "codex");
+    await executable(
+      codex,
+      `
+      import { mkdirSync } from "node:fs";
+      ${codexPlanningGate("Add the service module and a focused test, then run both mandatory gates.")}
+      mkdirSync("src", {recursive:true});
+      mkdirSync("test", {recursive:true});
+      await Bun.write("src/service.ts", "export const service = true;\\n");
+      await Bun.write("test/service.test.ts", "export const covered = true;\\n");
+      console.log(JSON.stringify({type:"thread.started",thread_id:"landable-implementation"}));
+      console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:"Implemented service and test"}}));
+      console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:7,output_tokens:3}}));
+      `,
+    );
+    process.env.AGENTQ_CODEX_BIN = codex;
+    const queue = await app.createQueue({
+      name: "landable-result",
+      repoPath: repo,
+      maxAttempts: 1,
+      allowedPaths: ["src/**", "test/**"],
+      deniedPaths: ["src/api/**"],
+      maxChangedFiles: 4,
+      verifyCommands: ["test -f src/service.ts"],
+      autoCommit: true,
+      landStrategy: "stack",
+    });
+    const task = await app.addTask({
+      queue: queue.id,
+      title: "Create a landable service result",
+      allowedPaths: ["src/service.ts", "test/service.test.ts"],
+      verifyCommands: ["test -f test/service.test.ts"],
+      landStrategy: "stack",
+    });
+    const initialMain = (await runCommand("git", ["-C", repo, "rev-parse", "main"])).stdout.trim();
+
+    await new Supervisor(app, { pollIntervalMs: 20 }).run({ once: true });
+
+    const stored = app.store.getTask(task.id);
+    const run = app.store.listRuns({ taskId: task.id })[0];
+    expect(stored).toMatchObject({
+      status: "succeeded",
+      deliveryStatus: "ready_to_integrate",
+      changedFiles: ["src/service.ts", "test/service.test.ts"],
+      inputTokens: 12,
+      outputTokens: 8,
+    });
+    expect(run?.resultCommitSha).toBe(stored?.resultCommitSha);
+    expect(run?.verificationResults.every((gate) => gate.status === "passed")).toBeTrue();
+    expect(run?.verificationResults.filter((gate) => gate.kind === "command")).toHaveLength(2);
+    const resultSha = stored?.resultCommitSha;
+    if (!resultSha || !run?.baseSha) throw new Error("Expected a canonical result");
+    expect(
+      (await runCommand("git", ["-C", repo, "rev-parse", `${resultSha}^`])).stdout.trim(),
+    ).toBe(run.baseSha);
+    expect(
+      (
+        await runCommand("git", [
+          "-C",
+          repo,
+          "rev-parse",
+          `refs/agentq/results/${task.id}/${run.id}`,
+        ])
+      ).stdout.trim(),
+    ).toBe(resultSha);
+    expect((await runCommand("git", ["-C", repo, "rev-parse", "main"])).stdout.trim()).toBe(
+      initialMain,
+    );
     app.close();
   });
 

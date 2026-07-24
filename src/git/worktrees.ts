@@ -77,6 +77,22 @@ export class WorktreeManager {
     return realpath(resolve(repoRoot, result.stdout.trim()));
   }
 
+  async resolveBase(
+    queue: Queue,
+    reference = queue.baseRef,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const repoRoot = await this.resolveRepo(queue.repoPath);
+    const baseResult = await runGit(repoRoot, ["rev-parse", "--verify", `${reference}^{commit}`], {
+      signal,
+    });
+    const baseSha = baseResult.stdout.trim();
+    if (!baseSha) {
+      throw new AgentQError(`Could not resolve base ${reference}`, "INVALID_BASE_REF");
+    }
+    return baseSha;
+  }
+
   async prepare(
     queue: Queue,
     task: Task,
@@ -86,20 +102,7 @@ export class WorktreeManager {
   ): Promise<PreparedWorktree> {
     const repoRoot = await this.resolveRepo(queue.repoPath);
     const commonDir = await this.resolveCommonDir(repoRoot, signal);
-    const baseResult = await runGit(
-      repoRoot,
-      ["rev-parse", "--verify", `${effectiveBaseSha ?? queue.baseRef}^{commit}`],
-      {
-        signal,
-      },
-    );
-    const baseSha = baseResult.stdout.trim();
-    if (!baseSha) {
-      throw new AgentQError(
-        `Could not resolve base ${effectiveBaseSha ?? queue.baseRef}`,
-        "INVALID_BASE_REF",
-      );
-    }
+    const baseSha = await this.resolveBase(queue, effectiveBaseSha ?? queue.baseRef, signal);
 
     const shortTask = task.id.replace(/^task_/, "").slice(0, 10);
     const queueSlug = slug(queue.name) || `queue-${queue.id.replace(/^queue_/, "").slice(0, 8)}`;
@@ -236,6 +239,75 @@ export class WorktreeManager {
 
     const head = await runGit(worktreePath, ["rev-parse", "HEAD"]);
     return head.stdout.trim() || undefined;
+  }
+
+  async canonicalizeResult(
+    worktreePath: string,
+    baseSha: string,
+    task: Task,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
+    const [base, head] = await Promise.all([
+      runGit(worktreePath, ["rev-parse", "--verify", `${baseSha}^{commit}`], { signal }),
+      runGit(worktreePath, ["rev-parse", "--verify", "HEAD^{commit}"], { signal }),
+    ]);
+    const canonicalBase = base.stdout.trim();
+    const previousHead = head.stdout.trim();
+    const ancestry = await runGit(
+      worktreePath,
+      ["merge-base", "--is-ancestor", canonicalBase, previousHead],
+      {
+        allowFailure: true,
+        signal,
+      },
+    );
+    if (ancestry.exitCode !== 0) {
+      throw new AgentQError(
+        "Task branch no longer descends from its recorded base",
+        "RESULT_BASE_DIVERGED",
+      );
+    }
+
+    await runGit(worktreePath, ["add", "--all"], { signal });
+    const [tree, baseTree] = await Promise.all([
+      runGit(worktreePath, ["write-tree"], { signal }),
+      runGit(worktreePath, ["rev-parse", `${canonicalBase}^{tree}`], { signal }),
+    ]);
+    const treeSha = tree.stdout.trim();
+    if (treeSha === baseTree.stdout.trim()) {
+      await runGit(worktreePath, ["reset", "--hard", canonicalBase], { signal });
+      return undefined;
+    }
+
+    const commit = await runGit(
+      worktreePath,
+      ["commit-tree", treeSha, "-p", canonicalBase, "-m", `agentq: ${task.title}`],
+      {
+        signal,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: "agentq",
+          GIT_AUTHOR_EMAIL: "agentq@localhost",
+          GIT_COMMITTER_NAME: "agentq",
+          GIT_COMMITTER_EMAIL: "agentq@localhost",
+        },
+      },
+    );
+    const resultSha = commit.stdout.trim();
+    await runGit(worktreePath, ["update-ref", "HEAD", resultSha, previousHead], { signal });
+    await runGit(worktreePath, ["reset", "--hard", resultSha], { signal });
+    const status = await runGit(
+      worktreePath,
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      { signal },
+    );
+    if (status.stdout.trim()) {
+      throw new AgentQError(
+        "Canonical result commit left the worktree dirty",
+        "RESULT_POSTCONDITION_FAILED",
+      );
+    }
+    return resultSha;
   }
 
   async assertUnchanged(

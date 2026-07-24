@@ -177,6 +177,15 @@ export interface QueueWorkflowSnapshot {
   planInstructions: string;
   implementModel: string;
   implementInstructions: string;
+  allowedPaths?: string[];
+  deniedPaths?: string[];
+  maxChangedFiles?: number;
+  verifyCommands?: string[];
+  approvalCheckpoints?: string[];
+  baseDriftPolicy?: BaseDriftPolicy;
+  landStrategy?: LandStrategy;
+  autoLand?: boolean;
+  fileConcurrency?: FileConcurrencyMode;
 }
 
 export interface Queue {

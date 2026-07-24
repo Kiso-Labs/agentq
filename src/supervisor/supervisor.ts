@@ -4,8 +4,17 @@ import { join } from "node:path";
 import type { AgentQApp } from "../app.ts";
 import { AgentQError, errorMessage } from "../core/errors.ts";
 import { buildImplementationPrompt, buildPlanningPrompt } from "../core/prompt.ts";
-import type { ExecutionPhase, ExecutorEvent, ExecutorResult, Queue, Task } from "../core/types.ts";
+import { evaluateScopePolicy, resolveEffectiveScopePolicy } from "../core/scope-policy.ts";
+import type {
+  ExecutionPhase,
+  ExecutorEvent,
+  ExecutorResult,
+  Queue,
+  Task,
+  VerificationResult,
+} from "../core/types.ts";
 import { createExecutorMap } from "../executors/index.ts";
+import { ensureImmutableResultRef, snapshotChangedFiles } from "../git/delivery.ts";
 import type { PreparedWorktree } from "../git/worktrees.ts";
 import { DelegatedTaskIntake } from "../intake/delegated-tasks.ts";
 import {
@@ -30,6 +39,9 @@ interface EventBudget {
   events: number;
   bytes: number;
   limitReported: boolean;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
 }
 
 export interface SupervisorOptions {
@@ -201,7 +213,14 @@ export class Supervisor {
     let intakeRegistered = false;
     let activePhase: ExecutionPhase = run.phase;
     let phaseFinished = false;
-    const eventBudget: EventBudget = { events: 0, bytes: 0, limitReported: false };
+    const eventBudget: EventBudget = {
+      events: 0,
+      bytes: 0,
+      limitReported: false,
+      inputTokens: 0,
+      outputTokens: 0,
+      costUsd: 0,
+    };
     const heartbeat = setInterval(() => {
       try {
         this.app.store.heartbeatRun(run.id, undefined, claim.leaseToken);
@@ -235,12 +254,51 @@ export class Supervisor {
           worktreePath: resume.worktreePath,
         };
       } else {
+        let effectiveBaseSha = run.baseSha;
+        if (!effectiveBaseSha) {
+          const currentBaseSha = await this.app.worktrees.resolveBase(
+            queue,
+            queue.baseRef,
+            controller.signal,
+          );
+          const createdBaseSha = run.taskSnapshot?.createdBaseSha ?? task.createdBaseSha;
+          if (createdBaseSha && createdBaseSha !== currentBaseSha) {
+            const driftPolicy = run.taskSnapshot?.baseDriftPolicy ?? task.baseDriftPolicy;
+            const driftPayload = {
+              createdBaseSha,
+              currentBaseSha,
+              policy: driftPolicy,
+            };
+            this.app.store.appendEvent({
+              taskId: task.id,
+              runId: run.id,
+              kind: "base.drift_detected",
+              payload: driftPayload,
+            });
+            await this.log(logPath, { type: "base.drift_detected", ...driftPayload });
+            if (driftPolicy === "fail") {
+              await this.completeClaim(
+                claim,
+                logPath,
+                {
+                  status: "failed",
+                  error: `Task base ${createdBaseSha} is stale; ${queue.baseRef} is now ${currentBaseSha}`,
+                  failureClass: "stale_base",
+                  retryDisposition: "stop",
+                },
+                driftPayload,
+              );
+              return;
+            }
+          }
+          effectiveBaseSha = currentBaseSha;
+        }
         prepared = await this.app.worktrees.prepare(
           queue,
           task,
           run.attemptNo,
           controller.signal,
-          run.baseSha,
+          effectiveBaseSha,
         );
       }
       // Persist the retained workspace before either provider starts. This
@@ -269,6 +327,27 @@ export class Supervisor {
             title: run.taskSnapshot.title,
             instructions: run.taskSnapshot.instructions,
             acceptanceCriteria: [...run.taskSnapshot.acceptanceCriteria],
+            objective: run.taskSnapshot.objective ?? task.objective,
+            invariants: [...(run.taskSnapshot.invariants ?? task.invariants)],
+            handoffRequirements: [
+              ...(run.taskSnapshot.handoffRequirements ?? task.handoffRequirements),
+            ],
+            blockedBy: [...(run.taskSnapshot.blockedBy ?? task.blockedBy)],
+            expectedPaths: [...(run.taskSnapshot.expectedPaths ?? task.expectedPaths)],
+            allowedPaths: [...(run.taskSnapshot.allowedPaths ?? task.allowedPaths)],
+            deniedPaths: [...(run.taskSnapshot.deniedPaths ?? task.deniedPaths)],
+            ...(run.taskSnapshot.maxChangedFiles === undefined
+              ? {}
+              : { maxChangedFiles: run.taskSnapshot.maxChangedFiles }),
+            verifyCommands: [...(run.taskSnapshot.verifyCommands ?? task.verifyCommands)],
+            approvalCheckpoints: [
+              ...(run.taskSnapshot.approvalCheckpoints ?? task.approvalCheckpoints),
+            ],
+            baseDriftPolicy: run.taskSnapshot.baseDriftPolicy ?? task.baseDriftPolicy,
+            landStrategy: run.taskSnapshot.landStrategy ?? task.landStrategy,
+            ...(run.taskSnapshot.createdBaseSha === undefined
+              ? {}
+              : { createdBaseSha: run.taskSnapshot.createdBaseSha }),
             provider: run.taskSnapshot.provider,
             priority: run.taskSnapshot.priority,
           }
@@ -320,10 +399,13 @@ export class Supervisor {
           const terminal = await this.finalizeSuccessfulOrFailed(
             claim,
             prepared,
+            executionTask,
+            executionQueue,
             planned.result,
             undefined,
             logPath,
             controller.signal,
+            eventBudget,
           );
           await this.completeClaim(claim, logPath, terminal.input, terminal.payload);
           return;
@@ -389,10 +471,13 @@ export class Supervisor {
         const terminal = await this.finalizeSuccessfulOrFailed(
           claim,
           prepared,
+          executionTask,
+          executionQueue,
           implemented.result,
           implemented.sessionId,
           logPath,
           controller.signal,
+          eventBudget,
         );
         await this.completeClaim(claim, logPath, terminal.input, terminal.payload);
         return;
@@ -405,10 +490,13 @@ export class Supervisor {
       const terminal = await this.finalizeSuccessfulOrFailed(
         claim,
         prepared,
+        executionTask,
+        executionQueue,
         implemented.result,
         implemented.sessionId,
         logPath,
         controller.signal,
+        eventBudget,
       );
       await this.completeClaim(claim, logPath, terminal.input, terminal.payload);
     } catch (error) {
@@ -435,6 +523,9 @@ export class Supervisor {
           providerSessionId:
             activePhase === "implement" ? persistedRun?.providerSessionId : undefined,
           requeue: shuttingDown,
+          inputTokens: eventBudget.inputTokens,
+          outputTokens: eventBudget.outputTokens,
+          costUsd: eventBudget.costUsd,
         },
         {
           message,
@@ -554,6 +645,21 @@ export class Supervisor {
               claim.leaseToken,
             );
           }
+          if (event.type === "usage") {
+            if (Number.isSafeInteger(event.inputTokens) && (event.inputTokens ?? 0) >= 0) {
+              input.eventBudget.inputTokens += event.inputTokens ?? 0;
+            }
+            if (Number.isSafeInteger(event.outputTokens) && (event.outputTokens ?? 0) >= 0) {
+              input.eventBudget.outputTokens += event.outputTokens ?? 0;
+            }
+            if (
+              event.costUsd !== undefined &&
+              Number.isFinite(event.costUsd) &&
+              event.costUsd >= 0
+            ) {
+              input.eventBudget.costUsd += event.costUsd;
+            }
+          }
           const storedEvent = boundedExecutorEvent(event);
           const eventBytes = Buffer.byteLength(JSON.stringify(storedEvent));
           if (
@@ -598,16 +704,27 @@ export class Supervisor {
   private async finalizeSuccessfulOrFailed(
     claim: TaskClaim,
     prepared: NonNullable<Awaited<ReturnType<typeof this.app.worktrees.prepare>>>,
+    task: Task,
+    queue: Queue,
     result: ExecutorResult,
     sessionId: string | undefined,
     logPath: string,
     signal: AbortSignal,
+    eventBudget: EventBudget,
   ): Promise<{ input: FinishRunInput; payload: Record<string, unknown> }> {
-    const { task, queue, run } = claim;
+    const { run } = claim;
+    const usage = {
+      inputTokens: eventBudget.inputTokens,
+      outputTokens: eventBudget.outputTokens,
+      costUsd: eventBudget.costUsd,
+    };
     if (result.status !== "succeeded") {
       const currentTask = this.app.store.getTask(task.id);
       const userCancelled = currentTask?.cancelRequestedAt !== undefined;
       const shuttingDown = this.shutdownRuns.has(run.id) && !userCancelled;
+      const partialChanges = await snapshotChangedFiles(prepared.worktreePath, prepared.baseSha, {
+        signal,
+      }).catch(() => undefined);
       return {
         input: {
           status: userCancelled
@@ -620,16 +737,98 @@ export class Supervisor {
           error: result.error,
           providerSessionId: sessionId,
           requeue: shuttingDown,
+          failureClass: userCancelled
+            ? "cancelled"
+            : shuttingDown || result.status === "cancelled"
+              ? "transient_infrastructure"
+              : "agent_failure",
+          changedFiles: partialChanges?.files.map((file) => file.path) ?? [],
+          ...usage,
         },
         payload: { summary: result.summary, message: result.error },
       };
     }
 
-    const verification = await this.app.worktrees.verify(
-      prepared.worktreePath,
-      queue.verifyCommands,
+    const changed = await snapshotChangedFiles(prepared.worktreePath, prepared.baseSha, {
       signal,
+    });
+    const changedPaths = changed.files.map((file) => file.path);
+    const policyPaths = changed.files.flatMap((file) =>
+      file.previousPath ? [file.previousPath, file.path] : [file.path],
     );
+    const effectivePolicy = resolveEffectiveScopePolicy(queue, task);
+    const policy = evaluateScopePolicy(effectivePolicy, policyPaths);
+    const verificationResults: VerificationResult[] = [];
+    const policyFinishedAt = new Date().toISOString();
+    const addPolicyResult = (
+      kind: Extract<
+        VerificationResult["kind"],
+        "allowed_paths" | "denied_paths" | "max_changed_files"
+      >,
+      enabled: boolean,
+      violationCodes: readonly string[],
+    ) => {
+      if (!enabled) return;
+      const violations = policy.violations.filter((violation) =>
+        violationCodes.includes(violation.code),
+      );
+      verificationResults.push({
+        kind,
+        status: violations.length > 0 ? "failed" : "passed",
+        summary:
+          violations.length > 0
+            ? violations.map((violation) => violation.message).join("; ")
+            : "Scope policy passed",
+        finishedAt: policyFinishedAt,
+      });
+    };
+    addPolicyResult("allowed_paths", effectivePolicy.allowPathGroups.length > 0, [
+      "outside_allowed_paths",
+      "invalid_changed_path",
+    ]);
+    addPolicyResult("denied_paths", effectivePolicy.deniedPaths.length > 0, [
+      "denied_path",
+      "invalid_changed_path",
+    ]);
+    addPolicyResult("max_changed_files", effectivePolicy.maxChangedFiles !== undefined, [
+      "max_changed_files",
+    ]);
+    await this.log(logPath, {
+      type: "policy.completed",
+      passed: policy.passed,
+      changedFiles: changed.files,
+      violations: policy.violations,
+    });
+    this.app.store.appendEvent({
+      taskId: task.id,
+      runId: run.id,
+      kind: "policy.completed",
+      payload: {
+        passed: policy.passed,
+        changedFiles: changed.files,
+        violations: policy.violations,
+      },
+    });
+    if (!policy.passed) {
+      const message = policy.violations.map((violation) => violation.message).join("; ");
+      return {
+        input: {
+          status: "failed",
+          summary: result.summary,
+          error: `Scope policy failed: ${message}`,
+          providerSessionId: sessionId,
+          failureClass: "policy_violation",
+          retryDisposition: "stop",
+          changedFiles: changedPaths,
+          verificationResults,
+          ...usage,
+        },
+        payload: { message: `Scope policy failed: ${message}`, violations: policy.violations },
+      };
+    }
+
+    const commands = [...queue.verifyCommands, ...task.verifyCommands];
+    const verification = await this.app.worktrees.verify(prepared.worktreePath, commands, signal);
     for (const check of verification) {
       await this.log(logPath, { type: "verification", ...check });
       this.app.store.appendEvent({
@@ -643,6 +842,14 @@ export class Supervisor {
           stderr: truncate(check.stderr),
         },
       });
+      verificationResults.push({
+        kind: "command",
+        status: check.exitCode === 0 ? "passed" : "failed",
+        command: check.command,
+        exitCode: check.exitCode,
+        summary: truncate(check.stderr || check.stdout),
+        finishedAt: new Date().toISOString(),
+      });
     }
     const failedCheck = verification.find((check) => check.exitCode !== 0);
     if (failedCheck) {
@@ -653,14 +860,60 @@ export class Supervisor {
           summary: result.summary,
           error: `Verification failed: ${failedCheck.command}`,
           providerSessionId: sessionId,
+          failureClass: "test_regression",
+          retryDisposition: "return_to_implementation",
+          changedFiles: changedPaths,
+          verificationResults,
+          ...usage,
         },
         payload: { message: `Verification failed: ${failedCheck.command}` },
       };
     }
 
-    const commitSha = queue.autoCommit
-      ? await this.app.worktrees.commitChanges(prepared.worktreePath, task)
+    const requiresResult = queue.autoCommit || task.landStrategy !== "none";
+    const commitSha = requiresResult
+      ? await this.app.worktrees.canonicalizeResult(
+          prepared.worktreePath,
+          prepared.baseSha,
+          task,
+          signal,
+        )
       : undefined;
+    if (!commitSha && task.landStrategy !== "none") {
+      const message = "A stack or merge-train task must produce a repository change";
+      return {
+        input: {
+          status: "failed",
+          summary: result.summary,
+          error: message,
+          providerSessionId: sessionId,
+          failureClass: "policy_violation",
+          retryDisposition: "stop",
+          changedFiles: changedPaths,
+          verificationResults,
+          ...usage,
+        },
+        payload: { message },
+      };
+    }
+    const resultRef = commitSha
+      ? (
+          await ensureImmutableResultRef(
+            prepared.repoRoot,
+            `refs/agentq/results/${task.id}/${run.id}`,
+            commitSha,
+            { signal },
+          )
+        ).refName
+      : undefined;
+    if (commitSha) {
+      verificationResults.push({
+        kind: "clean_worktree",
+        status: "passed",
+        summary: "Canonical result commit created with a clean worktree",
+        finishedAt: new Date().toISOString(),
+      });
+    }
     const summary = [
       result.summary,
       `Branch: ${prepared.branchName}`,
@@ -676,11 +929,17 @@ export class Supervisor {
         exitCode: result.exitCode,
         summary,
         providerSessionId: sessionId,
+        resultCommitSha: commitSha,
+        changedFiles: changedPaths,
+        verificationResults,
+        ...usage,
       },
       payload: {
         branchName: prepared.branchName,
         worktreePath: prepared.worktreePath,
         commitSha,
+        resultRef,
+        changedFiles: changed.files,
       },
     };
   }

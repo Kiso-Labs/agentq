@@ -195,6 +195,10 @@ export class AgentQApp implements UiController {
     const queue = input.queue || process.env.AGENTQ_QUEUE;
     if (!queue) throw new AgentQError("A queue is required", "QUEUE_REQUIRED");
     const resolvedQueue = await this.getQueue(queue);
+    const createdBaseSha = await this.worktrees.resolveBase(
+      resolvedQueue,
+      input.createdBaseSha ?? resolvedQueue.baseRef,
+    );
 
     const task = this.store.addTask(
       {
@@ -202,6 +206,7 @@ export class AgentQApp implements UiController {
         queue: resolvedQueue.id,
         parentTaskId,
         sourceKind,
+        createdBaseSha,
       },
       options,
     );
