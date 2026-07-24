@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentQStore } from "../src/store/index.ts";
@@ -55,6 +55,11 @@ async function repository(prefix: string): Promise<string> {
   await git(root, ["add", "README.md"]);
   await git(root, ["commit", "-m", "Initial fixture"]);
   return root;
+}
+
+async function executable(path: string, body: string): Promise<void> {
+  await writeFile(path, `#!/usr/bin/env bun\n${body}`);
+  await chmod(path, 0o755);
 }
 
 describe("agentq CLI", () => {
@@ -920,6 +925,103 @@ describe("agentq CLI", () => {
     expect(conflictingLimit.stderr).toContain(
       "either --max-changed-files or --clear-max-changed-files",
     );
+  });
+
+  test("lists and decides durable approval checkpoints before implementation", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-approvals-"));
+    roots.push(stateDir);
+    const repositoryRoot = await repository("agentq-approval-repo-");
+    const codex = join(stateDir, "fake-codex");
+    await executable(
+      codex,
+      `
+      const input = await Bun.stdin.text();
+      if (input.includes("You are the planning agent")) {
+        console.log(JSON.stringify({type:"thread.started",thread_id:"approval-plan"}));
+        console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:"Create approved.txt and verify the result."}}));
+      } else {
+        await Bun.write("approved.txt", "approved\\n");
+        console.log(JSON.stringify({type:"thread.started",thread_id:"approval-implementation"}));
+        console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:"Implemented after approval"}}));
+      }
+      console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:2,output_tokens:2}}));
+      `,
+    );
+    await cli(
+      stateDir,
+      ["queue", "create", "approval", "--checkpoint", "security-review", "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    const created = await cli(
+      stateDir,
+      ["task", "add", "Wait for security review", "--queue", "approval", "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    const taskId = (JSON.parse(created.stdout) as { id: string }).id;
+    const env = { AGENTQ_CODEX_BIN: codex };
+
+    const planned = await cli(
+      stateDir,
+      ["run", "approval", "--once"],
+      undefined,
+      repositoryRoot,
+      env,
+    );
+    expect(planned.exitCode).toBe(0);
+    const listed = await cli(
+      stateDir,
+      ["task", "approvals", taskId, "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    expect(JSON.parse(listed.stdout)).toMatchObject([
+      { checkpoint: "security-review", status: "pending" },
+    ]);
+
+    const approved = await cli(
+      stateDir,
+      [
+        "task",
+        "approve",
+        taskId,
+        "security-review",
+        "--actor",
+        "release-manager",
+        "--note",
+        "Reviewed",
+        "--json",
+      ],
+      undefined,
+      repositoryRoot,
+    );
+    expect(approved.exitCode).toBe(0);
+    expect(JSON.parse(approved.stdout)).toMatchObject({
+      checkpoint: "security-review",
+      status: "approved",
+      actor: "release-manager",
+      note: "Reviewed",
+    });
+
+    const implemented = await cli(
+      stateDir,
+      ["run", "approval", "--once"],
+      undefined,
+      repositoryRoot,
+      env,
+    );
+    expect(implemented.exitCode).toBe(0);
+    const shown = await cli(
+      stateDir,
+      ["task", "show", taskId, "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    expect(JSON.parse(shown.stdout)).toMatchObject({
+      status: "succeeded",
+      deliveryStatus: "ready_to_integrate",
+    });
   });
 
   test("renders a stable repository task dependency graph with an optional queue filter", async () => {

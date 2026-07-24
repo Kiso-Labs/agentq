@@ -489,6 +489,70 @@ task
   });
 
 task
+  .command("approvals")
+  .description("List durable approval checkpoints for a task")
+  .argument("<task-id>")
+  .option("--json", "print machine-readable JSON")
+  .action(async (taskId, options) => {
+    await withApp(async (app) => {
+      const approvals = await app.listTaskApprovals(taskId);
+      if (options.json) return printJson(approvals);
+      if (approvals.length === 0) return console.log("No approval checkpoints.");
+      console.log("CHECKPOINT\tSTATUS\tACTOR\tDECIDED");
+      for (const approval of approvals) {
+        console.log(
+          [
+            human(approval.checkpoint),
+            approval.status,
+            approval.actor ? human(approval.actor) : "-",
+            approval.decidedAt ?? "-",
+          ].join("\t"),
+        );
+      }
+    });
+  });
+
+task
+  .command("approve")
+  .description("Approve a pending task checkpoint")
+  .argument("<task-id>")
+  .argument("<checkpoint>")
+  .option("--actor <name>", "record who approved the checkpoint", "cli")
+  .option("--note <text>", "record an approval note")
+  .option("--json", "print machine-readable JSON")
+  .action(async (taskId, checkpoint, options) => {
+    await withApp(async (app) => {
+      const approval = await app.approveTaskCheckpoint(taskId, checkpoint, {
+        actor: options.actor,
+        note: options.note,
+      });
+      print(approval, options.json, `Approved ${human(checkpoint)} for ${human(taskId)}`);
+    });
+  });
+
+task
+  .command("reject")
+  .description("Reject a pending task checkpoint and stop the task")
+  .argument("<task-id>")
+  .argument("<checkpoint>")
+  .option("--actor <name>", "record who rejected the checkpoint", "cli")
+  .option("--note <text>", "record why the checkpoint was rejected")
+  .option("--yes", "confirm checkpoint rejection")
+  .option("--json", "print machine-readable JSON")
+  .action(async (taskId, checkpoint, options) => {
+    if (!options.yes) {
+      throw new AgentQError("Checkpoint rejection requires --yes", "CONFIRMATION_REQUIRED", 2);
+    }
+    await withApp(async (app) => {
+      const approval = await app.rejectTaskCheckpoint(taskId, checkpoint, {
+        actor: options.actor,
+        note: options.note,
+      });
+      print(approval, options.json, `Rejected ${human(checkpoint)} for ${human(taskId)}`);
+    });
+  });
+
+task
   .command("edit")
   .description("Edit a queued or retryable task")
   .argument("<task-id>")

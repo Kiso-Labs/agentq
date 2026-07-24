@@ -15,6 +15,7 @@ import {
   type Queue,
   type Run,
   type Task,
+  type TaskApproval,
   type TaskEvent,
 } from "./core/types.ts";
 import { createExecutorMap } from "./executors/index.ts";
@@ -280,6 +281,33 @@ export class AgentQApp implements UiController {
   async listRuns(taskId: string): Promise<Run[]> {
     await this.getTask(taskId);
     return this.store.listRuns({ taskId });
+  }
+
+  async listTaskApprovals(taskId: string): Promise<TaskApproval[]> {
+    await this.getTask(taskId);
+    return this.store.listTaskApprovals(taskId);
+  }
+
+  async approveTaskCheckpoint(
+    taskId: string,
+    checkpoint: string,
+    input: { actor?: string; note?: string } = {},
+  ): Promise<TaskApproval> {
+    await this.getTask(taskId);
+    const approval = this.store.approveTaskCheckpoint(taskId, checkpoint, input);
+    this.notify();
+    return approval;
+  }
+
+  async rejectTaskCheckpoint(
+    taskId: string,
+    checkpoint: string,
+    input: { actor?: string; note?: string } = {},
+  ): Promise<TaskApproval> {
+    await this.getTask(taskId);
+    const approval = this.store.rejectTaskCheckpoint(taskId, checkpoint, input);
+    this.notify();
+    return approval;
   }
 
   async cancelTask(taskId: string): Promise<void> {
