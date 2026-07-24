@@ -599,6 +599,7 @@ describe("agentq CLI", () => {
         "--clear-verify",
         "--clear-allowed-paths",
         "--clear-denied-paths",
+        "--clear-max-changed-files",
         "--clear-checkpoints",
         "--no-auto-land",
         "--file-concurrency",
@@ -617,12 +618,12 @@ describe("agentq CLI", () => {
       verifyCommands: [],
       allowedPaths: [],
       deniedPaths: [],
-      maxChangedFiles: 11,
       approvalCheckpoints: [],
       autoLand: false,
       fileConcurrency: "off",
       autoCommit: true,
     });
+    expect(JSON.parse(reset.stdout).maxChangedFiles).toBeUndefined();
 
     const conflicting = await cli(
       stateDir,
@@ -632,6 +633,17 @@ describe("agentq CLI", () => {
     );
     expect(conflicting.exitCode).toBe(2);
     expect(conflicting.stderr).toContain("either --verify or --clear-verify");
+
+    const conflictingLimit = await cli(
+      stateDir,
+      ["queue", "edit", "delivery", "--max-changed-files", "2", "--clear-max-changed-files"],
+      undefined,
+      repositoryRoot,
+    );
+    expect(conflictingLimit.exitCode).toBe(2);
+    expect(conflictingLimit.stderr).toContain(
+      "either --max-changed-files or --clear-max-changed-files",
+    );
 
     const workflowConflicts = [
       ["--plan-model", "gpt-planner", "--clear-plan-model"],
@@ -876,6 +888,7 @@ describe("agentq CLI", () => {
         "--clear-allowed-paths",
         "--clear-denied-paths",
         "--clear-expected-paths",
+        "--clear-max-changed-files",
         "--clear-verify",
         "--clear-checkpoints",
         "--clear-handoff",
@@ -895,7 +908,18 @@ describe("agentq CLI", () => {
       approvalCheckpoints: [],
       handoffRequirements: [],
     });
-    expect(JSON.parse(cleared.stdout).maxChangedFiles).toBe(9);
+    expect(JSON.parse(cleared.stdout).maxChangedFiles).toBeUndefined();
+
+    const conflictingLimit = await cli(
+      stateDir,
+      ["task", "edit", taskId, "--max-changed-files", "3", "--clear-max-changed-files"],
+      undefined,
+      repositoryRoot,
+    );
+    expect(conflictingLimit.exitCode).toBe(2);
+    expect(conflictingLimit.stderr).toContain(
+      "either --max-changed-files or --clear-max-changed-files",
+    );
   });
 
   test("renders a stable repository task dependency graph with an optional queue filter", async () => {

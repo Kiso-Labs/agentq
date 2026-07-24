@@ -143,6 +143,7 @@ queue
     "replace the maximum number of changed files",
     positiveInteger,
   )
+  .option("--clear-max-changed-files", "remove the changed-file limit")
   .option("--checkpoint <name>", "replace approval checkpoints; repeatable", collectOptional)
   .option("--clear-checkpoints", "remove all approval checkpoints")
   .option(
@@ -204,6 +205,13 @@ queue
         2,
       );
     }
+    if (options.maxChangedFiles !== undefined && options.clearMaxChangedFiles) {
+      throw new AgentQError(
+        "Use either --max-changed-files or --clear-max-changed-files, not both",
+        "INVALID_QUEUE_EDIT",
+        2,
+      );
+    }
     const listConflicts = [
       [options.allowPath, options.clearAllowedPaths, "--allow-path", "--clear-allowed-paths"],
       [options.denyPath, options.clearDeniedPaths, "--deny-path", "--clear-denied-paths"],
@@ -236,7 +244,9 @@ queue
       verifyCommands: options.clearVerify ? [] : (options.verify as string[] | undefined),
       allowedPaths: options.clearAllowedPaths ? [] : (options.allowPath as string[] | undefined),
       deniedPaths: options.clearDeniedPaths ? [] : (options.denyPath as string[] | undefined),
-      maxChangedFiles: options.maxChangedFiles as number | undefined,
+      maxChangedFiles: options.clearMaxChangedFiles
+        ? null
+        : (options.maxChangedFiles as number | undefined),
       approvalCheckpoints: options.clearCheckpoints
         ? []
         : (options.checkpoint as string[] | undefined),
@@ -500,6 +510,7 @@ task
     "replace the maximum number of changed files",
     positiveInteger,
   )
+  .option("--clear-max-changed-files", "remove the task-specific changed-file limit")
   .option("--verify <command>", "replace task-specific verification commands", collectOptional)
   .option("--clear-verify", "remove all task-specific verification commands")
   .option("--checkpoint <name>", "replace approval checkpoints; repeatable", collectOptional)
@@ -546,6 +557,13 @@ task
         2,
       );
     }
+    if (options.maxChangedFiles !== undefined && options.clearMaxChangedFiles) {
+      throw new AgentQError(
+        "Use either --max-changed-files or --clear-max-changed-files, not both",
+        "INVALID_TASK_EDIT",
+        2,
+      );
+    }
     const patch = {
       title: options.title as string | undefined,
       instructions: options.instructions as string | undefined,
@@ -558,7 +576,9 @@ task
       expectedPaths: options.clearExpectedPaths
         ? []
         : (options.expectedPath as string[] | undefined),
-      maxChangedFiles: options.maxChangedFiles as number | undefined,
+      maxChangedFiles: options.clearMaxChangedFiles
+        ? null
+        : (options.maxChangedFiles as number | undefined),
       verifyCommands: options.clearVerify ? [] : (options.verify as string[] | undefined),
       approvalCheckpoints: options.clearCheckpoints
         ? []
