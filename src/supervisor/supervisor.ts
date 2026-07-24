@@ -870,7 +870,13 @@ export class Supervisor {
       };
     }
 
-    const requiresResult = queue.autoCommit || task.landStrategy !== "none";
+    // A dependency edge is an executable Git relationship, not just metadata.
+    // Even when queue auto-commit is disabled, blockers must publish an
+    // immutable commit that their dependents can use as an exact base.
+    const requiresResult =
+      queue.autoCommit ||
+      task.landStrategy !== "none" ||
+      this.app.store.listTaskDependents(task.id).length > 0;
     const commitSha = requiresResult
       ? await this.app.worktrees.canonicalizeResult(
           prepared.worktreePath,
@@ -879,8 +885,11 @@ export class Supervisor {
           signal,
         )
       : undefined;
-    if (!commitSha && task.landStrategy !== "none") {
-      const message = "A stack or merge-train task must produce a repository change";
+    if (!commitSha && requiresResult) {
+      const message =
+        task.landStrategy !== "none"
+          ? "A stack or merge-train task must produce a repository change"
+          : "A task with dependents must produce a repository change";
       return {
         input: {
           status: "failed",

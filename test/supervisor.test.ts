@@ -780,6 +780,61 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     app.close();
   });
 
+  test("publishes a blocker result even when queue auto-commit is disabled", async () => {
+    const { root, repo, app } = await setup();
+    const codex = join(root, "codex");
+    await executable(
+      codex,
+      `
+      ${codexPlanningGate("Create the dependency output consumed by the downstream task.")}
+      await Bun.write("dependency-output.txt", "ready\\n");
+      console.log(JSON.stringify({type:"thread.started",thread_id:"dependency-result"}));
+      console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:"Produced dependency output"}}));
+      console.log(JSON.stringify({type:"turn.completed",usage:{input_tokens:2,output_tokens:2}}));
+      `,
+    );
+    process.env.AGENTQ_CODEX_BIN = codex;
+    const queue = await app.createQueue({
+      name: "dependency-result",
+      repoPath: repo,
+      maxAttempts: 1,
+      autoCommit: false,
+    });
+    const blocker = await app.addTask({
+      queue: queue.id,
+      title: "Produce dependency output",
+    });
+    const dependent = await app.addTask({
+      queue: queue.id,
+      title: "Consume dependency output later",
+      blockedBy: [blocker.id],
+    });
+    await app.cancelTask(dependent.id);
+
+    await new Supervisor(app, { pollIntervalMs: 20 }).run({ once: true });
+
+    const stored = app.store.getTask(blocker.id);
+    const run = app.store.listRuns({ taskId: blocker.id })[0];
+    expect(stored).toMatchObject({
+      status: "succeeded",
+      deliveryStatus: "ready_to_integrate",
+      changedFiles: ["dependency-output.txt"],
+    });
+    expect(stored?.resultCommitSha).toBeString();
+    expect(run?.resultCommitSha).toBe(stored?.resultCommitSha);
+    expect(
+      (
+        await runCommand("git", [
+          "-C",
+          repo,
+          "rev-parse",
+          `refs/agentq/results/${blocker.id}/${run?.id}`,
+        ])
+      ).stdout.trim(),
+    ).toBe(stored?.resultCommitSha);
+    app.close();
+  });
+
   test("observes cross-process cancellation and terminates the running agent", async () => {
     const { root, repo, app } = await setup();
     const codex = join(root, "codex");
