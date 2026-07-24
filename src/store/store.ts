@@ -4675,6 +4675,25 @@ export class AgentQStore {
             task.id,
           ],
         );
+      } else if (
+        task.status === "succeeded" &&
+        (task.deliveryStatus === "ready_to_integrate" || task.deliveryStatus === "integrated")
+      ) {
+        this.#database.run(
+          `
+            UPDATE tasks
+            SET current_phase = 'approval', blocked_reason = ?,
+                failure_class = 'blocked_dependency', failure_reason = ?,
+                retry_disposition = 'wait', updated_at = ?
+            WHERE id = ? AND status = 'succeeded'
+          `,
+          [
+            `Waiting for approval: ${checkpoint}`,
+            `Approval checkpoint ${checkpoint} is pending`,
+            requestedAt,
+            task.id,
+          ],
+        );
       }
       return this.#requireTaskApproval(task.id, checkpoint);
     });
@@ -5010,50 +5029,99 @@ export class AgentQStore {
               "pending count",
             )
           : 0;
-      const taskChanged =
-        decision === "approved"
-          ? this.#database.run(
-              `
-                UPDATE tasks
-                SET current_phase = ?,
-                    blocked_reason = ?,
-                    failure_class = ?,
-                    failure_reason = ?,
-                    retry_disposition = ?,
-                    updated_at = ?
-                WHERE id = ? AND status = 'queued'
-                  AND current_phase = 'approval'
-              `,
-              [
-                pendingApprovals > 0 ? "approval" : task.resumeRunId ? "implement" : "queued",
-                pendingApprovals > 0
-                  ? `Waiting for ${pendingApprovals} approval checkpoint${pendingApprovals === 1 ? "" : "s"}`
-                  : null,
-                pendingApprovals > 0 ? "blocked_dependency" : null,
-                pendingApprovals > 0 ? "One or more approval checkpoints are pending" : null,
-                pendingApprovals > 0 ? "wait" : null,
-                decidedAt,
-                task.id,
-              ],
-            ).changes
-          : this.#database.run(
-              `
-                UPDATE tasks
-                SET status = 'failed', current_phase = 'complete',
-                    blocked_reason = NULL, failure_class = 'policy_violation',
-                    failure_reason = ?, retry_disposition = 'stop',
-                    resume_run_id = NULL, completed_at = ?, updated_at = ?
-                WHERE id = ? AND status = 'queued' AND current_phase = 'approval'
-              `,
-              [
-                note
-                  ? `Approval checkpoint ${checkedCheckpoint} rejected: ${note}`
-                  : `Approval checkpoint ${checkedCheckpoint} rejected`,
-                decidedAt,
-                decidedAt,
-                task.id,
-              ],
-            ).changes;
+      let taskChanged: number;
+      if (task.status === "queued") {
+        taskChanged =
+          decision === "approved"
+            ? this.#database.run(
+                `
+                  UPDATE tasks
+                  SET current_phase = ?,
+                      blocked_reason = ?,
+                      failure_class = ?,
+                      failure_reason = ?,
+                      retry_disposition = ?,
+                      updated_at = ?
+                  WHERE id = ? AND status = 'queued'
+                    AND current_phase = 'approval'
+                `,
+                [
+                  pendingApprovals > 0 ? "approval" : task.resumeRunId ? "implement" : "queued",
+                  pendingApprovals > 0
+                    ? `Waiting for ${pendingApprovals} approval checkpoint${pendingApprovals === 1 ? "" : "s"}`
+                    : null,
+                  pendingApprovals > 0 ? "blocked_dependency" : null,
+                  pendingApprovals > 0 ? "One or more approval checkpoints are pending" : null,
+                  pendingApprovals > 0 ? "wait" : null,
+                  decidedAt,
+                  task.id,
+                ],
+              ).changes
+            : this.#database.run(
+                `
+                  UPDATE tasks
+                  SET status = 'failed', current_phase = 'complete',
+                      blocked_reason = NULL, failure_class = 'policy_violation',
+                      failure_reason = ?, retry_disposition = 'stop',
+                      resume_run_id = NULL, completed_at = ?, updated_at = ?
+                  WHERE id = ? AND status = 'queued' AND current_phase = 'approval'
+                `,
+                [
+                  note
+                    ? `Approval checkpoint ${checkedCheckpoint} rejected: ${note}`
+                    : `Approval checkpoint ${checkedCheckpoint} rejected`,
+                  decidedAt,
+                  decidedAt,
+                  task.id,
+                ],
+              ).changes;
+      } else if (task.status === "succeeded") {
+        const resumedPhase = task.deliveryStatus === "integrated" ? "land" : "integrate";
+        taskChanged =
+          decision === "approved"
+            ? this.#database.run(
+                `
+                  UPDATE tasks
+                  SET current_phase = ?, blocked_reason = ?,
+                      failure_class = ?, failure_reason = ?,
+                      retry_disposition = ?, updated_at = ?
+                  WHERE id = ? AND status = 'succeeded'
+                    AND current_phase = 'approval'
+                `,
+                [
+                  pendingApprovals > 0 ? "approval" : resumedPhase,
+                  pendingApprovals > 0
+                    ? `Waiting for ${pendingApprovals} approval checkpoint${pendingApprovals === 1 ? "" : "s"}`
+                    : null,
+                  pendingApprovals > 0 ? "blocked_dependency" : null,
+                  pendingApprovals > 0 ? "One or more approval checkpoints are pending" : null,
+                  pendingApprovals > 0 ? "wait" : null,
+                  decidedAt,
+                  task.id,
+                ],
+              ).changes
+            : this.#database.run(
+                `
+                  UPDATE tasks
+                  SET status = 'failed', current_phase = 'complete',
+                      blocked_reason = NULL, failure_class = 'policy_violation',
+                      failure_reason = ?, retry_disposition = 'stop',
+                      completed_at = ?, updated_at = ?
+                  WHERE id = ? AND status = 'succeeded'
+                    AND current_phase = 'approval'
+                `,
+                [
+                  note
+                    ? `Approval checkpoint ${checkedCheckpoint} rejected: ${note}`
+                    : `Approval checkpoint ${checkedCheckpoint} rejected`,
+                  decidedAt,
+                  decidedAt,
+                  task.id,
+                ],
+              ).changes;
+      } else {
+        taskChanged = 0;
+      }
       if (taskChanged !== 1) {
         throw new AgentQError(
           `Task ${task.id} is no longer waiting at ${checkedCheckpoint}`,

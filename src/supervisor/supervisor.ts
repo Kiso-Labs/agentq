@@ -152,15 +152,21 @@ export class Supervisor {
         }
         await this.intake.drain();
         await this.cancelRequestedRuns();
+        const repoKey =
+          typeof this.options.repoKey === "function"
+            ? this.options.repoKey()
+            : this.options.repoKey;
+        const delivered = await this.app.processReadyDeliveries({
+          ...(this.options.queue ? { queue: this.options.queue } : {}),
+          ...(repoKey ? { repoKey } : {}),
+          ...(signal ? { signal } : {}),
+        });
         let claimed = false;
 
         while (!this.stopping && this.active.size < maxConcurrency) {
           const claim = this.app.store.claimNextTask({
             queue: this.options.queue,
-            repoKey:
-              typeof this.options.repoKey === "function"
-                ? this.options.repoKey()
-                : this.options.repoKey,
+            repoKey,
             ownerToken: `${this.ownerPrefix}-${randomUUID()}`,
             ownerPid: process.pid,
             maxConcurrency,
@@ -190,7 +196,7 @@ export class Supervisor {
           this.app.notify();
         }
 
-        if (options.once && !claimed && this.active.size === 0) break;
+        if (options.once && !claimed && !delivered && this.active.size === 0) break;
         await Promise.race([
           Bun.sleep(pollIntervalMs),
           ...[...this.active.values()].map(({ promise }) => promise),
