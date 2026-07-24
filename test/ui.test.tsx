@@ -1,10 +1,19 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, render } from "ink-testing-library";
-import type { AddTaskInput, Queue, Run, Task, TaskEvent } from "../src/core/types.ts";
+import type {
+  AddTaskInput,
+  DeliveryOperation,
+  IntegrationLane,
+  Queue,
+  Run,
+  Task,
+  TaskApproval,
+  TaskEvent,
+} from "../src/core/types.ts";
 import { activityEntries } from "../src/ui/activity.ts";
 import { AgentqApp } from "../src/ui/app.tsx";
 import { sanitizeTerminalText } from "../src/ui/sanitize.ts";
-import type { UiController, UiTaskPatch } from "../src/ui/types.ts";
+import type { UiController, UiQueueDelivery, UiTaskPatch } from "../src/ui/types.ts";
 
 const NOW = "2026-07-21T12:00:00.000Z";
 
@@ -125,12 +134,86 @@ const run = (overrides: Partial<Run> = {}): Run => ({
   ...overrides,
 });
 
+const approval = (overrides: Partial<TaskApproval> = {}): TaskApproval => ({
+  taskId: "task-1",
+  checkpoint: "red-tests",
+  status: "pending",
+  runId: "run-1",
+  requestedAt: NOW,
+  ...overrides,
+});
+
+const queueDelivery = (overrides: Partial<UiQueueDelivery> = {}): UiQueueDelivery => ({
+  queue: queue(),
+  tasks: [],
+  artifacts: [],
+  operations: [],
+  ...overrides,
+});
+
+const integrationLane = (overrides: Partial<IntegrationLane> = {}): IntegrationLane => ({
+  id: "lane-main",
+  repoKey: "/code/agentq/.git",
+  repoPath: "/code/agentq",
+  targetRef: "refs/heads/main",
+  trainRef: "refs/agentq/train/main",
+  targetBaseSha: "target-base-sha",
+  headSha: "train-head-sha",
+  generation: 2,
+  createdAt: NOW,
+  updatedAt: NOW,
+  ...overrides,
+});
+
+const deliveryOperation = (overrides: Partial<DeliveryOperation> = {}): DeliveryOperation => ({
+  id: "delivery-op-1",
+  laneId: "lane-main",
+  taskId: "task-1",
+  artifactId: "artifact-1",
+  kind: "integrate",
+  status: "succeeded",
+  fenceToken: 1,
+  candidateSha: "integrated-sha",
+  conflictFiles: [],
+  createdAt: NOW,
+  finishedAt: NOW,
+  ...overrides,
+});
+
 const createController = (overrides: Partial<UiController> = {}): UiController => {
   const controller: UiController = {
     listQueues: mock(async () => [queue()]),
     listTasks: mock(async () => [task()]),
     listRuns: mock(async () => []),
     listEvents: mock(async () => [event()]),
+    listTaskApprovals: mock(async () => []),
+    approveTaskCheckpoint: mock(async (taskId, checkpoint, input = {}) =>
+      approval({
+        taskId,
+        checkpoint,
+        status: "approved",
+        actor: input.actor,
+        note: input.note,
+        decidedAt: NOW,
+      }),
+    ),
+    rejectTaskCheckpoint: mock(async (taskId, checkpoint, input = {}) =>
+      approval({
+        taskId,
+        checkpoint,
+        status: "rejected",
+        actor: input.actor,
+        note: input.note,
+        decidedAt: NOW,
+      }),
+    ),
+    integrateTask: mock(async () => {
+      throw new Error("Integration was not configured for this test.");
+    }),
+    landQueue: mock(async () => {
+      throw new Error("Landing was not configured for this test.");
+    }),
+    getQueueDelivery: mock(async () => queueDelivery()),
     createQueue: mock(async (input) =>
       queue({
         name: input.name,
@@ -599,6 +682,195 @@ describe("AgentqApp", () => {
     expect(frame).toContain("1 passed · 1 failed");
     expect(frame).toContain("FAILED · Denied path guard");
     expect(frame).toContain("1,234 in / 567 out · $0.04");
+  });
+
+  test("reviews, approves, and rejects durable task checkpoints", async () => {
+    let checkpointApprovals = [
+      approval({ checkpoint: "red-tests" }),
+      approval({ checkpoint: "integration" }),
+    ];
+    const approveTaskCheckpoint = mock(
+      async (taskId: string, checkpoint: string, input: { actor?: string; note?: string } = {}) => {
+        const decided = approval({
+          taskId,
+          checkpoint,
+          status: "approved",
+          actor: input.actor,
+          note: input.note,
+          decidedAt: NOW,
+        });
+        checkpointApprovals = checkpointApprovals.map((item) =>
+          item.checkpoint === checkpoint ? decided : item,
+        );
+        return decided;
+      },
+    );
+    const rejectTaskCheckpoint = mock(
+      async (taskId: string, checkpoint: string, input: { actor?: string; note?: string } = {}) => {
+        const decided = approval({
+          taskId,
+          checkpoint,
+          status: "rejected",
+          actor: input.actor,
+          note: input.note,
+          decidedAt: NOW,
+        });
+        checkpointApprovals = checkpointApprovals.map((item) =>
+          item.checkpoint === checkpoint ? decided : item,
+        );
+        return decided;
+      },
+    );
+    const view = render(
+      <AgentqApp
+        controller={createController({
+          listTasks: mock(async () => [task({ currentPhase: "approval", status: "running" })]),
+          listTaskApprovals: mock(async () => checkpointApprovals),
+          approveTaskCheckpoint,
+          rejectTaskCheckpoint,
+        })}
+        dimensions={{ columns: 120, rows: 34 }}
+      />,
+    );
+    await waitForFrame(view.lastFrame, "Approval: 2 pending");
+
+    view.stdin.write("p");
+    await waitForFrame(view.lastFrame, "TASK APPROVALS");
+    expect(view.lastFrame()).toContain("[PENDING] red-tests");
+    expect(view.lastFrame()).toContain("[PENDING] integration");
+
+    view.stdin.write("a");
+    await waitForFrame(view.lastFrame, "APPROVE CHECKPOINT?");
+    expect(view.lastFrame()).toContain("red-tests");
+    view.stdin.write("luke");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("Red tests reviewed");
+    await settle();
+    view.stdin.write("\u0013");
+    await waitForFrame(view.lastFrame, "Approved red-tests.");
+    expect(approveTaskCheckpoint).toHaveBeenCalledWith("task-1", "red-tests", {
+      actor: "luke",
+      note: "Red tests reviewed",
+    });
+
+    view.stdin.write("\u001B[B");
+    await settle();
+    view.stdin.write("r");
+    await waitForFrame(view.lastFrame, "REJECT CHECKPOINT?");
+    expect(view.lastFrame()).toContain("integration");
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("Integration evidence is incomplete");
+    await settle();
+    view.stdin.write("\u0013");
+    await waitForFrame(view.lastFrame, "Rejected integration.");
+    expect(rejectTaskCheckpoint).toHaveBeenCalledWith("task-1", "integration", {
+      note: "Integration evidence is incomplete",
+    });
+  });
+
+  test("confirms and integrates a verified task result through the real controller", async () => {
+    let selected = task({
+      status: "succeeded",
+      currentPhase: "integrate",
+      deliveryStatus: "ready_to_integrate",
+      resultRunId: "run-1",
+      resultCommitSha: "verified-result-sha",
+      verificationResults: [{ kind: "command", status: "passed", command: "bun test" }],
+    });
+    const integrateTask = mock(async () => {
+      selected = task({
+        ...selected,
+        deliveryStatus: "integrated",
+        integratedSha: "integrated-sha",
+      });
+      return {
+        status: "integrated",
+        laneId: "lane-main",
+        artifactId: "artifact-1",
+        previousTrainSha: "train-before-sha",
+        integratedSha: "integrated-sha",
+        changedFiles: [],
+        scopeEvaluation: {},
+        verificationResults: [],
+      } as never;
+    });
+    const view = render(
+      <AgentqApp
+        controller={createController({
+          listTasks: mock(async () => [selected]),
+          integrateTask,
+        })}
+        dimensions={{ columns: 120, rows: 30 }}
+      />,
+    );
+    await waitForFrame(view.lastFrame, "delivery READY TO INTEGRATE");
+
+    view.stdin.write("i");
+    await waitForFrame(view.lastFrame, "INTEGRATE TASK RESULT?");
+    expect(view.lastFrame()).toContain("Result: verified-result-sha");
+    expect(integrateTask).not.toHaveBeenCalled();
+    view.stdin.write("y");
+    await waitForFrame(view.lastFrame, "Integrated Fix session redirect at integrated-sha.");
+
+    expect(integrateTask).toHaveBeenCalledWith("task-1");
+  });
+
+  test("shows lane operations and confirms landing the selected queue", async () => {
+    let selected = task({
+      status: "succeeded",
+      currentPhase: "land",
+      deliveryStatus: "integrated",
+      resultCommitSha: "verified-result-sha",
+      integratedSha: "integrated-sha",
+    });
+    const lane = integrationLane();
+    const landQueue = mock(async () => {
+      selected = task({
+        ...selected,
+        currentPhase: "complete",
+        deliveryStatus: "landed",
+        landedSha: "landed-sha",
+      });
+      return {
+        status: "landed",
+        laneId: lane.id,
+        previousSha: lane.targetBaseSha,
+        landedSha: "landed-sha",
+        artifactIds: ["artifact-1"],
+      } as never;
+    });
+    const getQueueDelivery = mock(async () =>
+      queueDelivery({
+        lane,
+        tasks: [selected],
+        operations: [deliveryOperation()],
+      }),
+    );
+    const view = render(
+      <AgentqApp
+        controller={createController({
+          listTasks: mock(async () => [selected]),
+          landQueue,
+          getQueueDelivery,
+        })}
+        dimensions={{ columns: 140, rows: 34 }}
+      />,
+    );
+    const frame = await waitForFrame(view.lastFrame, "Delivery op: INTEGRATE SUCCEEDED");
+    expect(frame).toContain("Lane: refs/agentq/train/main · generation 2");
+    expect(frame).toContain("delivery-op-1");
+
+    view.stdin.write("L");
+    await waitForFrame(view.lastFrame, "LAND QUEUE?");
+    expect(view.lastFrame()).toContain("refs/agentq/train/main → main");
+    expect(landQueue).not.toHaveBeenCalled();
+    view.stdin.write("y");
+    await waitForFrame(view.lastFrame, "Landed main at landed-sha.");
+
+    expect(landQueue).toHaveBeenCalledWith("queue-main");
   });
 
   test("uses tab and arrows to navigate a narrow one-pane layout", async () => {
@@ -2030,9 +2302,11 @@ describe("AgentqApp", () => {
     expect(actions).toContain("Resume selected task");
     expect(actions).toContain("Integrate both providers");
     expect(actions).toContain("Doctor & providers");
+    expect(actions).toContain("View task approvals");
     expect(actions).toContain("× Approve current checkpoint");
+    expect(actions).toContain("× Reject current checkpoint");
     expect(actions).toContain("× Integrate selected task result");
-    expect(actions).toContain("× Land selected task result");
+    expect(actions).toContain("× Land selected queue");
 
     view.stdin.write("\u001B[B");
     await settle();

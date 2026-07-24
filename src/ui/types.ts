@@ -1,10 +1,15 @@
+import type { QueueLandingOutcome, TaskIntegrationOutcome } from "../app.ts";
 import type {
   AddTaskInput,
   CreateQueueInput,
+  DeliveryOperation,
+  IntegrationLane,
   Provider,
   Queue,
   Run,
   Task,
+  TaskApproval,
+  TaskArtifact,
   TaskEvent,
 } from "../core/types.ts";
 import type { IntegrationResult, IntegrationTarget } from "../integrations/instructions.ts";
@@ -89,6 +94,14 @@ export interface UiCleanResult {
   removedWorktree: string;
 }
 
+export interface UiQueueDelivery {
+  queue: Queue;
+  lane?: IntegrationLane;
+  tasks: Task[];
+  artifacts: TaskArtifact[];
+  operations: DeliveryOperation[];
+}
+
 /**
  * Narrow control-plane surface consumed by the TUI.
  *
@@ -101,6 +114,20 @@ export interface UiController {
   listTasks(queueId?: string): Promise<Task[]>;
   listRuns(taskId: string): Promise<Run[]>;
   listEvents(taskId: string, options?: ListEventOptions): Promise<TaskEvent[]>;
+  listTaskApprovals(taskId: string): Promise<TaskApproval[]>;
+  approveTaskCheckpoint(
+    taskId: string,
+    checkpoint: string,
+    input?: { actor?: string; note?: string },
+  ): Promise<TaskApproval>;
+  rejectTaskCheckpoint(
+    taskId: string,
+    checkpoint: string,
+    input?: { actor?: string; note?: string },
+  ): Promise<TaskApproval>;
+  integrateTask(taskId: string, signal?: AbortSignal): Promise<TaskIntegrationOutcome>;
+  landQueue(queueIdOrName: string, signal?: AbortSignal): Promise<QueueLandingOutcome>;
+  getQueueDelivery(queueIdOrName: string): Promise<UiQueueDelivery>;
   createQueue(input: UiCreateQueueInput): Promise<Queue>;
   updateQueue(queueId: string, patch: UiQueuePatch): Promise<Queue>;
   deleteQueue(queueId: string): Promise<void>;

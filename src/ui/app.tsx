@@ -16,6 +16,7 @@ import {
   type Run,
   TASK_STATUSES,
   type Task,
+  type TaskApproval,
   type TaskEvent,
 } from "../core/types.ts";
 import type { IntegrationResult, IntegrationTarget } from "../integrations/instructions.ts";
@@ -30,6 +31,7 @@ import type {
   AgentqAppProps,
   UiContext,
   UiDoctorCheck,
+  UiQueueDelivery,
   UiQueuePatch,
   UiTaskPatch,
 } from "./types.ts";
@@ -44,6 +46,8 @@ type ScreenMode =
   | "actions"
   | "confirm"
   | "attempts"
+  | "approvals"
+  | "approval-form"
   | "doctor"
   | "integration-results";
 
@@ -82,6 +86,16 @@ interface AddDraft extends TaskDraftFields {
 interface EditDraft extends TaskDraftFields {
   taskId: string;
   expectedUpdatedAt: string;
+}
+
+interface ApprovalDraft {
+  taskId: string;
+  checkpoint: string;
+  decision: "approve" | "reject";
+  actor: string;
+  note: string;
+  field: 0 | 1;
+  error?: string;
 }
 
 type TaskDraftTextKey =
@@ -553,7 +567,9 @@ type Confirmation =
   | { kind: "delete-queue"; queue: Queue }
   | { kind: "delete-task"; task: Task }
   | { kind: "clean"; task: Task; force: boolean }
-  | { kind: "integration"; target: IntegrationTarget; repoPath: string };
+  | { kind: "integration"; target: IntegrationTarget; repoPath: string }
+  | { kind: "integrate-task"; task: Task }
+  | { kind: "land-queue"; queue: Queue };
 
 type ActionId =
   | "create-queue"
@@ -579,9 +595,11 @@ type ActionId =
   | "refresh"
   | "help"
   | "quit"
+  | "view-approvals"
   | "approve-checkpoint"
+  | "reject-checkpoint"
   | "integrate-result"
-  | "land-result";
+  | "land-queue";
 
 interface ActionItem {
   id: ActionId;
@@ -601,6 +619,15 @@ const EDITABLE_TASK_STATUSES = new Set<Task["status"]>([
 const TASK_FILTERS: readonly TaskStatusFilter[] = ["all", ...TASK_STATUSES];
 
 const isTaskEditable = (task: Task): boolean => EDITABLE_TASK_STATUSES.has(task.status);
+
+const canIntegrateTaskResult = (task: Task | undefined): task is Task =>
+  Boolean(
+    task?.status === "succeeded" &&
+      task.resultRunId &&
+      task.resultCommitSha &&
+      task.verificationResults.every((result) => result.status === "passed") &&
+      task.deliveryStatus === "ready_to_integrate",
+  );
 
 const parseAcceptanceCriteria = (value: string): string[] =>
   value
@@ -729,6 +756,11 @@ const messageFrom = (error: unknown): string => {
   if (error instanceof Error) return error.message;
   return String(error);
 };
+
+const errorCodeFrom = (error: unknown): string | undefined =>
+  typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+    ? error.code
+    : undefined;
 
 const parseCommands = (value: string): string[] =>
   value
@@ -1024,6 +1056,9 @@ function DetailsPane({
   queue,
   run,
   events,
+  approvals,
+  delivery,
+  deliveryError,
   active,
   height,
   width,
@@ -1032,6 +1067,9 @@ function DetailsPane({
   queue?: Queue;
   run?: Run;
   events: TaskEvent[];
+  approvals: TaskApproval[];
+  delivery?: UiQueueDelivery;
+  deliveryError?: string;
   active: boolean;
   height?: number | string;
   width?: number | string;
@@ -1112,6 +1150,37 @@ function DetailsPane({
   const taskInputTokens = task ? task.inputTokens || run?.inputTokens || 0 : 0;
   const taskOutputTokens = task ? task.outputTokens || run?.outputTokens || 0 : 0;
   const taskCost = task ? task.costUsd || run?.costUsd || 0 : 0;
+  const pendingCheckpoints = approvals.filter((approval) => approval.status === "pending");
+  const approvalSummary =
+    pendingCheckpoints.length > 0
+      ? `${pendingCheckpoints.length} pending · ${pendingCheckpoints
+          .map((approval) => approval.checkpoint)
+          .join(", ")}`
+      : approvals.length > 0
+        ? `${approvals.filter((approval) => approval.status === "approved").length} approved · ${
+            approvals.filter((approval) => approval.status === "rejected").length
+          } rejected`
+        : "none requested";
+  const deliveryOperations = [...(delivery?.operations ?? [])].sort((left, right) =>
+    right.createdAt.localeCompare(left.createdAt),
+  );
+  const latestDeliveryOperation = task
+    ? deliveryOperations.find((operation) => operation.taskId === task.id)
+    : deliveryOperations[0];
+  const deliveryOperationSummary = latestDeliveryOperation
+    ? `${workflowLabel(latestDeliveryOperation.kind)} ${workflowLabel(
+        latestDeliveryOperation.status,
+      )} · ${latestDeliveryOperation.id}${
+        latestDeliveryOperation.candidateSha ? ` · ${latestDeliveryOperation.candidateSha}` : ""
+      }${
+        latestDeliveryOperation.conflictFiles.length > 0
+          ? ` · conflicts ${latestDeliveryOperation.conflictFiles.join(", ")}`
+          : ""
+      }${latestDeliveryOperation.error ? ` · ${latestDeliveryOperation.error}` : ""}`
+    : "none recorded";
+  const laneSummary = delivery?.lane
+    ? `${delivery.lane.trainRef} · generation ${delivery.lane.generation} · ${delivery.lane.targetBaseSha} → ${delivery.lane.headSha}`
+    : "not created";
   const failureSummary =
     task && (task.failureClass || task.failureReason || task.retryDisposition || run?.error)
       ? [
@@ -1134,6 +1203,29 @@ function DetailsPane({
                 ? "green"
                 : "cyan",
         },
+        {
+          label: "Approval",
+          value: approvalSummary,
+          tone: pendingCheckpoints.length > 0 ? "yellow" : undefined,
+        },
+        {
+          label: "Lane",
+          value: laneSummary,
+        },
+        {
+          label: "Delivery op",
+          value: deliveryOperationSummary,
+          tone:
+            latestDeliveryOperation?.status === "failed" ||
+            latestDeliveryOperation?.status === "conflicted"
+              ? "red"
+              : latestDeliveryOperation?.status === "succeeded"
+                ? "green"
+                : undefined,
+        },
+        ...(deliveryError
+          ? [{ label: "Delivery error", value: deliveryError, tone: "red" as const }]
+          : []),
         ...(failureSummary
           ? [{ label: "Failure", value: failureSummary, tone: "red" as const }]
           : []),
@@ -1201,7 +1293,7 @@ function DetailsPane({
         },
       ]
     : [];
-  const operationalLimit = typeof height === "number" ? Math.max(3, Math.min(11, height - 14)) : 11;
+  const operationalLimit = typeof height === "number" ? Math.max(4, Math.min(14, height - 14)) : 14;
   const visibleOperationalRows = operationalRows.slice(0, operationalLimit);
   const activityRowLimit =
     (typeof height === "number" ? Math.max(2, height - 7 - visibleOperationalRows.length) : 8) -
@@ -1261,6 +1353,18 @@ function DetailsPane({
               <Text wrap="truncate-end">
                 File concurrency: {workflowLabel(queue.fileConcurrency)}
               </Text>
+              <Text wrap="truncate-end">
+                Integration lane: {delivery?.lane?.id ?? "not created"}
+              </Text>
+              <Text wrap="truncate-end">Train: {sanitizeTerminalText(laneSummary)}</Text>
+              <Text wrap="truncate-end">
+                Latest delivery: {sanitizeTerminalText(deliveryOperationSummary)}
+              </Text>
+              {deliveryError ? (
+                <Text color="red" wrap="truncate-end">
+                  Delivery state unavailable: {sanitizeTerminalText(deliveryError)}
+                </Text>
+              ) : null}
               <Text dimColor>Select a task to inspect its live activity.</Text>
             </>
           ) : (
@@ -1373,12 +1477,12 @@ function Footer({
         <Text color="yellow">{sanitizeTerminalText(notice)}</Text>
       ) : task ? (
         <Text dimColor wrap="truncate-end">
-          c cancel · r retry · s resume · d done · v attempts · X clean · f filter · 1-3/tab focus
+          p approvals · i integrate · L land · c cancel · r retry · s resume · d done · v attempts
         </Text>
       ) : !narrow ? (
         <Text dimColor>
-          {queue ? `${sanitizeTerminalText(queue.name)} selected · ` : ""}1-3/tab focus · ↑↓/jk
-          select · [ ] size · z zoom · R refresh
+          {queue ? `${sanitizeTerminalText(queue.name)} selected · L land · ` : ""}1-3/tab focus ·
+          ↑↓/jk select · [ ] size · z zoom · R refresh
         </Text>
       ) : null}
     </Box>
@@ -1656,6 +1760,11 @@ export function AgentqApp({
   const [snapshotVersion, setSnapshotVersion] = useState(0);
   const [events, setEvents] = useState<TaskEvent[]>([]);
   const [liveRun, setLiveRun] = useState<Run>();
+  const [approvals, setApprovals] = useState<TaskApproval[]>([]);
+  const [approvalIndex, setApprovalIndex] = useState(0);
+  const [approvalDraft, setApprovalDraft] = useState<ApprovalDraft>();
+  const [delivery, setDelivery] = useState<UiQueueDelivery>();
+  const [deliveryError, setDeliveryError] = useState<string>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [notice, setNotice] = useState<string>();
@@ -1681,6 +1790,7 @@ export function AgentqApp({
   const mounted = useRef(true);
   const refreshSequence = useRef(0);
   const eventRefreshSequence = useRef(0);
+  const deliveryRefreshSequence = useRef(0);
   const actionPendingRef = useRef(false);
 
   const beginAction = useCallback(() => {
@@ -1757,21 +1867,36 @@ export function AgentqApp({
   }, [visibleTasks]);
 
   const selectedTask = visibleTasks.find((task) => task.id === selectedTaskId);
+  const selectedTaskApprovals = useMemo(
+    () => approvals.filter((approval) => approval.taskId === selectedTaskId),
+    [approvals, selectedTaskId],
+  );
+  const selectedApproval = selectedTaskApprovals[approvalIndex];
+  const pendingApproval = selectedTaskApprovals.find((approval) => approval.status === "pending");
+  const selectedDelivery = delivery?.queue.id === selectedQueueId ? delivery : undefined;
+  const canLandSelectedQueue = Boolean(
+    selectedDelivery?.lane &&
+      selectedDelivery.tasks.some((task) => task.deliveryStatus === "integrated"),
+  );
 
   const refreshEvents = useCallback(async () => {
     const sequence = ++eventRefreshSequence.current;
     if (!selectedTaskId) {
       setEvents([]);
       setLiveRun(undefined);
+      setApprovals([]);
       return;
     }
     try {
-      const [nextEvents, taskRuns] = await Promise.all([
+      const [nextEvents, taskRuns, nextApprovals] = await Promise.all([
         controller.listEvents(selectedTaskId, { limit: 200 }),
         controller.listRuns(selectedTaskId).catch(() => []),
+        controller.listTaskApprovals(selectedTaskId),
       ]);
       if (mounted.current && sequence === eventRefreshSequence.current) {
         setEvents(nextEvents);
+        setApprovals(nextApprovals);
+        setApprovalIndex((current) => Math.max(0, Math.min(nextApprovals.length - 1, current)));
         setLiveRun(
           taskRuns.find((candidate) => candidate.id === selectedTask?.currentRunId) ??
             taskRuns.find((candidate) =>
@@ -1782,7 +1907,7 @@ export function AgentqApp({
       }
     } catch (cause) {
       if (mounted.current && sequence === eventRefreshSequence.current) {
-        setNotice(`Logs unavailable: ${messageFrom(cause)}`);
+        setNotice(`Task details unavailable: ${messageFrom(cause)}`);
       }
     }
   }, [controller, selectedTask, selectedTaskId]);
@@ -1790,6 +1915,30 @@ export function AgentqApp({
   useEffect(() => {
     if (snapshotVersion > 0) void refreshEvents();
   }, [refreshEvents, snapshotVersion]);
+
+  const refreshDelivery = useCallback(async () => {
+    const sequence = ++deliveryRefreshSequence.current;
+    if (!selectedQueueId) {
+      setDelivery(undefined);
+      setDeliveryError(undefined);
+      return;
+    }
+    setDeliveryError(undefined);
+    try {
+      const nextDelivery = await controller.getQueueDelivery(selectedQueueId);
+      if (!mounted.current || sequence !== deliveryRefreshSequence.current) return;
+      setDelivery(nextDelivery);
+      setDeliveryError(undefined);
+    } catch (cause) {
+      if (!mounted.current || sequence !== deliveryRefreshSequence.current) return;
+      setDelivery(undefined);
+      setDeliveryError(messageFrom(cause));
+    }
+  }, [controller, selectedQueueId]);
+
+  useEffect(() => {
+    if (snapshotVersion > 0) void refreshDelivery();
+  }, [refreshDelivery, snapshotVersion]);
 
   const cycleFocus = useCallback((delta: number) => {
     setFocus((current) => {
@@ -2278,6 +2427,80 @@ export function AgentqApp({
     }
   }, [actionPending, beginAction, controller, finishAction, selectedTask]);
 
+  const openApprovals = useCallback(() => {
+    if (!selectedTask) {
+      setNotice("Select a task to inspect approvals.");
+      return;
+    }
+    const firstPending = selectedTaskApprovals.findIndex(
+      (approval) => approval.status === "pending",
+    );
+    setApprovalIndex(firstPending >= 0 ? firstPending : 0);
+    setMode("approvals");
+    setNotice(undefined);
+  }, [selectedTask, selectedTaskApprovals]);
+
+  const startApprovalDecision = useCallback(
+    (decision: ApprovalDraft["decision"], approval?: TaskApproval) => {
+      const target = approval ?? selectedApproval ?? pendingApproval;
+      if (!target) {
+        setNotice("This task has no approval checkpoints.");
+        return;
+      }
+      if (target.status !== "pending") {
+        setNotice(
+          `${target.checkpoint} is already ${target.status}; only pending checkpoints can be decided.`,
+        );
+        return;
+      }
+      setApprovalDraft({
+        taskId: target.taskId,
+        checkpoint: target.checkpoint,
+        decision,
+        actor: "",
+        note: "",
+        field: 0,
+      });
+      setMode("approval-form");
+      setNotice(undefined);
+    },
+    [pendingApproval, selectedApproval],
+  );
+
+  const submitApprovalDecision = useCallback(async () => {
+    if (!approvalDraft || actionPending || !beginAction()) return;
+    const pending = approvalDraft;
+    try {
+      const input = {
+        ...(pending.actor.trim() ? { actor: pending.actor.trim() } : {}),
+        ...(pending.note.trim() ? { note: pending.note.trim() } : {}),
+      };
+      if (pending.decision === "approve") {
+        await controller.approveTaskCheckpoint(pending.taskId, pending.checkpoint, input);
+      } else {
+        await controller.rejectTaskCheckpoint(pending.taskId, pending.checkpoint, input);
+      }
+      setApprovalDraft(undefined);
+      setMode("approvals");
+      setNotice(
+        `${pending.decision === "approve" ? "Approved" : "Rejected"} ${pending.checkpoint}.`,
+      );
+      await refresh();
+      await refreshEvents();
+    } catch (cause) {
+      setApprovalDraft((current) =>
+        current
+          ? {
+              ...current,
+              error: `Could not ${pending.decision} checkpoint: ${messageFrom(cause)}`,
+            }
+          : current,
+      );
+    } finally {
+      finishAction();
+    }
+  }, [actionPending, approvalDraft, beginAction, controller, finishAction, refresh, refreshEvents]);
+
   const openDoctor = useCallback(async () => {
     if (actionPending || !beginAction()) return;
     setMode("doctor");
@@ -2389,7 +2612,35 @@ export function AgentqApp({
 
     if (!beginAction()) return;
     try {
-      if (pending.kind === "delete-queue") {
+      if (pending.kind === "integrate-task") {
+        const outcome = await controller.integrateTask(pending.task.id);
+        setMode("dashboard");
+        if (outcome.status === "integrated") {
+          setNotice(`Integrated ${pending.task.title} at ${outcome.integratedSha}.`);
+        } else if (outcome.status === "already-integrated") {
+          setNotice(`${pending.task.title} is already integrated.`);
+        } else if (outcome.status === "conflict") {
+          setNotice(
+            `Integration conflict: ${outcome.conflictPaths.join(", ") || "unknown paths"}.`,
+          );
+        } else if (outcome.status === "verification-failed") {
+          setNotice(`Integration verification failed: ${workflowLabel(outcome.failureClass)}.`);
+        } else {
+          setNotice(`Integration is contended: ${outcome.message}`);
+        }
+        await refresh();
+        await refreshDelivery();
+      } else if (pending.kind === "land-queue") {
+        const outcome = await controller.landQueue(pending.queue.id);
+        setMode("dashboard");
+        setNotice(
+          outcome.status === "already-landed"
+            ? `${pending.queue.name} is already landed.`
+            : `Landed ${pending.queue.name} at ${outcome.landedSha}.`,
+        );
+        await refresh();
+        await refreshDelivery();
+      } else if (pending.kind === "delete-queue") {
         await controller.deleteQueue(pending.queue.id);
         setSelectedQueueId(undefined);
         setMode("dashboard");
@@ -2409,7 +2660,14 @@ export function AgentqApp({
       }
     } catch (cause) {
       setMode("dashboard");
-      setNotice(`${pending.kind} failed: ${messageFrom(cause)}`);
+      if (errorCodeFrom(cause) === "TASK_APPROVAL_REQUIRED") {
+        setNotice(`${messageFrom(cause)} · press p to review pending approvals.`);
+        await refresh();
+        await refreshEvents();
+        await refreshDelivery();
+      } else {
+        setNotice(`${pending.kind} failed: ${messageFrom(cause)}`);
+      }
     } finally {
       finishAction();
     }
@@ -2420,6 +2678,8 @@ export function AgentqApp({
     controller,
     finishAction,
     refresh,
+    refreshDelivery,
+    refreshEvents,
     runAction,
     runIntegration,
   ]);
@@ -2571,31 +2831,57 @@ export function AgentqApp({
         available: true,
       },
       {
+        id: "view-approvals",
+        label: "View task approvals",
+        detail: taskSelected
+          ? `${selectedTaskApprovals.filter((approval) => approval.status === "pending").length} pending · ${selectedTaskApprovals.length} total`
+          : "Select a task to inspect checkpoint decisions",
+        available: taskSelected,
+      },
+      {
         id: "approve-checkpoint",
         label: "Approve current checkpoint",
-        detail: taskSelected
-          ? "Unavailable: the UI controller does not expose approval decisions yet"
-          : "Select a task; approval decisions also require a controller API",
-        available: false,
+        detail: pendingApproval
+          ? `${pendingApproval.checkpoint} · opens a confirmed decision form`
+          : "The selected task has no pending checkpoint",
+        available: pendingApproval !== undefined,
+      },
+      {
+        id: "reject-checkpoint",
+        label: "Reject current checkpoint",
+        detail: pendingApproval
+          ? `${pendingApproval.checkpoint} · opens a confirmed decision form`
+          : "The selected task has no pending checkpoint",
+        available: pendingApproval !== undefined,
       },
       {
         id: "integrate-result",
         label: "Integrate selected task result",
-        detail: taskSelected
-          ? "Unavailable: the UI controller does not expose result integration yet"
-          : "Select a task; result integration also requires a controller API",
-        available: false,
+        detail: canIntegrateTaskResult(selectedTask)
+          ? `${selectedTask.resultCommitSha} · merge into the queue train after confirmation`
+          : "Requires a selected verified result that is ready to integrate",
+        available: canIntegrateTaskResult(selectedTask),
       },
       {
-        id: "land-result",
-        label: "Land selected task result",
-        detail: taskSelected
-          ? "Unavailable: the UI controller does not expose result landing yet"
-          : "Select a task; result landing also requires a controller API",
-        available: false,
+        id: "land-queue",
+        label: "Land selected queue",
+        detail: canLandSelectedQueue
+          ? `${selectedDelivery?.lane?.trainRef} → ${selectedQueue?.baseRef}`
+          : "Requires an integration lane with at least one integrated task",
+        available: canLandSelectedQueue,
       },
     ];
-  }, [context, integrationRepositoryPath, selectedQueue, selectedTask, taskFilter]);
+  }, [
+    canLandSelectedQueue,
+    context,
+    integrationRepositoryPath,
+    pendingApproval,
+    selectedDelivery,
+    selectedQueue,
+    selectedTask,
+    selectedTaskApprovals,
+    taskFilter,
+  ]);
 
   const performAction = useCallback(
     (item: ActionItem) => {
@@ -2701,10 +2987,26 @@ export function AgentqApp({
           if (onExit) onExit();
           else exit();
           break;
+        case "view-approvals":
+          openApprovals();
+          break;
         case "approve-checkpoint":
+          startApprovalDecision("approve", pendingApproval);
+          break;
+        case "reject-checkpoint":
+          startApprovalDecision("reject", pendingApproval);
+          break;
         case "integrate-result":
-        case "land-result":
-          setNotice(`${item.label} requires a lifecycle controller API.`);
+          if (selectedTask) {
+            setConfirmation({ kind: "integrate-task", task: selectedTask });
+            setMode("confirm");
+          }
+          break;
+        case "land-queue":
+          if (selectedQueue) {
+            setConfirmation({ kind: "land-queue", queue: selectedQueue });
+            setMode("confirm");
+          }
           break;
       }
     },
@@ -2713,8 +3015,10 @@ export function AgentqApp({
       cycleTaskFilter,
       integrationRepositoryPath,
       onExit,
+      openApprovals,
       openAttempts,
       openDoctor,
+      pendingApproval,
       refresh,
       runAction,
       runProviderLogin,
@@ -2724,6 +3028,7 @@ export function AgentqApp({
       startCreateQueue,
       startEdit,
       startEditQueue,
+      startApprovalDecision,
       toggleRepositoryScope,
     ],
   );
@@ -2747,6 +3052,85 @@ export function AgentqApp({
 
     if (mode === "integration-results") {
       if (key.escape || key.return) setMode("dashboard");
+      return;
+    }
+
+    if (mode === "approval-form" && approvalDraft) {
+      if (key.escape) {
+        setApprovalDraft(undefined);
+        setMode("approvals");
+        return;
+      }
+      if (key.ctrl && input === "s") {
+        void submitApprovalDecision();
+        return;
+      }
+      if (key.tab) {
+        setApprovalDraft((current) =>
+          current
+            ? { ...current, field: nextIndex(current.field, 2, key.shift ? -1 : 1) as 0 | 1 }
+            : current,
+        );
+        return;
+      }
+      if (key.ctrl && input === "n" && approvalDraft.field === 1) {
+        setApprovalDraft((current) =>
+          current ? { ...current, note: `${current.note}\n`, error: undefined } : current,
+        );
+        return;
+      }
+      if (key.return) {
+        if (approvalDraft.field === 0) {
+          setApprovalDraft((current) => (current ? { ...current, field: 1 } : current));
+        } else {
+          void submitApprovalDecision();
+        }
+        return;
+      }
+      if ((key.ctrl && input === "u") || key.backspace || key.delete) {
+        setApprovalDraft((current) => {
+          if (!current) return current;
+          const field = current.field === 0 ? "actor" : "note";
+          return {
+            ...current,
+            [field]: key.ctrl ? "" : current[field].slice(0, -1),
+            error: undefined,
+          };
+        });
+        return;
+      }
+      if (!key.ctrl && !key.meta && input) {
+        setApprovalDraft((current) => {
+          if (!current) return current;
+          const field = current.field === 0 ? "actor" : "note";
+          return { ...current, [field]: current[field] + input, error: undefined };
+        });
+      }
+      return;
+    }
+
+    if (mode === "approvals") {
+      if (key.escape || input === "p") {
+        setMode("dashboard");
+        return;
+      }
+      if (key.upArrow || input === "k") {
+        setApprovalIndex((current) => nextIndex(current, selectedTaskApprovals.length, -1));
+        return;
+      }
+      if (key.downArrow || input === "j") {
+        setApprovalIndex((current) => nextIndex(current, selectedTaskApprovals.length, 1));
+        return;
+      }
+      if (input === "a" || key.return) {
+        startApprovalDecision("approve", selectedApproval);
+        return;
+      }
+      if (input === "r") {
+        startApprovalDecision("reject", selectedApproval);
+        return;
+      }
+      if (input === "R") void refreshEvents();
       return;
     }
 
@@ -3270,6 +3654,28 @@ export function AgentqApp({
       setMode("help");
       return;
     }
+    if (input === "p") {
+      openApprovals();
+      return;
+    }
+    if (input === "i") {
+      if (canIntegrateTaskResult(selectedTask)) {
+        setConfirmation({ kind: "integrate-task", task: selectedTask });
+        setMode("confirm");
+      } else {
+        setNotice("Integration requires a selected verified result that is ready to integrate.");
+      }
+      return;
+    }
+    if (input === "L") {
+      if (selectedQueue && canLandSelectedQueue) {
+        setConfirmation({ kind: "land-queue", queue: selectedQueue });
+        setMode("confirm");
+      } else {
+        setNotice("Landing requires an integration lane with an integrated task.");
+      }
+      return;
+    }
     if (input === "c" && selectedTask && canCancelTask(selectedTask.status)) {
       setConfirmation({ kind: "cancel", task: selectedTask });
       setMode("confirm");
@@ -3395,13 +3801,112 @@ export function AgentqApp({
             <Text bold>:</Text> action center · <Text bold>g</Text> local / all ·{" "}
             <Text bold>R</Text> refresh · <Text bold>q</Text> quit · <Text bold>? / esc</Text> close
           </Text>
+          <Text>
+            <Text bold>p</Text> approvals · <Text bold>i</Text> integrate verified result ·{" "}
+            <Text bold>L</Text> land selected queue
+          </Text>
           <Text dimColor>
             Forms: tab fields · ctrl+n newline · ctrl+u clear · ctrl+s save · esc cancel
           </Text>
-          <Text dimColor>
-            Lifecycle: approval, result integration, and landing appear in : and stay disabled until
-            controller APIs are connected
-          </Text>
+        </Box>
+      </Box>
+    );
+  }
+
+  if (mode === "approval-form" && approvalDraft) {
+    return (
+      <FormScreen
+        columns={columns}
+        rows={rows}
+        title={`${approvalDraft.decision === "approve" ? "APPROVE" : "REJECT"} CHECKPOINT?`}
+        subtitle={`${approvalDraft.checkpoint} · task ${approvalDraft.taskId} · this records a durable human decision.`}
+        fields={[
+          {
+            label: "Actor",
+            value: approvalDraft.actor || "optional",
+            focused: approvalDraft.field === 0,
+            textInput: true,
+          },
+          {
+            label: "Decision note",
+            value: approvalDraft.note || "optional",
+            focused: approvalDraft.field === 1,
+            multiline: true,
+            textInput: true,
+          },
+        ]}
+        error={approvalDraft.error}
+        footer="ctrl+s confirm decision · ctrl+n newline · esc back · tab fields · ctrl+u clear"
+      />
+    );
+  }
+
+  if (mode === "approvals") {
+    const capacity = Math.max(1, Math.floor((rows - 9) / 3));
+    const visible = windowItems(selectedTaskApprovals, approvalIndex, capacity);
+    return (
+      <Box width={columns} height={rows} flexDirection="column" overflow="hidden">
+        <Header
+          tasks={snapshot.tasks}
+          focus={focus}
+          narrow={columns < 72}
+          scopeLabel={displayScope}
+        />
+        <Box flexGrow={1} alignItems="center" overflow="hidden">
+          <Box
+            width={Math.max(1, Math.min(columns - 2, 96))}
+            height={Math.max(1, rows - 4)}
+            borderStyle="double"
+            borderColor="magenta"
+            paddingX={columns >= 50 ? 2 : 1}
+            flexDirection="column"
+            overflow="hidden"
+          >
+            <Text bold color="magenta" wrap="truncate-end">
+              TASK APPROVALS · {sanitizeTerminalText(selectedTask?.title ?? "task unavailable")}
+            </Text>
+            {selectedTaskApprovals.length === 0 ? (
+              <Text dimColor>No checkpoint decisions have been requested for this task.</Text>
+            ) : null}
+            {visible.items.map((approval, offset) => {
+              const index = visible.start + offset;
+              const selected = index === approvalIndex;
+              const color =
+                approval.status === "approved"
+                  ? "green"
+                  : approval.status === "rejected"
+                    ? "red"
+                    : "yellow";
+              return (
+                <Box key={approval.checkpoint} flexDirection="column" marginBottom={1}>
+                  <Text bold={selected} color={selected ? "magenta" : color} wrap="truncate-end">
+                    {selected ? "› " : "  "}[{workflowLabel(approval.status)}]{" "}
+                    {sanitizeTerminalText(approval.checkpoint)}
+                  </Text>
+                  <Text dimColor wrap="truncate-end">
+                    requested {sanitizeTerminalText(approval.requestedAt)}
+                    {approval.runId ? ` · run ${sanitizeTerminalText(approval.runId)}` : ""}
+                    {approval.actor ? ` · ${sanitizeTerminalText(approval.actor)}` : ""}
+                  </Text>
+                  {approval.note ? (
+                    <Text dimColor wrap="truncate-end">
+                      {sanitizeTerminalText(approval.note)}
+                    </Text>
+                  ) : null}
+                </Box>
+              );
+            })}
+            {notice ? (
+              <Text color="yellow" wrap="truncate-end">
+                {sanitizeTerminalText(notice)}
+              </Text>
+            ) : null}
+            <Box marginTop={1} borderTop borderColor="gray">
+              <Text dimColor>
+                ↑↓ / j k select · a / enter approve · r reject · R refresh · p / esc back
+              </Text>
+            </Box>
+          </Box>
         </Box>
       </Box>
     );
@@ -3855,9 +4360,13 @@ export function AgentqApp({
               ? "DELETE TASK?"
               : confirmation.kind === "clean"
                 ? "CLEAN WORKTREE?"
-                : "INSTALL INTEGRATION?";
+                : confirmation.kind === "integration"
+                  ? "INSTALL INTEGRATION?"
+                  : confirmation.kind === "integrate-task"
+                    ? "INTEGRATE TASK RESULT?"
+                    : "LAND QUEUE?";
     const subject =
-      confirmation.kind === "delete-queue"
+      confirmation.kind === "delete-queue" || confirmation.kind === "land-queue"
         ? confirmation.queue.name
         : confirmation.kind === "integration"
           ? confirmation.target === "all"
@@ -3879,11 +4388,16 @@ export function AgentqApp({
                 ? confirmation.force
                   ? "Force removal discards uncommitted work in the retained worktree."
                   : "Safe removal stops if the retained worktree has uncommitted changes."
-                : "Repository instructions will be installed in:";
+                : confirmation.kind === "integration"
+                  ? "Repository instructions will be installed in:"
+                  : confirmation.kind === "integrate-task"
+                    ? "The verified result will be merged into the queue integration train. Verification and scope gates are enforced again."
+                    : `The integration train will update ${confirmation.queue.baseRef}. This changes the queue's target branch.`;
     const destructive =
       confirmation.kind === "cancel" ||
       confirmation.kind === "delete-queue" ||
       confirmation.kind === "delete-task" ||
+      confirmation.kind === "land-queue" ||
       (confirmation.kind === "clean" && confirmation.force);
     return (
       <Box width={columns} height={rows} flexDirection="column">
@@ -3912,6 +4426,17 @@ export function AgentqApp({
             {confirmation.kind === "integration" ? (
               <Text color="cyan" wrap="truncate-end">
                 {sanitizeTerminalText(confirmation.repoPath)}
+              </Text>
+            ) : null}
+            {confirmation.kind === "integrate-task" ? (
+              <Text color="cyan" wrap="truncate-end">
+                Result: {sanitizeTerminalText(confirmation.task.resultCommitSha ?? "not recorded")}
+              </Text>
+            ) : null}
+            {confirmation.kind === "land-queue" ? (
+              <Text color="cyan" wrap="truncate-end">
+                {sanitizeTerminalText(selectedDelivery?.lane?.trainRef ?? "integration train")} →{" "}
+                {sanitizeTerminalText(confirmation.queue.baseRef)}
               </Text>
             ) : null}
             {confirmation.kind === "clean" ? (
@@ -3973,6 +4498,9 @@ export function AgentqApp({
       queue={selectedQueue}
       run={liveRun?.taskId === selectedTask?.id ? liveRun : undefined}
       events={events}
+      approvals={selectedTaskApprovals}
+      delivery={selectedDelivery}
+      deliveryError={deliveryError}
       active={focus === "details"}
       height={singlePane || wide ? bodyHeight : mediumDetailsHeight}
       width={singlePane ? "100%" : wide ? widths.details : undefined}
