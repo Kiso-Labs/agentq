@@ -14,32 +14,61 @@ export interface ListEventOptions {
   limit?: number;
 }
 
-export interface UiTaskPatch {
-  title: string;
-  instructions: string;
-  acceptanceCriteria: string[];
-  provider: Provider;
-  priority: number;
-}
+export type UiTaskPatch = Partial<
+  Omit<
+    Pick<
+      Task,
+      | "title"
+      | "instructions"
+      | "acceptanceCriteria"
+      | "objective"
+      | "invariants"
+      | "handoffRequirements"
+      | "blockedBy"
+      | "expectedPaths"
+      | "allowedPaths"
+      | "deniedPaths"
+      | "maxChangedFiles"
+      | "verifyCommands"
+      | "approvalCheckpoints"
+      | "baseDriftPolicy"
+      | "landStrategy"
+      | "provider"
+      | "priority"
+    >,
+    "maxChangedFiles"
+  >
+> & { maxChangedFiles?: number | null };
 
 export type UiCreateQueueInput = Omit<CreateQueueInput, "repoKey">;
 
 export type UiQueuePatch = Partial<
-  Pick<
-    Queue,
-    | "name"
-    | "baseRef"
-    | "defaultProvider"
-    | "planModel"
-    | "planInstructions"
-    | "implementModel"
-    | "implementInstructions"
-    | "concurrency"
-    | "maxAttempts"
-    | "verifyCommands"
-    | "autoCommit"
+  Omit<
+    Pick<
+      Queue,
+      | "name"
+      | "baseRef"
+      | "defaultProvider"
+      | "planModel"
+      | "planInstructions"
+      | "implementModel"
+      | "implementInstructions"
+      | "concurrency"
+      | "maxAttempts"
+      | "verifyCommands"
+      | "autoCommit"
+      | "allowedPaths"
+      | "deniedPaths"
+      | "maxChangedFiles"
+      | "approvalCheckpoints"
+      | "baseDriftPolicy"
+      | "landStrategy"
+      | "autoLand"
+      | "fileConcurrency"
+    >,
+    "maxChangedFiles"
   >
->;
+> & { maxChangedFiles?: number | null };
 
 export interface UiDoctorCheck {
   name: string;

@@ -2,11 +2,14 @@ import { Box, Text, useApp, useInput, useWindowSize } from "ink";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import stringWidth from "string-width";
 import {
+  BASE_DRIFT_POLICIES,
   canCancelTask,
   canCompleteTaskManually,
   canRetryTask,
+  FILE_CONCURRENCY_MODES,
   isTaskActive,
   isTaskTerminal,
+  LAND_STRATEGIES,
   PROVIDERS,
   type Provider,
   type Queue,
@@ -49,29 +52,221 @@ interface Snapshot {
   tasks: Task[];
 }
 
-interface AddDraft {
-  queueId: string;
+interface TaskDraftFields {
   providerIndex: number;
   priority: string;
   title: string;
   instructions: string;
   acceptanceCriteria: string;
+  objective: string;
+  invariants: string;
+  handoffRequirements: string;
+  blockedBy: string;
+  expectedPaths: string;
+  allowedPaths: string;
+  deniedPaths: string;
+  maxChangedFiles: string;
+  verifyCommands: string;
+  approvalCheckpoints: string;
+  baseDriftPolicyIndex: number;
+  landStrategyIndex: number;
   idempotencyKey: string;
-  field: 0 | 1 | 2 | 3 | 4 | 5 | 6;
+  field: number;
   error?: string;
 }
 
-interface EditDraft {
+interface AddDraft extends TaskDraftFields {
+  queueId: string;
+}
+
+interface EditDraft extends TaskDraftFields {
   taskId: string;
   expectedUpdatedAt: string;
-  providerIndex: number;
-  priority: string;
-  title: string;
-  instructions: string;
-  acceptanceCriteria: string;
-  field: 0 | 1 | 2 | 3 | 4;
-  error?: string;
 }
+
+type TaskDraftTextKey =
+  | "priority"
+  | "title"
+  | "instructions"
+  | "acceptanceCriteria"
+  | "objective"
+  | "invariants"
+  | "handoffRequirements"
+  | "blockedBy"
+  | "expectedPaths"
+  | "allowedPaths"
+  | "deniedPaths"
+  | "maxChangedFiles"
+  | "verifyCommands"
+  | "approvalCheckpoints"
+  | "idempotencyKey";
+
+type TaskFormControl =
+  | { kind: "queue"; label: string; focusIndex: number }
+  | { kind: "provider"; label: string; focusIndex: number }
+  | {
+      kind: "text";
+      key: TaskDraftTextKey;
+      label: string;
+      focusIndex: number;
+      multiline?: boolean;
+      placeholder?: string;
+    }
+  | {
+      kind: "selector";
+      key: "baseDriftPolicyIndex" | "landStrategyIndex";
+      label: string;
+      focusIndex: number;
+      options: readonly string[];
+    };
+
+const TASK_STRUCTURED_CONTROLS = (firstIndex: number): readonly TaskFormControl[] => [
+  {
+    kind: "text",
+    key: "objective",
+    label: "Objective",
+    focusIndex: firstIndex,
+    multiline: true,
+    placeholder: "Use title and instructions",
+  },
+  {
+    kind: "text",
+    key: "invariants",
+    label: "Invariants",
+    focusIndex: firstIndex + 1,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  {
+    kind: "text",
+    key: "handoffRequirements",
+    label: "Handoff requirements",
+    focusIndex: firstIndex + 2,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  {
+    kind: "text",
+    key: "blockedBy",
+    label: "Blocked by task IDs",
+    focusIndex: firstIndex + 3,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  {
+    kind: "text",
+    key: "expectedPaths",
+    label: "Expected paths",
+    focusIndex: firstIndex + 4,
+    multiline: true,
+    placeholder: "none · globs separated with ;",
+  },
+  {
+    kind: "text",
+    key: "allowedPaths",
+    label: "Allowed paths",
+    focusIndex: firstIndex + 5,
+    multiline: true,
+    placeholder: "inherit queue · globs separated with ;",
+  },
+  {
+    kind: "text",
+    key: "deniedPaths",
+    label: "Denied paths",
+    focusIndex: firstIndex + 6,
+    multiline: true,
+    placeholder: "inherit queue · globs separated with ;",
+  },
+  {
+    kind: "text",
+    key: "maxChangedFiles",
+    label: "Maximum changed files",
+    focusIndex: firstIndex + 7,
+    placeholder: "inherit queue",
+  },
+  {
+    kind: "text",
+    key: "verifyCommands",
+    label: "Verification commands",
+    focusIndex: firstIndex + 8,
+    multiline: true,
+    placeholder: "inherit queue · separate with ; or ctrl+n",
+  },
+  {
+    kind: "text",
+    key: "approvalCheckpoints",
+    label: "Approval checkpoints",
+    focusIndex: firstIndex + 9,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  {
+    kind: "selector",
+    key: "baseDriftPolicyIndex",
+    label: "Base drift policy",
+    focusIndex: firstIndex + 10,
+    options: BASE_DRIFT_POLICIES,
+  },
+  {
+    kind: "selector",
+    key: "landStrategyIndex",
+    label: "Land strategy",
+    focusIndex: firstIndex + 11,
+    options: LAND_STRATEGIES,
+  },
+];
+
+const ADD_TASK_CONTROLS: readonly TaskFormControl[] = [
+  { kind: "queue", label: "Queue", focusIndex: 0 },
+  { kind: "provider", label: "Provider", focusIndex: 1 },
+  { kind: "text", key: "title", label: "Title", focusIndex: 2 },
+  {
+    kind: "text",
+    key: "instructions",
+    label: "Instructions",
+    focusIndex: 3,
+    multiline: true,
+  },
+  { kind: "text", key: "priority", label: "Priority", focusIndex: 4 },
+  {
+    kind: "text",
+    key: "acceptanceCriteria",
+    label: "Acceptance criteria",
+    focusIndex: 5,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  {
+    kind: "text",
+    key: "idempotencyKey",
+    label: "Idempotency key",
+    focusIndex: 6,
+    placeholder: "optional",
+  },
+  ...TASK_STRUCTURED_CONTROLS(7),
+];
+
+const EDIT_TASK_CONTROLS: readonly TaskFormControl[] = [
+  { kind: "provider", label: "Provider", focusIndex: 0 },
+  { kind: "text", key: "priority", label: "Priority", focusIndex: 1 },
+  { kind: "text", key: "title", label: "Title", focusIndex: 2 },
+  {
+    kind: "text",
+    key: "instructions",
+    label: "Instructions",
+    focusIndex: 3,
+    multiline: true,
+  },
+  {
+    kind: "text",
+    key: "acceptanceCriteria",
+    label: "Acceptance criteria",
+    focusIndex: 4,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  ...TASK_STRUCTURED_CONTROLS(5),
+];
 
 interface QueueDraft {
   kind: "create" | "edit";
@@ -88,6 +283,14 @@ interface QueueDraft {
   maxAttempts: string;
   verifyCommands: string;
   autoCommit: boolean;
+  allowedPaths: string;
+  deniedPaths: string;
+  maxChangedFiles: string;
+  approvalCheckpoints: string;
+  baseDriftPolicyIndex: number;
+  landStrategyIndex: number;
+  autoLand: boolean;
+  fileConcurrencyIndex: number;
   field: number;
   error?: string;
 }
@@ -102,7 +305,11 @@ type QueueDraftTextKey =
   | "implementInstructions"
   | "concurrency"
   | "maxAttempts"
-  | "verifyCommands";
+  | "verifyCommands"
+  | "allowedPaths"
+  | "deniedPaths"
+  | "maxChangedFiles"
+  | "approvalCheckpoints";
 
 type QueueFormControl =
   | {
@@ -114,7 +321,19 @@ type QueueFormControl =
       placeholder?: string;
     }
   | { kind: "provider"; label: string; focusIndex: number }
-  | { kind: "toggle"; key: "autoCommit"; label: string; focusIndex: number }
+  | {
+      kind: "toggle";
+      key: "autoCommit" | "autoLand";
+      label: string;
+      focusIndex: number;
+    }
+  | {
+      kind: "selector";
+      key: "baseDriftPolicyIndex" | "landStrategyIndex" | "fileConcurrencyIndex";
+      label: string;
+      focusIndex: number;
+      options: readonly string[];
+    }
   | { kind: "readonly"; key: "repoPath"; label: string };
 
 const CREATE_QUEUE_CONTROLS: readonly QueueFormControl[] = [
@@ -169,6 +388,59 @@ const CREATE_QUEUE_CONTROLS: readonly QueueFormControl[] = [
     placeholder: "none",
   },
   { kind: "toggle", key: "autoCommit", label: "Auto-commit", focusIndex: 11 },
+  {
+    kind: "text",
+    key: "allowedPaths",
+    label: "Allowed paths",
+    focusIndex: 12,
+    multiline: true,
+    placeholder: "unrestricted · globs separated with ;",
+  },
+  {
+    kind: "text",
+    key: "deniedPaths",
+    label: "Denied paths",
+    focusIndex: 13,
+    multiline: true,
+    placeholder: "none · globs separated with ;",
+  },
+  {
+    kind: "text",
+    key: "maxChangedFiles",
+    label: "Maximum changed files",
+    focusIndex: 14,
+    placeholder: "unlimited",
+  },
+  {
+    kind: "text",
+    key: "approvalCheckpoints",
+    label: "Approval checkpoints",
+    focusIndex: 15,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  {
+    kind: "selector",
+    key: "baseDriftPolicyIndex",
+    label: "Base drift policy",
+    focusIndex: 16,
+    options: BASE_DRIFT_POLICIES,
+  },
+  {
+    kind: "selector",
+    key: "landStrategyIndex",
+    label: "Land strategy",
+    focusIndex: 17,
+    options: LAND_STRATEGIES,
+  },
+  { kind: "toggle", key: "autoLand", label: "Auto-land", focusIndex: 18 },
+  {
+    kind: "selector",
+    key: "fileConcurrencyIndex",
+    label: "File concurrency",
+    focusIndex: 19,
+    options: FILE_CONCURRENCY_MODES,
+  },
 ];
 
 const EDIT_QUEUE_CONTROLS: readonly QueueFormControl[] = [
@@ -217,6 +489,59 @@ const EDIT_QUEUE_CONTROLS: readonly QueueFormControl[] = [
     placeholder: "none",
   },
   { kind: "toggle", key: "autoCommit", label: "Auto-commit", focusIndex: 10 },
+  {
+    kind: "text",
+    key: "allowedPaths",
+    label: "Allowed paths",
+    focusIndex: 11,
+    multiline: true,
+    placeholder: "unrestricted · globs separated with ;",
+  },
+  {
+    kind: "text",
+    key: "deniedPaths",
+    label: "Denied paths",
+    focusIndex: 12,
+    multiline: true,
+    placeholder: "none · globs separated with ;",
+  },
+  {
+    kind: "text",
+    key: "maxChangedFiles",
+    label: "Maximum changed files",
+    focusIndex: 13,
+    placeholder: "unlimited",
+  },
+  {
+    kind: "text",
+    key: "approvalCheckpoints",
+    label: "Approval checkpoints",
+    focusIndex: 14,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  {
+    kind: "selector",
+    key: "baseDriftPolicyIndex",
+    label: "Base drift policy",
+    focusIndex: 15,
+    options: BASE_DRIFT_POLICIES,
+  },
+  {
+    kind: "selector",
+    key: "landStrategyIndex",
+    label: "Land strategy",
+    focusIndex: 16,
+    options: LAND_STRATEGIES,
+  },
+  { kind: "toggle", key: "autoLand", label: "Auto-land", focusIndex: 17 },
+  {
+    kind: "selector",
+    key: "fileConcurrencyIndex",
+    label: "File concurrency",
+    focusIndex: 18,
+    options: FILE_CONCURRENCY_MODES,
+  },
 ];
 
 const queueFormControls = (kind: QueueDraft["kind"]): readonly QueueFormControl[] =>
@@ -253,7 +578,10 @@ type ActionId =
   | "toggle-scope"
   | "refresh"
   | "help"
-  | "quit";
+  | "quit"
+  | "approve-checkpoint"
+  | "integrate-result"
+  | "land-result";
 
 interface ActionItem {
   id: ActionId;
@@ -309,6 +637,32 @@ const queueInstructionSummary = (instructions: string): string => {
   const summary = sanitizeTerminalText(instructions).replace(/\s+/gu, " ").trim();
   return summary || "none";
 };
+
+const workflowLabel = (value: string): string =>
+  value.replace(/[_-]+/gu, " ").replace(/\s+/gu, " ").trim().toUpperCase();
+
+const listSummary = (values: readonly string[], fallback = "none"): string =>
+  values.length > 0 ? sanitizeTerminalText(values.join(", ")) : fallback;
+
+const formatElapsed = (run: Run | undefined, task: Task): string => {
+  const started = Date.parse(run?.startedAt ?? task.createdAt);
+  const finished = Date.parse(
+    run?.finishedAt ?? run?.heartbeatAt ?? task.completedAt ?? task.updatedAt,
+  );
+  if (!Number.isFinite(started) || !Number.isFinite(finished) || finished < started) {
+    return "unknown";
+  }
+  const seconds = Math.floor((finished - started) / 1_000);
+  const hours = Math.floor(seconds / 3_600);
+  const minutes = Math.floor((seconds % 3_600) / 60);
+  const remainder = seconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${remainder}s`;
+  return `${remainder}s`;
+};
+
+const formatCost = (costUsd: number): string =>
+  costUsd === 0 ? "$0" : `$${costUsd.toFixed(costUsd < 0.01 ? 4 : 2)}`;
 
 const FOCUS_ORDER: FocusPane[] = ["queues", "tasks", "details"];
 type PaneWeights = Record<FocusPane, number>;
@@ -382,6 +736,8 @@ const parseCommands = (value: string): string[] =>
     .map((command) => command.trim())
     .filter((command) => command.length > 0);
 
+const parseList = parseCommands;
+
 const positiveIntegerFrom = (value: string, label: string): number => {
   if (!/^\d+$/u.test(value.trim())) throw new Error(`${label} must be a positive whole number.`);
   const parsed = Number(value);
@@ -390,6 +746,15 @@ const positiveIntegerFrom = (value: string, label: string): number => {
   }
   return parsed;
 };
+
+const optionalPositiveIntegerFrom = (value: string, label: string): number | undefined =>
+  value.trim() ? positiveIntegerFrom(value, label) : undefined;
+
+const selectedOption = <T extends string>(options: readonly T[], index: number, fallback: T): T =>
+  options[index] ?? fallback;
+
+const selectedOptionIndex = <T extends string>(options: readonly T[], value: T): number =>
+  Math.max(0, options.indexOf(value));
 
 const runSummary = (run: Run): string =>
   run.error ?? run.summary ?? run.taskSnapshot?.title ?? "No summary recorded.";
@@ -575,7 +940,7 @@ function TaskPane({
 }) {
   const selectedIndex = tasks.findIndex((task) => task.id === selectedId);
   const rowCapacity =
-    typeof height === "number" ? Math.max(1, Math.floor((height - 3) / 3)) : tasks.length;
+    typeof height === "number" ? Math.max(1, Math.floor((height - 3) / 2)) : tasks.length;
   const visible = windowItems(tasks, selectedIndex, rowCapacity);
   const position = selectedIndex >= 0 ? `  ${selectedIndex + 1}/${tasks.length}` : "";
 
@@ -597,7 +962,7 @@ function TaskPane({
         visible.items.map((task) => {
           const selected = task.id === selectedId;
           return (
-            <Box key={task.id} flexDirection="column" marginBottom={1}>
+            <Box key={task.id} flexDirection="column" flexShrink={0}>
               <Box>
                 <Text color={selected ? "cyan" : undefined}>{selected ? "› " : "  "}</Text>
                 <StatusBadge status={task.status} />
@@ -713,8 +1078,134 @@ function DetailsPane({
           emphasis: true,
         }
       : undefined;
+  const verificationResults = task
+    ? task.verificationResults.length > 0
+      ? task.verificationResults
+      : (run?.verificationResults ?? [])
+    : [];
+  const changedFiles = task
+    ? task.changedFiles.length > 0
+      ? task.changedFiles
+      : (run?.changedFiles ?? [])
+    : [];
+  const verificationCounts = verificationResults.reduce(
+    (counts, result) => {
+      counts[result.status] += 1;
+      return counts;
+    },
+    { pending: 0, passed: 0, failed: 0, skipped: 0 },
+  );
+  const latestVerification = verificationResults.at(-1);
+  const blockerState =
+    task && task.blockedBy.length > 0
+      ? task.blockedBy
+          .map((taskId) => {
+            const dependency = run?.dependencySnapshot.find(
+              (candidate) => candidate.taskId === taskId,
+            );
+            return dependency
+              ? `${taskId} ${workflowLabel(dependency.deliveryStatus)} @ ${dependency.resultCommitSha}`
+              : taskId;
+          })
+          .join(", ")
+      : "none";
+  const taskInputTokens = task ? task.inputTokens || run?.inputTokens || 0 : 0;
+  const taskOutputTokens = task ? task.outputTokens || run?.outputTokens || 0 : 0;
+  const taskCost = task ? task.costUsd || run?.costUsd || 0 : 0;
+  const failureSummary =
+    task && (task.failureClass || task.failureReason || task.retryDisposition || run?.error)
+      ? [
+          task.failureClass ? workflowLabel(task.failureClass) : undefined,
+          task.retryDisposition ? `next ${workflowLabel(task.retryDisposition)}` : undefined,
+          task.failureReason ?? run?.error,
+        ]
+          .filter((value): value is string => Boolean(value))
+          .join(" · ")
+      : undefined;
+  const operationalRows = task
+    ? [
+        {
+          label: "Phase",
+          value: `${workflowLabel(task.currentPhase)} · delivery ${workflowLabel(task.deliveryStatus)}`,
+          tone:
+            task.failureClass !== undefined
+              ? "red"
+              : task.deliveryStatus === "landed"
+                ? "green"
+                : "cyan",
+        },
+        ...(failureSummary
+          ? [{ label: "Failure", value: failureSummary, tone: "red" as const }]
+          : []),
+        ...(task.integrationConflictFiles.length > 0
+          ? [
+              {
+                label: "Conflicts",
+                value: listSummary(task.integrationConflictFiles),
+                tone: "red" as const,
+              },
+            ]
+          : []),
+        {
+          label: "Source",
+          value: `base ${run?.baseSha ?? task.createdBaseSha ?? "not recorded"} · branch ${
+            run?.branchName ?? task.integrationBranch ?? "not created"
+          }`,
+        },
+        {
+          label: "Result",
+          value: `${task.resultCommitSha ?? run?.resultCommitSha ?? "not recorded"} · integrated ${
+            task.integratedSha ?? "no"
+          } · landed ${task.landedSha ?? "no"}`,
+        },
+        {
+          label: "Blockers",
+          value: `${blockerState}${task.blockedReason ? ` · ${task.blockedReason}` : ""}`,
+        },
+        {
+          label: "Changed",
+          value:
+            changedFiles.length > 0
+              ? `${changedFiles.length} · ${listSummary(changedFiles)}`
+              : "0 files recorded",
+        },
+        {
+          label: "Verification",
+          value:
+            verificationResults.length > 0
+              ? `${verificationCounts.passed} passed · ${verificationCounts.failed} failed · ${verificationCounts.pending} pending · ${verificationCounts.skipped} skipped`
+              : `${task.verifyCommands.length} configured · no results`,
+          tone:
+            verificationCounts.failed > 0
+              ? "red"
+              : verificationCounts.passed > 0
+                ? "green"
+                : undefined,
+        },
+        ...(latestVerification
+          ? [
+              {
+                label: "Latest gate",
+                value: `${workflowLabel(latestVerification.status)} · ${
+                  latestVerification.name ??
+                  latestVerification.command ??
+                  workflowLabel(latestVerification.kind)
+                }${latestVerification.summary ? ` · ${latestVerification.summary}` : ""}`,
+                tone: latestVerification.status === "failed" ? "red" : undefined,
+              },
+            ]
+          : []),
+        {
+          label: "Resources",
+          value: `${formatElapsed(run, task)} · ${taskInputTokens.toLocaleString("en-US")} in / ${taskOutputTokens.toLocaleString("en-US")} out · ${formatCost(taskCost)}`,
+        },
+      ]
+    : [];
+  const operationalLimit = typeof height === "number" ? Math.max(3, Math.min(11, height - 14)) : 11;
+  const visibleOperationalRows = operationalRows.slice(0, operationalLimit);
   const activityRowLimit =
-    (typeof height === "number" ? Math.max(2, height - 7) : 8) - (activeStage ? 1 : 0);
+    (typeof height === "number" ? Math.max(2, height - 7 - visibleOperationalRows.length) : 8) -
+    (activeStage ? 1 : 0);
   const visibleActivity = visibleActivityEntries(activity, activityRowLimit);
 
   return (
@@ -757,6 +1248,19 @@ function DetailsPane({
                   : "none"}
               </Text>
               <Text>Auto-commit: {queue.autoCommit ? "on" : "off"}</Text>
+              <Text wrap="truncate-end">
+                Allowed paths: {listSummary(queue.allowedPaths, "unrestricted")}
+              </Text>
+              <Text wrap="truncate-end">Denied paths: {listSummary(queue.deniedPaths)}</Text>
+              <Text>Changed-file limit: {queue.maxChangedFiles ?? "unlimited"}</Text>
+              <Text wrap="truncate-end">Approvals: {listSummary(queue.approvalCheckpoints)}</Text>
+              <Text wrap="truncate-end">
+                Drift: {workflowLabel(queue.baseDriftPolicy)} · landing:{" "}
+                {workflowLabel(queue.landStrategy)} · auto-land {queue.autoLand ? "on" : "off"}
+              </Text>
+              <Text wrap="truncate-end">
+                File concurrency: {workflowLabel(queue.fileConcurrency)}
+              </Text>
               <Text dimColor>Select a task to inspect its live activity.</Text>
             </>
           ) : (
@@ -778,10 +1282,27 @@ function DetailsPane({
             </Text>
           </Box>
           <Text dimColor wrap="truncate-end">
+            Objective: {sanitizeTerminalText(task.objective || task.title)}
+          </Text>
+          <Text dimColor wrap="truncate-end">
+            Instructions:{" "}
             {task.instructions
               ? sanitizeTerminalText(task.instructions)
               : "No additional instructions."}
           </Text>
+          <Box flexDirection="column" marginTop={1}>
+            <Text bold color="magenta">
+              ENGINEERING STATE
+            </Text>
+            {visibleOperationalRows.map((row) => (
+              <Text key={row.label} color={row.tone} wrap="truncate-end">
+                <Text bold dimColor={!row.tone}>
+                  {row.label}:{" "}
+                </Text>
+                {sanitizeTerminalText(row.value)}
+              </Text>
+            ))}
+          </Box>
           <Box marginTop={1} flexDirection="column" flexGrow={1} overflow="hidden">
             {activeStage ? <ActivityRow entry={activeStage} /> : null}
             {visibleActivity.length === 0 && !activeStage ? (
@@ -1247,9 +1768,7 @@ export function AgentqApp({
     try {
       const [nextEvents, taskRuns] = await Promise.all([
         controller.listEvents(selectedTaskId, { limit: 200 }),
-        selectedTask && isTaskActive(selectedTask.status)
-          ? controller.listRuns(selectedTaskId).catch(() => [])
-          : Promise.resolve([]),
+        controller.listRuns(selectedTaskId).catch(() => []),
       ]);
       if (mounted.current && sequence === eventRefreshSequence.current) {
         setEvents(nextEvents);
@@ -1257,7 +1776,8 @@ export function AgentqApp({
           taskRuns.find((candidate) => candidate.id === selectedTask?.currentRunId) ??
             taskRuns.find((candidate) =>
               ["starting", "running", "cancelling"].includes(candidate.status),
-            ),
+            ) ??
+            taskRuns[0],
         );
       }
     } catch (cause) {
@@ -1311,6 +1831,18 @@ export function AgentqApp({
       title: "",
       instructions: "",
       acceptanceCriteria: "",
+      objective: "",
+      invariants: "",
+      handoffRequirements: "",
+      blockedBy: "",
+      expectedPaths: "",
+      allowedPaths: "",
+      deniedPaths: "",
+      maxChangedFiles: "",
+      verifyCommands: "",
+      approvalCheckpoints: "",
+      baseDriftPolicyIndex: selectedOptionIndex(BASE_DRIFT_POLICIES, queue.baseDriftPolicy),
+      landStrategyIndex: selectedOptionIndex(LAND_STRATEGIES, queue.landStrategy),
       idempotencyKey: "",
       field: 0,
     });
@@ -1352,6 +1884,13 @@ export function AgentqApp({
       );
       return;
     }
+    let maxChangedFiles: number | undefined;
+    try {
+      maxChangedFiles = optionalPositiveIntegerFrom(draft.maxChangedFiles, "Maximum changed files");
+    } catch (cause) {
+      setDraft((current) => (current ? { ...current, error: messageFrom(cause) } : current));
+      return;
+    }
 
     if (!beginAction()) return;
     try {
@@ -1361,6 +1900,18 @@ export function AgentqApp({
         title: draft.title.trim(),
         instructions: draft.instructions.trim() || undefined,
         acceptanceCriteria: parseAcceptanceCriteria(draft.acceptanceCriteria),
+        objective: draft.objective.trim() || undefined,
+        invariants: parseList(draft.invariants),
+        handoffRequirements: parseList(draft.handoffRequirements),
+        blockedBy: parseList(draft.blockedBy),
+        expectedPaths: parseList(draft.expectedPaths),
+        allowedPaths: parseList(draft.allowedPaths),
+        deniedPaths: parseList(draft.deniedPaths),
+        ...(maxChangedFiles === undefined ? {} : { maxChangedFiles }),
+        verifyCommands: parseCommands(draft.verifyCommands),
+        approvalCheckpoints: parseList(draft.approvalCheckpoints),
+        baseDriftPolicy: selectedOption(BASE_DRIFT_POLICIES, draft.baseDriftPolicyIndex, "replan"),
+        landStrategy: selectedOption(LAND_STRATEGIES, draft.landStrategyIndex, "none"),
         priority,
         idempotencyKey: draft.idempotencyKey.trim() || undefined,
         sourceKind: "manual",
@@ -1401,6 +1952,20 @@ export function AgentqApp({
       title: selectedTask.title,
       instructions: selectedTask.instructions,
       acceptanceCriteria: selectedTask.acceptanceCriteria.join("; "),
+      objective: selectedTask.objective,
+      invariants: selectedTask.invariants.join("; "),
+      handoffRequirements: selectedTask.handoffRequirements.join("; "),
+      blockedBy: selectedTask.blockedBy.join("; "),
+      expectedPaths: selectedTask.expectedPaths.join("; "),
+      allowedPaths: selectedTask.allowedPaths.join("; "),
+      deniedPaths: selectedTask.deniedPaths.join("; "),
+      maxChangedFiles:
+        selectedTask.maxChangedFiles === undefined ? "" : String(selectedTask.maxChangedFiles),
+      verifyCommands: selectedTask.verifyCommands.join("; "),
+      approvalCheckpoints: selectedTask.approvalCheckpoints.join("; "),
+      baseDriftPolicyIndex: selectedOptionIndex(BASE_DRIFT_POLICIES, selectedTask.baseDriftPolicy),
+      landStrategyIndex: selectedOptionIndex(LAND_STRATEGIES, selectedTask.landStrategy),
+      idempotencyKey: "",
       field: 0,
     });
     setMode("edit");
@@ -1430,11 +1995,37 @@ export function AgentqApp({
       );
       return;
     }
+    let maxChangedFiles: number | undefined;
+    try {
+      maxChangedFiles = optionalPositiveIntegerFrom(
+        editDraft.maxChangedFiles,
+        "Maximum changed files",
+      );
+    } catch (cause) {
+      setEditDraft((current) => (current ? { ...current, error: messageFrom(cause) } : current));
+      return;
+    }
 
     const patch: UiTaskPatch = {
       title,
       instructions: editDraft.instructions.trim(),
       acceptanceCriteria: parseAcceptanceCriteria(editDraft.acceptanceCriteria),
+      objective: editDraft.objective.trim() || title,
+      invariants: parseList(editDraft.invariants),
+      handoffRequirements: parseList(editDraft.handoffRequirements),
+      blockedBy: parseList(editDraft.blockedBy),
+      expectedPaths: parseList(editDraft.expectedPaths),
+      allowedPaths: parseList(editDraft.allowedPaths),
+      deniedPaths: parseList(editDraft.deniedPaths),
+      maxChangedFiles: maxChangedFiles ?? null,
+      verifyCommands: parseCommands(editDraft.verifyCommands),
+      approvalCheckpoints: parseList(editDraft.approvalCheckpoints),
+      baseDriftPolicy: selectedOption(
+        BASE_DRIFT_POLICIES,
+        editDraft.baseDriftPolicyIndex,
+        "replan",
+      ),
+      landStrategy: selectedOption(LAND_STRATEGIES, editDraft.landStrategyIndex, "none"),
       provider,
       priority,
     };
@@ -1477,6 +2068,14 @@ export function AgentqApp({
       maxAttempts: "2",
       verifyCommands: "",
       autoCommit: true,
+      allowedPaths: "",
+      deniedPaths: "",
+      maxChangedFiles: "",
+      approvalCheckpoints: "",
+      baseDriftPolicyIndex: selectedOptionIndex(BASE_DRIFT_POLICIES, "replan"),
+      landStrategyIndex: selectedOptionIndex(LAND_STRATEGIES, "none"),
+      autoLand: false,
+      fileConcurrencyIndex: selectedOptionIndex(FILE_CONCURRENCY_MODES, "off"),
       field: 0,
     });
     setMode("queue-form");
@@ -1503,6 +2102,18 @@ export function AgentqApp({
       maxAttempts: String(selectedQueue.maxAttempts),
       verifyCommands: selectedQueue.verifyCommands.join("; "),
       autoCommit: selectedQueue.autoCommit,
+      allowedPaths: selectedQueue.allowedPaths.join("; "),
+      deniedPaths: selectedQueue.deniedPaths.join("; "),
+      maxChangedFiles:
+        selectedQueue.maxChangedFiles === undefined ? "" : String(selectedQueue.maxChangedFiles),
+      approvalCheckpoints: selectedQueue.approvalCheckpoints.join("; "),
+      baseDriftPolicyIndex: selectedOptionIndex(BASE_DRIFT_POLICIES, selectedQueue.baseDriftPolicy),
+      landStrategyIndex: selectedOptionIndex(LAND_STRATEGIES, selectedQueue.landStrategy),
+      autoLand: selectedQueue.autoLand,
+      fileConcurrencyIndex: selectedOptionIndex(
+        FILE_CONCURRENCY_MODES,
+        selectedQueue.fileConcurrency,
+      ),
       field: 0,
     });
     setMode("queue-form");
@@ -1526,7 +2137,25 @@ export function AgentqApp({
       if (queueDraft.kind === "edit" && !baseRef) throw new Error("Base ref is required.");
       const concurrency = positiveIntegerFrom(queueDraft.concurrency, "Concurrency");
       const maxAttempts = positiveIntegerFrom(queueDraft.maxAttempts, "Max attempts");
+      const maxChangedFiles = optionalPositiveIntegerFrom(
+        queueDraft.maxChangedFiles,
+        "Maximum changed files",
+      );
       const verifyCommands = parseCommands(queueDraft.verifyCommands);
+      const allowedPaths = parseList(queueDraft.allowedPaths);
+      const deniedPaths = parseList(queueDraft.deniedPaths);
+      const approvalCheckpoints = parseList(queueDraft.approvalCheckpoints);
+      const baseDriftPolicy = selectedOption(
+        BASE_DRIFT_POLICIES,
+        queueDraft.baseDriftPolicyIndex,
+        "replan",
+      );
+      const landStrategy = selectedOption(LAND_STRATEGIES, queueDraft.landStrategyIndex, "none");
+      const fileConcurrency = selectedOption(
+        FILE_CONCURRENCY_MODES,
+        queueDraft.fileConcurrencyIndex,
+        "off",
+      );
       if (!beginAction()) return;
       started = true;
 
@@ -1544,6 +2173,14 @@ export function AgentqApp({
           maxAttempts,
           verifyCommands,
           autoCommit: queueDraft.autoCommit,
+          allowedPaths,
+          deniedPaths,
+          ...(maxChangedFiles === undefined ? {} : { maxChangedFiles }),
+          approvalCheckpoints,
+          baseDriftPolicy,
+          landStrategy,
+          autoLand: queueDraft.autoLand,
+          fileConcurrency,
         });
         setSelectedQueueId(created.id);
         setFocus("queues");
@@ -1562,6 +2199,14 @@ export function AgentqApp({
           maxAttempts,
           verifyCommands,
           autoCommit: queueDraft.autoCommit,
+          allowedPaths,
+          deniedPaths,
+          maxChangedFiles: maxChangedFiles ?? null,
+          approvalCheckpoints,
+          baseDriftPolicy,
+          landStrategy,
+          autoLand: queueDraft.autoLand,
+          fileConcurrency,
         };
         const updated = await controller.updateQueue(queueDraft.queueId, patch);
         setSelectedQueueId(updated.id);
@@ -1925,6 +2570,30 @@ export function AgentqApp({
         detail: "Stop the foreground supervisor safely and requeue interrupted work",
         available: true,
       },
+      {
+        id: "approve-checkpoint",
+        label: "Approve current checkpoint",
+        detail: taskSelected
+          ? "Unavailable: the UI controller does not expose approval decisions yet"
+          : "Select a task; approval decisions also require a controller API",
+        available: false,
+      },
+      {
+        id: "integrate-result",
+        label: "Integrate selected task result",
+        detail: taskSelected
+          ? "Unavailable: the UI controller does not expose result integration yet"
+          : "Select a task; result integration also requires a controller API",
+        available: false,
+      },
+      {
+        id: "land-result",
+        label: "Land selected task result",
+        detail: taskSelected
+          ? "Unavailable: the UI controller does not expose result landing yet"
+          : "Select a task; result landing also requires a controller API",
+        available: false,
+      },
     ];
   }, [context, integrationRepositoryPath, selectedQueue, selectedTask, taskFilter]);
 
@@ -2031,6 +2700,11 @@ export function AgentqApp({
         case "quit":
           if (onExit) onExit();
           else exit();
+          break;
+        case "approve-checkpoint":
+        case "integrate-result":
+        case "land-result":
+          setNotice(`${item.label} requires a lifecycle controller API.`);
           break;
       }
     },
@@ -2212,11 +2886,37 @@ export function AgentqApp({
         return;
       }
       if (
+        focusedControl?.kind === "selector" &&
+        (key.leftArrow || key.upArrow || key.rightArrow || key.downArrow)
+      ) {
+        const delta = key.leftArrow || key.upArrow ? -1 : 1;
+        setQueueDraft((current) =>
+          current
+            ? {
+                ...current,
+                [focusedControl.key]: nextIndex(
+                  current[focusedControl.key],
+                  focusedControl.options.length,
+                  delta,
+                ),
+                error: undefined,
+              }
+            : current,
+        );
+        return;
+      }
+      if (
         focusedControl?.kind === "toggle" &&
         (input === " " || key.leftArrow || key.upArrow || key.rightArrow || key.downArrow)
       ) {
         setQueueDraft((current) =>
-          current ? { ...current, autoCommit: !current.autoCommit, error: undefined } : current,
+          current
+            ? {
+                ...current,
+                [focusedControl.key]: !current[focusedControl.key],
+                error: undefined,
+              }
+            : current,
         );
         return;
       }
@@ -2278,19 +2978,22 @@ export function AgentqApp({
         void submitEdit();
         return;
       }
+      const controls = EDIT_TASK_CONTROLS;
+      const focusedControl = controls.find((control) => control.focusIndex === editDraft.field);
+      const fieldCount = controls.length;
       if (key.tab) {
         setEditDraft((current) =>
           current
             ? {
                 ...current,
-                field: nextIndex(current.field, 5, key.shift ? -1 : 1) as EditDraft["field"],
+                field: nextIndex(current.field, fieldCount, key.shift ? -1 : 1),
               }
             : current,
         );
         return;
       }
       if (
-        editDraft.field === 0 &&
+        focusedControl?.kind === "provider" &&
         (key.leftArrow || key.upArrow || key.rightArrow || key.downArrow)
       ) {
         const delta = key.leftArrow || key.upArrow ? -1 : 1;
@@ -2305,56 +3008,67 @@ export function AgentqApp({
         );
         return;
       }
-      if (key.ctrl && input === "n" && (editDraft.field === 3 || editDraft.field === 4)) {
-        setEditDraft((current) => {
-          if (!current || (current.field !== 3 && current.field !== 4)) return current;
-          const field = current.field === 3 ? "instructions" : "acceptanceCriteria";
-          return { ...current, [field]: `${current[field]}\n`, error: undefined };
-        });
+      if (
+        focusedControl?.kind === "selector" &&
+        (key.leftArrow || key.upArrow || key.rightArrow || key.downArrow)
+      ) {
+        const delta = key.leftArrow || key.upArrow ? -1 : 1;
+        setEditDraft((current) =>
+          current
+            ? {
+                ...current,
+                [focusedControl.key]: nextIndex(
+                  current[focusedControl.key],
+                  focusedControl.options.length,
+                  delta,
+                ),
+                error: undefined,
+              }
+            : current,
+        );
         return;
       }
       if (key.return) {
-        if (editDraft.field < 4) {
-          setEditDraft((current) =>
-            current ? { ...current, field: (current.field + 1) as EditDraft["field"] } : current,
-          );
+        if (editDraft.field < fieldCount - 1) {
+          setEditDraft((current) => (current ? { ...current, field: current.field + 1 } : current));
         } else {
           void submitEdit();
         }
         return;
       }
-      if ((key.ctrl && input === "u") || key.backspace || key.delete) {
+
+      if (
+        focusedControl?.kind === "text" &&
+        focusedControl.multiline &&
+        key.ctrl &&
+        input === "n"
+      ) {
+        const textField = focusedControl.key;
+        setEditDraft((current) =>
+          current
+            ? { ...current, [textField]: `${current[textField]}\n`, error: undefined }
+            : current,
+        );
+        return;
+      }
+      const textField = focusedControl?.kind === "text" ? focusedControl.key : undefined;
+      if (textField && ((key.ctrl && input === "u") || key.backspace || key.delete)) {
         setEditDraft((current) => {
-          if (!current || current.field === 0) return current;
-          const field =
-            current.field === 1
-              ? "priority"
-              : current.field === 2
-                ? "title"
-                : current.field === 3
-                  ? "instructions"
-                  : "acceptanceCriteria";
+          if (!current) return current;
           return {
             ...current,
-            [field]: key.ctrl ? "" : current[field].slice(0, -1),
+            [textField]: key.ctrl ? "" : current[textField].slice(0, -1),
             error: undefined,
           };
         });
         return;
       }
-      if (!key.ctrl && !key.meta && input && editDraft.field > 0) {
-        setEditDraft((current) => {
-          if (!current || current.field === 0) return current;
-          const field =
-            current.field === 1
-              ? "priority"
-              : current.field === 2
-                ? "title"
-                : current.field === 3
-                  ? "instructions"
-                  : "acceptanceCriteria";
-          return { ...current, [field]: current[field] + input, error: undefined };
-        });
+      if (textField && !key.ctrl && !key.meta && input) {
+        setEditDraft((current) =>
+          current
+            ? { ...current, [textField]: current[textField] + input, error: undefined }
+            : current,
+        );
       }
       return;
     }
@@ -2369,22 +3083,28 @@ export function AgentqApp({
         void submitAdd();
         return;
       }
+      const controls = ADD_TASK_CONTROLS;
+      const focusedControl = controls.find((control) => control.focusIndex === draft.field);
+      const fieldCount = controls.length;
       if (key.tab) {
         setDraft((current) =>
           current
             ? {
                 ...current,
-                field: nextIndex(current.field, 7, key.shift ? -1 : 1) as AddDraft["field"],
+                field: nextIndex(current.field, fieldCount, key.shift ? -1 : 1),
               }
             : current,
         );
         return;
       }
-      if ((key.leftArrow || key.upArrow || key.rightArrow || key.downArrow) && draft.field < 2) {
+      if (
+        (focusedControl?.kind === "queue" || focusedControl?.kind === "provider") &&
+        (key.leftArrow || key.upArrow || key.rightArrow || key.downArrow)
+      ) {
         const delta = key.leftArrow || key.upArrow ? -1 : 1;
         setDraft((current) => {
           if (!current) return current;
-          if (current.field === 0) {
+          if (focusedControl.kind === "queue") {
             const currentIndex = snapshot.queues.findIndex((queue) => queue.id === current.queueId);
             const nextQueue =
               currentIndex < 0
@@ -2409,60 +3129,67 @@ export function AgentqApp({
         });
         return;
       }
-      if (key.ctrl && input === "n" && (draft.field === 3 || draft.field === 5)) {
-        setDraft((current) => {
-          if (!current || (current.field !== 3 && current.field !== 5)) return current;
-          const field = current.field === 3 ? "instructions" : "acceptanceCriteria";
-          return { ...current, [field]: `${current[field]}\n`, error: undefined };
-        });
+      if (
+        focusedControl?.kind === "selector" &&
+        (key.leftArrow || key.upArrow || key.rightArrow || key.downArrow)
+      ) {
+        const delta = key.leftArrow || key.upArrow ? -1 : 1;
+        setDraft((current) =>
+          current
+            ? {
+                ...current,
+                [focusedControl.key]: nextIndex(
+                  current[focusedControl.key],
+                  focusedControl.options.length,
+                  delta,
+                ),
+                error: undefined,
+              }
+            : current,
+        );
         return;
       }
       if (key.return) {
-        if (draft.field < 6) {
-          setDraft((current) =>
-            current ? { ...current, field: (current.field + 1) as AddDraft["field"] } : current,
-          );
+        if (draft.field < fieldCount - 1) {
+          setDraft((current) => (current ? { ...current, field: current.field + 1 } : current));
         } else {
           void submitAdd();
         }
         return;
       }
-      if ((key.ctrl && input === "u") || key.backspace || key.delete) {
+
+      if (
+        focusedControl?.kind === "text" &&
+        focusedControl.multiline &&
+        key.ctrl &&
+        input === "n"
+      ) {
+        const textField = focusedControl.key;
+        setDraft((current) =>
+          current
+            ? { ...current, [textField]: `${current[textField]}\n`, error: undefined }
+            : current,
+        );
+        return;
+      }
+      const textField = focusedControl?.kind === "text" ? focusedControl.key : undefined;
+      if (textField && ((key.ctrl && input === "u") || key.backspace || key.delete)) {
         setDraft((current) => {
-          if (!current || current.field < 2) return current;
-          const keyName =
-            current.field === 2
-              ? "title"
-              : current.field === 3
-                ? "instructions"
-                : current.field === 4
-                  ? "priority"
-                  : current.field === 5
-                    ? "acceptanceCriteria"
-                    : "idempotencyKey";
+          if (!current) return current;
           return {
             ...current,
-            [keyName]: key.ctrl ? "" : current[keyName].slice(0, -1),
+            [textField]: key.ctrl ? "" : current[textField].slice(0, -1),
             error: undefined,
           };
         });
         return;
       }
-      if (!key.ctrl && !key.meta && input && draft.field >= 2) {
-        setDraft((current) => {
-          if (!current) return current;
-          const keyName =
-            current.field === 2
-              ? "title"
-              : current.field === 3
-                ? "instructions"
-                : current.field === 4
-                  ? "priority"
-                  : current.field === 5
-                    ? "acceptanceCriteria"
-                    : "idempotencyKey";
-          return { ...current, [keyName]: current[keyName] + input, error: undefined };
-        });
+      if (textField && !key.ctrl && !key.meta && input) {
+        setDraft((current) =>
+          current
+            ? { ...current, [textField]: current[textField] + input, error: undefined }
+            : current,
+        );
       }
       return;
     }
@@ -2671,6 +3398,10 @@ export function AgentqApp({
           <Text dimColor>
             Forms: tab fields · ctrl+n newline · ctrl+u clear · ctrl+s save · esc cancel
           </Text>
+          <Text dimColor>
+            Lifecycle: approval, result integration, and landing appear in : and stay disabled until
+            controller APIs are connected
+          </Text>
         </Box>
       </Box>
     );
@@ -2759,6 +3490,13 @@ export function AgentqApp({
         return {
           label: control.label,
           value: queueDraft[control.key] ? "on" : "off",
+          focused: queueDraft.field === control.focusIndex,
+        };
+      }
+      if (control.kind === "selector") {
+        return {
+          label: control.label,
+          value: control.options[queueDraft[control.key]] ?? "unavailable",
           focused: queueDraft.field === control.focusIndex,
         };
       }
@@ -3016,47 +3754,45 @@ export function AgentqApp({
   }
 
   if (mode === "edit" && editDraft) {
+    const fields: FormField[] = EDIT_TASK_CONTROLS.map((control) => {
+      if (control.kind === "provider") {
+        return {
+          label: control.label,
+          value: PROVIDERS[editDraft.providerIndex] ?? "No provider",
+          focused: editDraft.field === control.focusIndex,
+        };
+      }
+      if (control.kind === "selector") {
+        return {
+          label: control.label,
+          value: control.options[editDraft[control.key]] ?? "unavailable",
+          focused: editDraft.field === control.focusIndex,
+        };
+      }
+      if (control.kind === "text") {
+        return {
+          label: control.label,
+          value: editDraft[control.key] || control.placeholder || "",
+          focused: editDraft.field === control.focusIndex,
+          multiline: control.multiline,
+          textInput: true,
+        };
+      }
+      return {
+        label: control.label,
+        value: "Unavailable while editing",
+        focused: editDraft.field === control.focusIndex,
+      };
+    });
     return (
       <FormScreen
         columns={columns}
         rows={rows}
         title="EDIT TASK"
         subtitle="Changes apply to the next attempt and keep existing run history."
-        fields={[
-          {
-            label: "Provider",
-            value: PROVIDERS[editDraft.providerIndex] ?? "No provider",
-            focused: editDraft.field === 0,
-          },
-          {
-            label: "Priority",
-            value: editDraft.priority,
-            focused: editDraft.field === 1,
-            textInput: true,
-          },
-          {
-            label: "Title",
-            value: editDraft.title,
-            focused: editDraft.field === 2,
-            textInput: true,
-          },
-          {
-            label: "Instructions",
-            value: editDraft.instructions,
-            focused: editDraft.field === 3,
-            multiline: true,
-            textInput: true,
-          },
-          {
-            label: "Acceptance criteria",
-            value: editDraft.acceptanceCriteria,
-            focused: editDraft.field === 4,
-            multiline: true,
-            textInput: true,
-          },
-        ]}
+        fields={fields}
         error={editDraft.error}
-        footer="ctrl+s save · esc cancel · ←→ provider · enter next/submit · tab next · ctrl+u clear"
+        footer="ctrl+s save · ctrl+n newline · esc cancel · ←→ change · tab fields · ctrl+u clear"
       />
     );
   }
@@ -3064,58 +3800,45 @@ export function AgentqApp({
   if (mode === "add" && draft) {
     const queue = snapshot.queues.find((candidate) => candidate.id === draft.queueId);
     const provider = PROVIDERS[draft.providerIndex];
+    const fields: FormField[] = ADD_TASK_CONTROLS.map((control) => {
+      if (control.kind === "queue") {
+        return {
+          label: control.label,
+          value: queue?.name ?? "Queue unavailable (removed)",
+          focused: draft.field === control.focusIndex,
+        };
+      }
+      if (control.kind === "provider") {
+        return {
+          label: control.label,
+          value: provider ?? "No provider",
+          focused: draft.field === control.focusIndex,
+        };
+      }
+      if (control.kind === "selector") {
+        return {
+          label: control.label,
+          value: control.options[draft[control.key]] ?? "unavailable",
+          focused: draft.field === control.focusIndex,
+        };
+      }
+      return {
+        label: control.label,
+        value: draft[control.key] || control.placeholder || "",
+        focused: draft.field === control.focusIndex,
+        multiline: control.multiline,
+        textInput: true,
+      };
+    });
     return (
       <FormScreen
         columns={columns}
         rows={rows}
         title="ADD TASK"
         subtitle="Choose the queue and provider, then describe the outcome."
-        fields={[
-          {
-            label: "Queue",
-            value: queue?.name ?? "Queue unavailable (removed)",
-            focused: draft.field === 0,
-          },
-          {
-            label: "Provider",
-            value: provider ?? "No provider",
-            focused: draft.field === 1,
-          },
-          {
-            label: "Title",
-            value: draft.title,
-            focused: draft.field === 2,
-            textInput: true,
-          },
-          {
-            label: "Instructions",
-            value: draft.instructions,
-            focused: draft.field === 3,
-            multiline: true,
-            textInput: true,
-          },
-          {
-            label: "Priority",
-            value: draft.priority,
-            focused: draft.field === 4,
-            textInput: true,
-          },
-          {
-            label: "Acceptance",
-            value: draft.acceptanceCriteria,
-            focused: draft.field === 5,
-            multiline: true,
-            textInput: true,
-          },
-          {
-            label: "Idempotency key",
-            value: draft.idempotencyKey,
-            focused: draft.field === 6,
-            textInput: true,
-          },
-        ]}
+        fields={fields}
         error={draft.error}
-        footer="ctrl+s submit · esc cancel · ←→ choose · tab next · ctrl+u clear · ; separates criteria"
+        footer="ctrl+s submit · esc cancel · ←→ choose"
       />
     );
   }

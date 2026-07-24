@@ -8,67 +8,84 @@ import type { UiController, UiTaskPatch } from "../src/ui/types.ts";
 
 const NOW = "2026-07-21T12:00:00.000Z";
 
-const queue = (overrides: Partial<Queue> = {}): Queue => ({
-  id: "queue-main",
-  name: "main",
-  repoKey: "/code/agentq/.git",
-  repoPath: "/code/agentq",
-  baseRef: "main",
-  defaultProvider: "codex",
-  planModel: "",
-  planInstructions: "",
-  implementModel: "",
-  implementInstructions: "",
-  concurrency: 3,
-  maxAttempts: 2,
-  verifyCommands: [],
-  autoCommit: true,
-  allowedPaths: [],
-  deniedPaths: [],
-  approvalCheckpoints: [],
-  baseDriftPolicy: "replan",
-  landStrategy: "none",
-  autoLand: false,
-  fileConcurrency: "off",
-  createdAt: NOW,
-  updatedAt: NOW,
-  ...overrides,
-});
+type QueueOverrides = Omit<Partial<Queue>, "maxChangedFiles"> & {
+  maxChangedFiles?: number | null;
+};
 
-const task = (overrides: Partial<Task> = {}): Task => ({
-  id: "task-1",
-  queueId: "queue-main",
-  queueName: "main",
-  title: "Fix session redirect",
-  instructions: "Reproduce the expired-session redirect and add a regression test.",
-  acceptanceCriteria: [],
-  objective: "Reproduce the expired-session redirect and add a regression test.",
-  invariants: [],
-  handoffRequirements: [],
-  blockedBy: [],
-  expectedPaths: [],
-  allowedPaths: [],
-  deniedPaths: [],
-  verifyCommands: [],
-  approvalCheckpoints: [],
-  baseDriftPolicy: "replan",
-  landStrategy: "none",
-  provider: "codex",
-  priority: 0,
-  status: "running",
-  currentPhase: "implement",
-  deliveryStatus: "not_started",
-  changedFiles: [],
-  verificationResults: [],
-  inputTokens: 0,
-  outputTokens: 0,
-  costUsd: 0,
-  sourceKind: "manual",
-  attemptCount: 1,
-  createdAt: NOW,
-  updatedAt: NOW,
-  ...overrides,
-});
+const queue = (overrides: QueueOverrides = {}): Queue => {
+  const { maxChangedFiles, ...rest } = overrides;
+  return {
+    id: "queue-main",
+    name: "main",
+    repoKey: "/code/agentq/.git",
+    repoPath: "/code/agentq",
+    baseRef: "main",
+    defaultProvider: "codex",
+    planModel: "",
+    planInstructions: "",
+    implementModel: "",
+    implementInstructions: "",
+    concurrency: 3,
+    maxAttempts: 2,
+    verifyCommands: [],
+    autoCommit: true,
+    allowedPaths: [],
+    deniedPaths: [],
+    approvalCheckpoints: [],
+    baseDriftPolicy: "replan",
+    landStrategy: "none",
+    autoLand: false,
+    fileConcurrency: "off",
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...rest,
+    ...(maxChangedFiles === null || maxChangedFiles === undefined ? {} : { maxChangedFiles }),
+  };
+};
+
+type TaskOverrides = Omit<Partial<Task>, "maxChangedFiles"> & {
+  maxChangedFiles?: number | null;
+};
+
+const task = (overrides: TaskOverrides = {}): Task => {
+  const { maxChangedFiles, ...rest } = overrides;
+  return {
+    id: "task-1",
+    queueId: "queue-main",
+    queueName: "main",
+    title: "Fix session redirect",
+    instructions: "Reproduce the expired-session redirect and add a regression test.",
+    acceptanceCriteria: [],
+    objective: "Reproduce the expired-session redirect and add a regression test.",
+    invariants: [],
+    handoffRequirements: [],
+    blockedBy: [],
+    expectedPaths: [],
+    allowedPaths: [],
+    deniedPaths: [],
+    verifyCommands: [],
+    approvalCheckpoints: [],
+    baseDriftPolicy: "replan",
+    landStrategy: "none",
+    provider: "codex",
+    priority: 0,
+    status: "running",
+    currentPhase: "implement",
+    deliveryStatus: "not_started",
+    changedFiles: [],
+    verificationResults: [],
+    integrationConflictFiles: [],
+    inputTokens: 0,
+    outputTokens: 0,
+    costUsd: 0,
+    sourceKind: "manual",
+    attemptCount: 1,
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...rest,
+    ...(maxChangedFiles === null || maxChangedFiles === undefined ? {} : { maxChangedFiles }),
+  };
+};
 
 const event = (overrides: Partial<TaskEvent> = {}): TaskEvent => ({
   id: 1,
@@ -461,7 +478,20 @@ describe("AgentqApp", () => {
       <AgentqApp
         controller={createController({
           listQueues: mock(async () => [
-            queue({ id: "queue-a", name: "app", repoPath: "/repos/alpha", baseRef: "release" }),
+            queue({
+              id: "queue-a",
+              name: "app",
+              repoPath: "/repos/alpha",
+              baseRef: "release",
+              allowedPaths: ["src/services/**"],
+              deniedPaths: ["src/api/**"],
+              maxChangedFiles: 20,
+              approvalCheckpoints: ["red-tests"],
+              baseDriftPolicy: "rebase",
+              landStrategy: "stack",
+              autoLand: true,
+              fileConcurrency: "enforced",
+            }),
             queue({ id: "queue-b", name: "app", repoPath: "/repos/beta" }),
           ]),
           listTasks: mock(async () => []),
@@ -471,7 +501,7 @@ describe("AgentqApp", () => {
             canToggle: true,
           }),
         })}
-        dimensions={{ columns: 128, rows: 28 }}
+        dimensions={{ columns: 128, rows: 40 }}
       />,
     );
     await settle();
@@ -484,6 +514,91 @@ describe("AgentqApp", () => {
     expect(frame).toContain("Provider: codex");
     expect(frame).toContain("Concurrency: 3");
     expect(frame).toContain("Auto-commit: on");
+    expect(frame).toContain("Allowed paths: src/services/**");
+    expect(frame).toContain("Denied paths: src/api/**");
+    expect(frame).toContain("Changed-file limit: 20");
+    expect(frame).toContain("Approvals: red-tests");
+    expect(frame).toContain("Drift: REBASE");
+    expect(frame).toContain("landing: STACK");
+    expect(frame).toContain("File concurrency: ENFORCED");
+  });
+
+  test("shows dependency, delivery, verification, resource, and failure state for a task", async () => {
+    const selected = task({
+      status: "failed",
+      currentPhase: "integrate",
+      deliveryStatus: "ready_to_integrate",
+      blockedBy: ["task-base"],
+      blockedReason: "Waiting for the integration lane",
+      createdBaseSha: "base-created-sha",
+      resultCommitSha: "result-task-sha",
+      changedFiles: ["src/services/jobs.ts", "test/services/jobs.test.ts"],
+      verificationResults: [
+        {
+          kind: "command",
+          status: "passed",
+          command: "bun test test/services",
+          summary: "24 tests passed",
+          durationMs: 1_200,
+        },
+        {
+          kind: "denied_paths",
+          status: "failed",
+          name: "Denied path guard",
+          summary: "src/api/jobs.ts is prohibited",
+        },
+      ],
+      integrationConflictFiles: ["src/services/jobs.ts"],
+      integrationBranch: "agentq/train/main",
+      integratedSha: "integrated-task-sha",
+      failureClass: "integration_conflict",
+      failureReason: "Merge train conflict",
+      retryDisposition: "manual_resolution",
+      inputTokens: 1_234,
+      outputTokens: 567,
+      costUsd: 0.042,
+    });
+    const latestRun = run({
+      status: "failed",
+      baseSha: "base-run-sha",
+      branchName: "agentq/task-1/attempt-1",
+      resultCommitSha: "result-run-sha",
+      dependencySnapshot: [
+        {
+          taskId: "task-base",
+          runId: "run-base",
+          resultCommitSha: "blocker-result-sha",
+          deliveryStatus: "integrated",
+          integratedSha: "blocker-integrated-sha",
+        },
+      ],
+      error: "Automatic integration found a conflict",
+    });
+    const view = render(
+      <AgentqApp
+        controller={createController({
+          listTasks: mock(async () => [selected]),
+          listRuns: mock(async () => [latestRun]),
+          listEvents: mock(async () => []),
+        })}
+        dimensions={{ columns: 160, rows: 44 }}
+      />,
+    );
+
+    const frame = await waitForFrame(view.lastFrame, "base base-run-sha");
+    expect(frame).toContain("Phase: INTEGRATE · delivery READY TO INTEGRATE");
+    expect(frame).toContain("Failure: INTEGRATION CONFLICT");
+    expect(frame).toContain("next MANUAL RESOLUTION");
+    expect(frame).toContain("Conflicts: src/services/jobs.ts");
+    expect(frame).toContain("base base-run-sha");
+    expect(frame).toContain("branch agentq/task-1/attempt-1");
+    expect(frame).toContain("result-task-sha");
+    expect(frame).toContain("integrated integrated-task-sha");
+    expect(frame).toContain("task-base INTEGRATED @ blocker-result-sha");
+    expect(frame).toContain("2 · src/services/jobs.ts, test/services/jobs.test.ts");
+    expect(frame).toContain("1 passed · 1 failed");
+    expect(frame).toContain("FAILED · Denied path guard");
+    expect(frame).toContain("1,234 in / 567 out · $0.04");
   });
 
   test("uses tab and arrows to navigate a narrow one-pane layout", async () => {
@@ -695,7 +810,55 @@ describe("AgentqApp", () => {
     await settle();
     view.stdin.write("manual-queue-view");
     await settle();
-    view.stdin.write("\r");
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("Produce a verified queue dashboard");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("Keep public APIs stable; Preserve persisted runs");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("Report changed files; Include verification evidence");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("task-0");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("src/ui/**; test/ui.test.tsx");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("src/ui/**; test/ui.test.tsx");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("src/api/**");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("12");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("bun test test/ui.test.tsx; bun run typecheck");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("red-tests; integrate");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("\u001B[C");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("\u001B[C");
+    await settle();
+    view.stdin.write("\u0013");
     await settle();
 
     expect(addTask).toHaveBeenCalledTimes(1);
@@ -705,6 +868,18 @@ describe("AgentqApp", () => {
       title: "Build a durable queue view",
       instructions: "Show reconnect-safe live output",
       acceptanceCriteria: ["Tests pass", "Output reconnects"],
+      objective: "Produce a verified queue dashboard",
+      invariants: ["Keep public APIs stable", "Preserve persisted runs"],
+      handoffRequirements: ["Report changed files", "Include verification evidence"],
+      blockedBy: ["task-0"],
+      expectedPaths: ["src/ui/**", "test/ui.test.tsx"],
+      allowedPaths: ["src/ui/**", "test/ui.test.tsx"],
+      deniedPaths: ["src/api/**"],
+      maxChangedFiles: 12,
+      verifyCommands: ["bun test test/ui.test.tsx", "bun run typecheck"],
+      approvalCheckpoints: ["red-tests", "integrate"],
+      baseDriftPolicy: "fail",
+      landStrategy: "stack",
       priority: 5,
       idempotencyKey: "manual-queue-view",
       sourceKind: "manual",
@@ -841,6 +1016,14 @@ describe("AgentqApp", () => {
         maxAttempts: input.maxAttempts ?? 1,
         verifyCommands: input.verifyCommands ?? [],
         autoCommit: input.autoCommit ?? false,
+        allowedPaths: input.allowedPaths ?? [],
+        deniedPaths: input.deniedPaths ?? [],
+        ...(input.maxChangedFiles === undefined ? {} : { maxChangedFiles: input.maxChangedFiles }),
+        approvalCheckpoints: input.approvalCheckpoints ?? [],
+        baseDriftPolicy: input.baseDriftPolicy ?? "replan",
+        landStrategy: input.landStrategy ?? "none",
+        autoLand: input.autoLand ?? false,
+        fileConcurrency: input.fileConcurrency ?? "off",
       }),
     );
     const view = render(
@@ -854,7 +1037,7 @@ describe("AgentqApp", () => {
     view.stdin.write("n");
     await settle();
     expect(view.lastFrame()).toContain("CREATE QUEUE");
-    expect(view.lastFrame()).toContain("FIELD 1/12");
+    expect(view.lastFrame()).toContain("FIELD 1/20");
     expect(view.lastFrame()).toContain("hidden");
 
     view.stdin.write("shipping");
@@ -909,7 +1092,41 @@ describe("AgentqApp", () => {
     await settle();
     view.stdin.write(" ");
     await settle();
-    view.stdin.write("\r");
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("src/services/**; tests/services/**");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("src/api/**; tests/api/**");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("20");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("red-tests; integrate");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("\u001B[D");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("\u001B[C");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write(" ");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("\u001B[C");
+    await settle();
+    view.stdin.write("\u001B[C");
+    await settle();
+    view.stdin.write("\u0013");
     await settle();
 
     expect(createQueue).toHaveBeenCalledWith({
@@ -925,6 +1142,14 @@ describe("AgentqApp", () => {
       maxAttempts: 3,
       verifyCommands: ["bun test", "bun run typecheck"],
       autoCommit: false,
+      allowedPaths: ["src/services/**", "tests/services/**"],
+      deniedPaths: ["src/api/**", "tests/api/**"],
+      maxChangedFiles: 20,
+      approvalCheckpoints: ["red-tests", "integrate"],
+      baseDriftPolicy: "rebase",
+      landStrategy: "stack",
+      autoLand: true,
+      fileConcurrency: "enforced",
     });
     expect(view.lastFrame()).toContain("Created queue shipping");
   });
@@ -970,6 +1195,43 @@ describe("AgentqApp", () => {
     await settle();
     expect(deleteQueue).toHaveBeenCalledWith("queue-main");
     expect(view.lastFrame()).toContain("Deleted queue main");
+  });
+
+  test("clears an existing queue changed-file limit explicitly", async () => {
+    const configuredQueue = queue({ maxChangedFiles: 20 });
+    const updateQueue = mock(
+      async (_queueId: string, patch: Parameters<UiController["updateQueue"]>[1]) =>
+        queue({ ...configuredQueue, ...patch }),
+    );
+    const view = render(
+      <AgentqApp
+        controller={createController({
+          listQueues: mock(async () => [configuredQueue]),
+          updateQueue,
+        })}
+        dimensions={{ columns: 100, rows: 28 }}
+      />,
+    );
+    await settle();
+
+    view.stdin.write("e");
+    await settle();
+    for (let index = 0; index < 13; index += 1) {
+      view.stdin.write("\t");
+      await Bun.sleep(10);
+    }
+    await settle();
+    expect(view.lastFrame()).toContain("Maximum changed files");
+    expect(view.lastFrame()).toContain("20▏");
+    view.stdin.write("\u0015");
+    await settle();
+    view.stdin.write("\u0013");
+    await settle();
+
+    expect(updateQueue).toHaveBeenCalledWith(
+      "queue-main",
+      expect.objectContaining({ maxChangedFiles: null }),
+    );
   });
 
   test("confirms deletion of an inactive selected task", async () => {
@@ -1273,7 +1535,56 @@ describe("AgentqApp", () => {
     view.stdin.write("\u000e");
     view.stdin.write("Regression covered");
     await settle();
-    view.stdin.write("\r");
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("\u0015");
+    view.stdin.write("Eliminate the redirect race");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("Keep auth state compatible; Avoid API changes");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("List changed files; Report gate results");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("task-auth-base");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("src/auth/**; test/auth/**");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("src/auth/**; test/auth/**");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("src/api/**");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("8");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("bun test test/auth; bun run typecheck");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("red-tests; integration");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("\u001B[C");
+    await settle();
+    view.stdin.write("\t");
+    await settle();
+    view.stdin.write("\u001B[C");
+    await settle();
+    view.stdin.write("\u0013");
     await settle();
 
     expect(editTask).toHaveBeenCalledTimes(1);
@@ -1283,12 +1594,62 @@ describe("AgentqApp", () => {
         title: "Fix the redirect race",
         instructions: "Update the guard\nCover the race",
         acceptanceCriteria: ["Redirects once", "Regression covered"],
+        objective: "Eliminate the redirect race",
+        invariants: ["Keep auth state compatible", "Avoid API changes"],
+        handoffRequirements: ["List changed files", "Report gate results"],
+        blockedBy: ["task-auth-base"],
+        expectedPaths: ["src/auth/**", "test/auth/**"],
+        allowedPaths: ["src/auth/**", "test/auth/**"],
+        deniedPaths: ["src/api/**"],
+        maxChangedFiles: 8,
+        verifyCommands: ["bun test test/auth", "bun run typecheck"],
+        approvalCheckpoints: ["red-tests", "integration"],
+        baseDriftPolicy: "fail",
+        landStrategy: "stack",
         provider: "claude",
         priority: 7,
       },
       NOW,
     ]);
     expect(view.lastFrame()).toContain("Updated task-1");
+  });
+
+  test("clears an existing task changed-file limit explicitly", async () => {
+    const editTask = mock(async (_taskId: string, patch: UiTaskPatch, _expectedUpdatedAt: string) =>
+      task({ status: "failed", maxChangedFiles: patch.maxChangedFiles }),
+    );
+    const view = render(
+      <AgentqApp
+        controller={createController({
+          listTasks: mock(async () => [task({ status: "failed", maxChangedFiles: 20 })]),
+          editTask,
+        })}
+        dimensions={{ columns: 100, rows: 28 }}
+      />,
+    );
+    await settle();
+
+    view.stdin.write("2");
+    await settle();
+    view.stdin.write("e");
+    await settle();
+    for (let index = 0; index < 12; index += 1) {
+      view.stdin.write("\t");
+      await Bun.sleep(10);
+    }
+    await settle();
+    expect(view.lastFrame()).toContain("Maximum changed files");
+    expect(view.lastFrame()).toContain("20▏");
+    view.stdin.write("\u0015");
+    await settle();
+    view.stdin.write("\u0013");
+    await settle();
+
+    expect(editTask).toHaveBeenCalledWith(
+      "task-1",
+      expect.objectContaining({ maxChangedFiles: null }),
+      NOW,
+    );
   });
 
   test("opens editing only for editable task states and explains locked states", async () => {
@@ -1547,6 +1908,7 @@ describe("AgentqApp", () => {
       />,
     );
     await waitForFrame(view.lastFrame, "[FAILED]");
+    await settle();
 
     view.stdin.write("v");
     await waitForFrame(view.lastFrame, "ATTEMPTS");
@@ -1668,6 +2030,9 @@ describe("AgentqApp", () => {
     expect(actions).toContain("Resume selected task");
     expect(actions).toContain("Integrate both providers");
     expect(actions).toContain("Doctor & providers");
+    expect(actions).toContain("× Approve current checkpoint");
+    expect(actions).toContain("× Integrate selected task result");
+    expect(actions).toContain("× Land selected task result");
 
     view.stdin.write("\u001B[B");
     await settle();
@@ -1885,14 +2250,40 @@ describe("AgentqApp", () => {
       "Title",
       "Instructions",
       "Priority",
-      "Acceptance",
+      "Acceptance criteria",
       "Idempotency key",
+      "Objective",
+      "Invariants",
+      "Handoff requirements",
+      "Blocked by task IDs",
+      "Expected paths",
+      "Allowed paths",
+      "Denied paths",
+      "Maximum changed files",
+      "Verification commands",
+      "Approval checkpoints",
+      "Base drift policy",
+      "Land strategy",
     ];
     for (const [index, label] of fields.entries()) {
       const frame = view.lastFrame() ?? "";
       expectLargeFormField(frame, "ADD TASK", label, index + 1, fields.length);
       expect(frame).toContain("hidden");
-      if (label === "Instructions" || label === "Acceptance") {
+      if (
+        [
+          "Instructions",
+          "Acceptance criteria",
+          "Objective",
+          "Invariants",
+          "Handoff requirements",
+          "Blocked by task IDs",
+          "Expected paths",
+          "Allowed paths",
+          "Denied paths",
+          "Verification commands",
+          "Approval checkpoints",
+        ].includes(label)
+      ) {
         expectTallFormField(frame, label);
       }
       if (index < fields.length - 1) {
@@ -1919,11 +2310,43 @@ describe("AgentqApp", () => {
     view.stdin.write("e");
     await settle();
 
-    const fields = ["Provider", "Priority", "Title", "Instructions", "Acceptance criteria"];
+    const fields = [
+      "Provider",
+      "Priority",
+      "Title",
+      "Instructions",
+      "Acceptance criteria",
+      "Objective",
+      "Invariants",
+      "Handoff requirements",
+      "Blocked by task IDs",
+      "Expected paths",
+      "Allowed paths",
+      "Denied paths",
+      "Maximum changed files",
+      "Verification commands",
+      "Approval checkpoints",
+      "Base drift policy",
+      "Land strategy",
+    ];
     for (const [index, label] of fields.entries()) {
       const frame = view.lastFrame() ?? "";
       expectLargeFormField(frame, "EDIT TASK", label, index + 1, fields.length);
-      if (label === "Instructions" || label === "Acceptance criteria") {
+      if (
+        [
+          "Instructions",
+          "Acceptance criteria",
+          "Objective",
+          "Invariants",
+          "Handoff requirements",
+          "Blocked by task IDs",
+          "Expected paths",
+          "Allowed paths",
+          "Denied paths",
+          "Verification commands",
+          "Approval checkpoints",
+        ].includes(label)
+      ) {
         expectTallFormField(frame, label);
       }
       if (index < fields.length - 1) {
@@ -1988,6 +2411,14 @@ describe("AgentqApp", () => {
       "Max attempts",
       "Verify commands",
       "Auto-commit",
+      "Allowed paths",
+      "Denied paths",
+      "Maximum changed files",
+      "Approval checkpoints",
+      "Base drift policy",
+      "Land strategy",
+      "Auto-land",
+      "File concurrency",
     ];
     for (const [index, label] of fields.entries()) {
       const frame = view.lastFrame() ?? "";
@@ -1995,7 +2426,10 @@ describe("AgentqApp", () => {
       if (
         label === "Plan instructions" ||
         label === "Implementation instructions" ||
-        label === "Verify commands"
+        label === "Verify commands" ||
+        label === "Allowed paths" ||
+        label === "Denied paths" ||
+        label === "Approval checkpoints"
       ) {
         expectTallFormField(frame, label);
       }
@@ -2029,6 +2463,14 @@ describe("AgentqApp", () => {
       "Max attempts",
       "Verify commands",
       "Auto-commit",
+      "Allowed paths",
+      "Denied paths",
+      "Maximum changed files",
+      "Approval checkpoints",
+      "Base drift policy",
+      "Land strategy",
+      "Auto-land",
+      "File concurrency",
     ];
     for (const [index, label] of fields.entries()) {
       const frame = view.lastFrame() ?? "";
@@ -2036,7 +2478,10 @@ describe("AgentqApp", () => {
       if (
         label === "Plan instructions" ||
         label === "Implementation instructions" ||
-        label === "Verify commands"
+        label === "Verify commands" ||
+        label === "Allowed paths" ||
+        label === "Denied paths" ||
+        label === "Approval checkpoints"
       ) {
         expectTallFormField(frame, label);
       }
