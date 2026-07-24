@@ -912,12 +912,13 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
         ])
       ).stdout.trim(),
     ).toBe(resultSha);
-    expect(stored?.integratedSha).toBeTruthy();
+    const integratedSha = stored?.integratedSha;
+    if (!integratedSha) throw new Error("Expected the result to be integrated");
     expect(
       (
         await runCommand("git", ["-C", repo, "rev-parse", `refs/heads/agentq/train/${queue.id}`])
       ).stdout.trim(),
-    ).toBe(stored?.integratedSha);
+    ).toBe(integratedSha);
     expect(
       app.store
         .listDeliveryOperations({ taskId: task.id })

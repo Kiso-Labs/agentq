@@ -44,6 +44,10 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return command(cwd, "git", args);
 }
 
+async function gitExitCode(cwd: string, ...args: string[]): Promise<number> {
+  return (await runCommand("git", args, { cwd })).exitCode;
+}
+
 async function commitAll(cwd: string, message: string): Promise<string> {
   await git(cwd, "add", "--all");
   await git(
@@ -387,6 +391,71 @@ describe("AgentQApp delivery", () => {
     if (!deliveredTask?.landedSha) throw new Error("Expected an automatically landed task");
     expect(await git(value.repo, "rev-parse", "refs/heads/main")).toBe(deliveredTask.landedSha);
     expect(await readFile(join(value.repo, "approved.txt"), "utf8")).toBe("approved delivery\n");
+  });
+
+  test("a rejected integration approval permanently stops delivery without creating a train", async () => {
+    const value = await fixture();
+    const queue = await deliveryQueue(value, {
+      autoLand: true,
+      approvalCheckpoints: ["before-integrate"],
+    });
+    const result = await createSuccessfulResult(value, queue, {
+      title: "Rejected automatic delivery",
+      path: "rejected.txt",
+      content: "must not land\n",
+    });
+
+    expect(await value.app.processReadyDeliveries({ queue: queue.id })).toBeTrue();
+    expect(await value.app.listTaskApprovals(result.task.id)).toEqual([
+      expect.objectContaining({
+        checkpoint: "before-integrate",
+        status: "pending",
+      }),
+    ]);
+
+    const rejection = await value.app.rejectTaskCheckpoint(result.task.id, "before-integrate", {
+      actor: "release-manager",
+      note: "The release cannot accept this change",
+    });
+    expect(rejection).toMatchObject({
+      checkpoint: "before-integrate",
+      status: "rejected",
+      actor: "release-manager",
+      note: "The release cannot accept this change",
+    });
+    expect(await value.app.listTaskApprovals(result.task.id)).toEqual([rejection]);
+    expect(await value.app.getTask(result.task.id)).toMatchObject({
+      status: "failed",
+      currentPhase: "complete",
+      failureClass: "policy_violation",
+      retryDisposition: "stop",
+      deliveryStatus: "ready_to_integrate",
+    });
+
+    expect(await value.app.processReadyDeliveries({ queue: queue.id })).toBeFalse();
+    expect(await value.app.processReadyDeliveries({ queue: queue.id })).toBeFalse();
+    let integrationErrorCode: string | undefined;
+    try {
+      await value.app.integrateTask(result.task.id);
+    } catch (error) {
+      integrationErrorCode =
+        error instanceof Error && "code" in error ? String(error.code) : undefined;
+    }
+    expect(
+      integrationErrorCode === "APPROVAL_REJECTED" ||
+        integrationErrorCode === "TASK_RESULT_NOT_VERIFIED",
+    ).toBeTrue();
+
+    const delivery = await value.app.getQueueDelivery(queue.id);
+    expect(delivery.lane).toBeUndefined();
+    expect(delivery.operations).toEqual([]);
+    expect(
+      await gitExitCode(value.repo, "show-ref", "--verify", `refs/heads/agentq/train/${queue.id}`),
+    ).not.toBe(0);
+    expect(await git(value.repo, "rev-parse", "refs/heads/main")).toBe(result.baseSha);
+    expect(
+      await gitExitCode(value.repo, "cat-file", "-e", "refs/heads/main:rejected.txt"),
+    ).not.toBe(0);
   });
 
   test("refuses to integrate a task without successful verified result evidence", async () => {
