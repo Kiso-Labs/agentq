@@ -70,6 +70,108 @@ export type RunStatus = (typeof RUN_STATUSES)[number];
 export const EXECUTION_PHASES = ["plan", "implement"] as const;
 export type ExecutionPhase = (typeof EXECUTION_PHASES)[number];
 
+/**
+ * Delivery is deliberately orthogonal to `TaskStatus`: task status describes
+ * whether an agent process is runnable, while delivery status describes how
+ * far its result has progressed toward the repository's target branch.
+ */
+export const DELIVERY_STATUSES = [
+  "not_started",
+  "implemented",
+  "verified",
+  "ready_to_integrate",
+  "integrated",
+  "landed",
+] as const;
+export type DeliveryStatus = (typeof DELIVERY_STATUSES)[number];
+
+export const CURRENT_PHASES = [
+  "queued",
+  "blocked",
+  "plan",
+  "red_test",
+  "approval",
+  "implement",
+  "verify",
+  "integrate",
+  "land",
+  "complete",
+] as const;
+export type CurrentPhase = (typeof CURRENT_PHASES)[number];
+
+export const FAILURE_CLASSES = [
+  "transient_infrastructure",
+  "stale_base",
+  "test_regression",
+  "blocked_dependency",
+  "file_conflict",
+  "policy_violation",
+  "integration_conflict",
+  "agent_failure",
+  "cancelled",
+  "unknown",
+] as const;
+export type FailureClass = (typeof FAILURE_CLASSES)[number];
+
+export const RETRY_DISPOSITIONS = [
+  "retry",
+  "rebase_and_retry",
+  "return_to_implementation",
+  "wait",
+  "stop",
+  "manual_resolution",
+] as const;
+export type RetryDisposition = (typeof RETRY_DISPOSITIONS)[number];
+
+export const LAND_STRATEGIES = ["none", "stack", "merge-train"] as const;
+export type LandStrategy = (typeof LAND_STRATEGIES)[number];
+
+export const BASE_DRIFT_POLICIES = ["rebase", "replan", "fail"] as const;
+export type BaseDriftPolicy = (typeof BASE_DRIFT_POLICIES)[number];
+
+export const FILE_CONCURRENCY_MODES = ["off", "advisory", "enforced"] as const;
+export type FileConcurrencyMode = (typeof FILE_CONCURRENCY_MODES)[number];
+
+export const VERIFICATION_GATE_KINDS = [
+  "command",
+  "allowed_paths",
+  "denied_paths",
+  "max_changed_files",
+  "clean_worktree",
+] as const;
+export type VerificationGateKind = (typeof VERIFICATION_GATE_KINDS)[number];
+
+export const VERIFICATION_STATUSES = ["pending", "passed", "failed", "skipped"] as const;
+export type VerificationStatus = (typeof VERIFICATION_STATUSES)[number];
+
+export interface VerificationResult {
+  kind: VerificationGateKind;
+  status: VerificationStatus;
+  name?: string;
+  command?: string;
+  exitCode?: number;
+  summary?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  durationMs?: number;
+}
+
+/** Immutable evidence from a blocker used to construct a dependent attempt. */
+export interface TaskDependencySnapshot {
+  taskId: string;
+  runId: string;
+  resultCommitSha: string;
+  deliveryStatus: DeliveryStatus;
+  integratedSha?: string;
+  landedSha?: string;
+}
+
+export interface TaskDependency {
+  taskId: string;
+  blockerTaskId: string;
+  createdAt: string;
+}
+
 export interface QueueWorkflowSnapshot {
   planModel: string;
   planInstructions: string;
@@ -92,6 +194,14 @@ export interface Queue {
   maxAttempts: number;
   verifyCommands: string[];
   autoCommit: boolean;
+  allowedPaths: string[];
+  deniedPaths: string[];
+  maxChangedFiles?: number;
+  approvalCheckpoints: string[];
+  baseDriftPolicy: BaseDriftPolicy;
+  landStrategy: LandStrategy;
+  autoLand: boolean;
+  fileConcurrency: FileConcurrencyMode;
   createdAt: string;
   updatedAt: string;
 }
@@ -102,6 +212,21 @@ export interface TaskSpecSnapshot {
   acceptanceCriteria: string[];
   provider: Provider;
   priority: number;
+  /** Optional on legacy snapshots created before structured task specs. */
+  objective?: string;
+  invariants?: string[];
+  handoffRequirements?: string[];
+  blockedBy?: string[];
+  expectedPaths?: string[];
+  allowedPaths?: string[];
+  deniedPaths?: string[];
+  maxChangedFiles?: number;
+  verifyCommands?: string[];
+  approvalCheckpoints?: string[];
+  baseDriftPolicy?: BaseDriftPolicy;
+  landStrategy?: LandStrategy;
+  createdBaseSha?: string;
+  dependencies?: TaskDependencySnapshot[];
   /** Immutable queue workflow captured when this attempt is claimed. */
   workflow?: QueueWorkflowSnapshot;
 }
@@ -113,9 +238,40 @@ export interface Task {
   title: string;
   instructions: string;
   acceptanceCriteria: string[];
+  objective: string;
+  invariants: string[];
+  handoffRequirements: string[];
+  blockedBy: string[];
+  expectedPaths: string[];
+  allowedPaths: string[];
+  deniedPaths: string[];
+  maxChangedFiles?: number;
+  verifyCommands: string[];
+  approvalCheckpoints: string[];
+  baseDriftPolicy: BaseDriftPolicy;
+  landStrategy: LandStrategy;
+  createdBaseSha?: string;
   provider: Provider;
   priority: number;
   status: TaskStatus;
+  currentPhase: CurrentPhase;
+  deliveryStatus: DeliveryStatus;
+  blockedReason?: string;
+  failureClass?: FailureClass;
+  failureReason?: string;
+  retryDisposition?: RetryDisposition;
+  resultRunId?: string;
+  resultCommitSha?: string;
+  changedFiles: string[];
+  verificationResults: VerificationResult[];
+  integrationBranch?: string;
+  integratedSha?: string;
+  landedSha?: string;
+  integratedAt?: string;
+  landedAt?: string;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
   sourceKind: "manual" | "agent" | "api";
   parentTaskId?: string;
   idempotencyKey?: string;
@@ -147,6 +303,15 @@ export interface Run {
   processIdentityPath?: string;
   ownerPid?: number;
   taskSnapshot?: TaskSpecSnapshot;
+  dependencySnapshot: TaskDependencySnapshot[];
+  resultCommitSha?: string;
+  changedFiles: string[];
+  verificationResults: VerificationResult[];
+  failureClass?: FailureClass;
+  retryDisposition?: RetryDisposition;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
   startedAt: string;
   heartbeatAt: string;
   finishedAt?: string;
@@ -179,6 +344,14 @@ export interface CreateQueueInput {
   maxAttempts?: number;
   verifyCommands?: string[];
   autoCommit?: boolean;
+  allowedPaths?: string[];
+  deniedPaths?: string[];
+  maxChangedFiles?: number;
+  approvalCheckpoints?: string[];
+  baseDriftPolicy?: BaseDriftPolicy;
+  landStrategy?: LandStrategy;
+  autoLand?: boolean;
+  fileConcurrency?: FileConcurrencyMode;
 }
 
 export interface AddTaskInput {
@@ -186,6 +359,19 @@ export interface AddTaskInput {
   title: string;
   instructions?: string;
   acceptanceCriteria?: string[];
+  objective?: string;
+  invariants?: string[];
+  handoffRequirements?: string[];
+  blockedBy?: string[];
+  expectedPaths?: string[];
+  allowedPaths?: string[];
+  deniedPaths?: string[];
+  maxChangedFiles?: number;
+  verifyCommands?: string[];
+  approvalCheckpoints?: string[];
+  baseDriftPolicy?: BaseDriftPolicy;
+  landStrategy?: LandStrategy;
+  createdBaseSha?: string;
   provider?: Provider;
   priority?: number;
   idempotencyKey?: string;

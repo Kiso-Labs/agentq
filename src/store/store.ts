@@ -5,22 +5,33 @@ import { AgentQError, errorMessage } from "../core/errors.ts";
 import { isoNow, makeId } from "../core/paths.ts";
 import {
   type AddTaskInput,
+  BASE_DRIFT_POLICIES,
   type CreateQueueInput,
+  CURRENT_PHASES,
   canCompleteTaskManually,
   canRetryTask,
+  DELIVERY_STATUSES,
   EXECUTION_PHASES,
+  FAILURE_CLASSES,
+  FILE_CONCURRENCY_MODES,
   isTaskActive,
+  LAND_STRATEGIES,
   PROVIDERS,
   type Queue,
   type QueueWorkflowSnapshot,
+  RETRY_DISPOSITIONS,
   RUN_STATUSES,
   type Run,
   type RunStatus,
   TASK_STATUSES,
   type Task,
+  type TaskDependencySnapshot,
   type TaskEvent,
   type TaskSpecSnapshot,
   type TaskStatus,
+  VERIFICATION_GATE_KINDS,
+  VERIFICATION_STATUSES,
+  type VerificationResult,
 } from "../core/types.ts";
 import { migrate } from "./migrations.ts";
 import { selectAll, selectOne } from "./sqlite.ts";
@@ -70,6 +81,14 @@ interface QueueRow {
   max_attempts: unknown;
   verify_commands: unknown;
   auto_commit: unknown;
+  allowed_paths: unknown;
+  denied_paths: unknown;
+  max_changed_files: unknown;
+  approval_checkpoints: unknown;
+  base_drift_policy: unknown;
+  land_strategy: unknown;
+  auto_land: unknown;
+  file_concurrency: unknown;
   created_at: unknown;
   updated_at: unknown;
 }
@@ -81,9 +100,40 @@ interface TaskRow {
   title: unknown;
   instructions: unknown;
   acceptance_criteria: unknown;
+  objective: unknown;
+  invariants: unknown;
+  handoff_requirements: unknown;
+  blocked_by: unknown;
+  expected_paths: unknown;
+  allowed_paths: unknown;
+  denied_paths: unknown;
+  max_changed_files: unknown;
+  verify_commands: unknown;
+  approval_checkpoints: unknown;
+  base_drift_policy: unknown;
+  land_strategy: unknown;
+  created_base_sha: unknown;
   provider: unknown;
   priority: unknown;
   status: unknown;
+  current_phase: unknown;
+  delivery_status: unknown;
+  blocked_reason: unknown;
+  failure_class: unknown;
+  failure_reason: unknown;
+  retry_disposition: unknown;
+  result_run_id: unknown;
+  result_commit_sha: unknown;
+  changed_files: unknown;
+  verification_results: unknown;
+  integration_branch: unknown;
+  integrated_sha: unknown;
+  landed_sha: unknown;
+  integrated_at: unknown;
+  landed_at: unknown;
+  input_tokens: unknown;
+  output_tokens: unknown;
+  cost_usd: unknown;
   source_kind: unknown;
   parent_task_id: unknown;
   idempotency_key: unknown;
@@ -116,6 +166,15 @@ interface RunRow {
   owner_token: unknown;
   owner_pid: unknown;
   task_snapshot: unknown;
+  dependency_snapshot: unknown;
+  result_commit_sha: unknown;
+  changed_files: unknown;
+  verification_results: unknown;
+  failure_class: unknown;
+  retry_disposition: unknown;
+  input_tokens: unknown;
+  output_tokens: unknown;
+  cost_usd: unknown;
   started_at: unknown;
   heartbeat_at: unknown;
   finished_at: unknown;
@@ -153,6 +212,14 @@ const QUEUE_COLUMNS = `
   q.max_attempts,
   q.verify_commands,
   q.auto_commit,
+  q.allowed_paths,
+  q.denied_paths,
+  q.max_changed_files,
+  q.approval_checkpoints,
+  q.base_drift_policy,
+  q.land_strategy,
+  q.auto_land,
+  q.file_concurrency,
   q.created_at,
   q.updated_at
 `;
@@ -164,9 +231,48 @@ const TASK_COLUMNS = `
   t.title,
   t.instructions,
   t.acceptance_criteria,
+  t.objective,
+  t.invariants,
+  t.handoff_requirements,
+  COALESCE((
+    SELECT json_group_array(blocker_task_id)
+    FROM (
+      SELECT d.blocker_task_id
+      FROM task_dependencies d
+      WHERE d.task_id = t.id
+      ORDER BY d.blocker_task_id
+    )
+  ), '[]') AS blocked_by,
+  t.expected_paths,
+  t.allowed_paths,
+  t.denied_paths,
+  t.max_changed_files,
+  t.verify_commands,
+  t.approval_checkpoints,
+  t.base_drift_policy,
+  t.land_strategy,
+  t.created_base_sha,
   t.provider,
   t.priority,
   t.status,
+  t.current_phase,
+  t.delivery_status,
+  t.blocked_reason,
+  t.failure_class,
+  t.failure_reason,
+  t.retry_disposition,
+  t.result_run_id,
+  t.result_commit_sha,
+  t.changed_files,
+  t.verification_results,
+  t.integration_branch,
+  t.integrated_sha,
+  t.landed_sha,
+  t.integrated_at,
+  t.landed_at,
+  t.input_tokens,
+  t.output_tokens,
+  t.cost_usd,
   t.source_kind,
   t.parent_task_id,
   t.idempotency_key,
@@ -199,6 +305,15 @@ const RUN_COLUMNS = `
   r.owner_token,
   r.owner_pid,
   r.task_snapshot,
+  r.dependency_snapshot,
+  r.result_commit_sha,
+  r.changed_files,
+  r.verification_results,
+  r.failure_class,
+  r.retry_disposition,
+  r.input_tokens,
+  r.output_tokens,
+  r.cost_usd,
   r.started_at,
   r.heartbeat_at,
   r.finished_at,
@@ -299,6 +414,116 @@ function jsonObject(
   }
 }
 
+function finiteNumberValue(value: unknown, entity: string, id: string, column: string): number {
+  const number = typeof value === "bigint" ? Number(value) : value;
+  if (typeof number !== "number" || !Number.isFinite(number)) {
+    return corrupt(entity, id, column, "a finite number");
+  }
+  return number;
+}
+
+function parsedStringArray(value: unknown, entity: string, id: string, column: string): string[] {
+  if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) {
+    return corrupt(entity, id, column, "a string array");
+  }
+  return [...value];
+}
+
+function jsonArray(value: unknown, entity: string, id: string, column: string): unknown[] {
+  const json = stringValue(value, entity, id, column);
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (!Array.isArray(parsed)) return corrupt(entity, id, column, "a JSON array");
+    return parsed;
+  } catch (error) {
+    if (error instanceof AgentQError) throw error;
+    return corrupt(entity, id, column, "valid JSON");
+  }
+}
+
+function verificationResults(
+  value: unknown,
+  entity: string,
+  id: string,
+  column: string,
+): VerificationResult[] {
+  return jsonArray(value, entity, id, column).map((item, index) => {
+    const itemColumn = `${column}[${index}]`;
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return corrupt(entity, id, itemColumn, "a verification result object");
+    }
+    const row = item as Record<string, unknown>;
+    const optionalText = (key: keyof VerificationResult): string | undefined =>
+      row[key] === undefined
+        ? undefined
+        : stringValue(row[key], entity, id, `${itemColumn}.${key}`);
+    const optionalCount = (key: "exitCode" | "durationMs"): number | undefined =>
+      row[key] === undefined
+        ? undefined
+        : integerValue(row[key], entity, id, `${itemColumn}.${key}`);
+    const name = optionalText("name");
+    const command = optionalText("command");
+    const summary = optionalText("summary");
+    const startedAt = optionalText("startedAt");
+    const finishedAt = optionalText("finishedAt");
+    const exitCode = optionalCount("exitCode");
+    const durationMs = optionalCount("durationMs");
+    return {
+      kind: enumValue(row.kind, VERIFICATION_GATE_KINDS, entity, id, `${itemColumn}.kind`),
+      status: enumValue(row.status, VERIFICATION_STATUSES, entity, id, `${itemColumn}.status`),
+      ...(name === undefined ? {} : { name }),
+      ...(command === undefined ? {} : { command }),
+      ...(exitCode === undefined ? {} : { exitCode }),
+      ...(summary === undefined ? {} : { summary }),
+      ...(startedAt === undefined ? {} : { startedAt }),
+      ...(finishedAt === undefined ? {} : { finishedAt }),
+      ...(durationMs === undefined ? {} : { durationMs }),
+    };
+  });
+}
+
+function dependencySnapshots(
+  value: unknown,
+  entity: string,
+  id: string,
+  column: string,
+): TaskDependencySnapshot[] {
+  return jsonArray(value, entity, id, column).map((item, index) => {
+    const itemColumn = `${column}[${index}]`;
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return corrupt(entity, id, itemColumn, "a dependency snapshot object");
+    }
+    const row = item as Record<string, unknown>;
+    const integratedSha =
+      row.integratedSha === undefined
+        ? undefined
+        : stringValue(row.integratedSha, entity, id, `${itemColumn}.integratedSha`);
+    const landedSha =
+      row.landedSha === undefined
+        ? undefined
+        : stringValue(row.landedSha, entity, id, `${itemColumn}.landedSha`);
+    return {
+      taskId: stringValue(row.taskId, entity, id, `${itemColumn}.taskId`),
+      runId: stringValue(row.runId, entity, id, `${itemColumn}.runId`),
+      resultCommitSha: stringValue(
+        row.resultCommitSha,
+        entity,
+        id,
+        `${itemColumn}.resultCommitSha`,
+      ),
+      deliveryStatus: enumValue(
+        row.deliveryStatus,
+        DELIVERY_STATUSES,
+        entity,
+        id,
+        `${itemColumn}.deliveryStatus`,
+      ),
+      ...(integratedSha === undefined ? {} : { integratedSha }),
+      ...(landedSha === undefined ? {} : { landedSha }),
+    };
+  });
+}
+
 function taskSpecSnapshot(
   value: unknown,
   entity: string,
@@ -307,13 +532,12 @@ function taskSpecSnapshot(
 ): TaskSpecSnapshot | undefined {
   if (value === null || value === undefined) return undefined;
   const parsed = jsonObject(value, entity, id, column);
-  const acceptanceCriteria = parsed.acceptanceCriteria;
-  if (
-    !Array.isArray(acceptanceCriteria) ||
-    !acceptanceCriteria.every((item) => typeof item === "string")
-  ) {
-    return corrupt(entity, id, column, "a task specification snapshot");
-  }
+  const acceptanceCriteria = parsedStringArray(
+    parsed.acceptanceCriteria,
+    entity,
+    id,
+    `${column}.acceptanceCriteria`,
+  );
   let workflow: QueueWorkflowSnapshot | undefined;
   if (parsed.workflow !== undefined) {
     if (!parsed.workflow || typeof parsed.workflow !== "object" || Array.isArray(parsed.workflow)) {
@@ -342,12 +566,71 @@ function taskSpecSnapshot(
       ),
     };
   }
+  const optionalText = (key: keyof TaskSpecSnapshot): string | undefined =>
+    parsed[key] === undefined
+      ? undefined
+      : stringValue(parsed[key], entity, id, `${column}.${String(key)}`);
+  const optionalArray = (key: keyof TaskSpecSnapshot): string[] | undefined =>
+    parsed[key] === undefined
+      ? undefined
+      : parsedStringArray(parsed[key], entity, id, `${column}.${String(key)}`);
+  const objective = optionalText("objective");
+  const invariants = optionalArray("invariants");
+  const handoffRequirements = optionalArray("handoffRequirements");
+  const blockedBy = optionalArray("blockedBy");
+  const expectedPaths = optionalArray("expectedPaths");
+  const allowedPaths = optionalArray("allowedPaths");
+  const deniedPaths = optionalArray("deniedPaths");
+  const verifyCommands = optionalArray("verifyCommands");
+  const approvalCheckpoints = optionalArray("approvalCheckpoints");
+  const createdBaseSha = optionalText("createdBaseSha");
+  const maxChangedFiles =
+    parsed.maxChangedFiles === undefined
+      ? undefined
+      : integerValue(parsed.maxChangedFiles, entity, id, `${column}.maxChangedFiles`);
+  const baseDriftPolicy =
+    parsed.baseDriftPolicy === undefined
+      ? undefined
+      : enumValue(
+          parsed.baseDriftPolicy,
+          BASE_DRIFT_POLICIES,
+          entity,
+          id,
+          `${column}.baseDriftPolicy`,
+        );
+  const landStrategy =
+    parsed.landStrategy === undefined
+      ? undefined
+      : enumValue(parsed.landStrategy, LAND_STRATEGIES, entity, id, `${column}.landStrategy`);
+  const dependencies =
+    parsed.dependencies === undefined
+      ? undefined
+      : dependencySnapshots(
+          JSON.stringify(parsed.dependencies),
+          entity,
+          id,
+          `${column}.dependencies`,
+        );
   return {
     title: stringValue(parsed.title, entity, id, `${column}.title`),
     instructions: stringValue(parsed.instructions, entity, id, `${column}.instructions`),
     acceptanceCriteria: [...acceptanceCriteria],
     provider: enumValue(parsed.provider, PROVIDERS, entity, id, `${column}.provider`),
     priority: integerValue(parsed.priority, entity, id, `${column}.priority`),
+    ...(objective === undefined ? {} : { objective }),
+    ...(invariants === undefined ? {} : { invariants }),
+    ...(handoffRequirements === undefined ? {} : { handoffRequirements }),
+    ...(blockedBy === undefined ? {} : { blockedBy }),
+    ...(expectedPaths === undefined ? {} : { expectedPaths }),
+    ...(allowedPaths === undefined ? {} : { allowedPaths }),
+    ...(deniedPaths === undefined ? {} : { deniedPaths }),
+    ...(maxChangedFiles === undefined ? {} : { maxChangedFiles }),
+    ...(verifyCommands === undefined ? {} : { verifyCommands }),
+    ...(approvalCheckpoints === undefined ? {} : { approvalCheckpoints }),
+    ...(baseDriftPolicy === undefined ? {} : { baseDriftPolicy }),
+    ...(landStrategy === undefined ? {} : { landStrategy }),
+    ...(createdBaseSha === undefined ? {} : { createdBaseSha }),
+    ...(dependencies === undefined ? {} : { dependencies }),
     ...(workflow === undefined ? {} : { workflow }),
   };
 }
@@ -367,6 +650,7 @@ function enumValue<const T extends readonly string[]>(
 
 function mapQueue(row: QueueRow): Queue {
   const id = rowId(row, "queue");
+  const maxChangedFiles = optionalInteger(row.max_changed_files, "queue", id, "max_changed_files");
   return {
     id,
     name: stringValue(row.name, "queue", id, "name"),
@@ -387,6 +671,31 @@ function mapQueue(row: QueueRow): Queue {
     maxAttempts: integerValue(row.max_attempts, "queue", id, "max_attempts"),
     verifyCommands: jsonStringArray(row.verify_commands, "queue", id, "verify_commands"),
     autoCommit: booleanValue(row.auto_commit, "queue", id, "auto_commit"),
+    allowedPaths: jsonStringArray(row.allowed_paths, "queue", id, "allowed_paths"),
+    deniedPaths: jsonStringArray(row.denied_paths, "queue", id, "denied_paths"),
+    ...(maxChangedFiles === undefined ? {} : { maxChangedFiles }),
+    approvalCheckpoints: jsonStringArray(
+      row.approval_checkpoints,
+      "queue",
+      id,
+      "approval_checkpoints",
+    ),
+    baseDriftPolicy: enumValue(
+      row.base_drift_policy,
+      BASE_DRIFT_POLICIES,
+      "queue",
+      id,
+      "base_drift_policy",
+    ),
+    landStrategy: enumValue(row.land_strategy, LAND_STRATEGIES, "queue", id, "land_strategy"),
+    autoLand: booleanValue(row.auto_land, "queue", id, "auto_land"),
+    fileConcurrency: enumValue(
+      row.file_concurrency,
+      FILE_CONCURRENCY_MODES,
+      "queue",
+      id,
+      "file_concurrency",
+    ),
     createdAt: stringValue(row.created_at, "queue", id, "created_at"),
     updatedAt: stringValue(row.updated_at, "queue", id, "updated_at"),
   };
@@ -405,6 +714,30 @@ function mapTask(row: TaskRow): Task {
     "cancel_requested_at",
   );
   const completedAt = optionalString(row.completed_at, "task", id, "completed_at");
+  const maxChangedFiles = optionalInteger(row.max_changed_files, "task", id, "max_changed_files");
+  const createdBaseSha = optionalString(row.created_base_sha, "task", id, "created_base_sha");
+  const blockedReason = optionalString(row.blocked_reason, "task", id, "blocked_reason");
+  const failureClass =
+    row.failure_class === null || row.failure_class === undefined
+      ? undefined
+      : enumValue(row.failure_class, FAILURE_CLASSES, "task", id, "failure_class");
+  const failureReason = optionalString(row.failure_reason, "task", id, "failure_reason");
+  const retryDisposition =
+    row.retry_disposition === null || row.retry_disposition === undefined
+      ? undefined
+      : enumValue(row.retry_disposition, RETRY_DISPOSITIONS, "task", id, "retry_disposition");
+  const resultRunId = optionalString(row.result_run_id, "task", id, "result_run_id");
+  const resultCommitSha = optionalString(row.result_commit_sha, "task", id, "result_commit_sha");
+  const integrationBranch = optionalString(
+    row.integration_branch,
+    "task",
+    id,
+    "integration_branch",
+  );
+  const integratedSha = optionalString(row.integrated_sha, "task", id, "integrated_sha");
+  const landedSha = optionalString(row.landed_sha, "task", id, "landed_sha");
+  const integratedAt = optionalString(row.integrated_at, "task", id, "integrated_at");
+  const landedAt = optionalString(row.landed_at, "task", id, "landed_at");
   return {
     id,
     queueId: stringValue(row.queue_id, "task", id, "queue_id"),
@@ -414,9 +747,67 @@ function mapTask(row: TaskRow): Task {
     title: stringValue(row.title, "task", id, "title"),
     instructions: stringValue(row.instructions, "task", id, "instructions"),
     acceptanceCriteria: jsonStringArray(row.acceptance_criteria, "task", id, "acceptance_criteria"),
+    objective: stringValue(row.objective, "task", id, "objective"),
+    invariants: jsonStringArray(row.invariants, "task", id, "invariants"),
+    handoffRequirements: jsonStringArray(
+      row.handoff_requirements,
+      "task",
+      id,
+      "handoff_requirements",
+    ),
+    blockedBy: jsonStringArray(row.blocked_by, "task", id, "blocked_by"),
+    expectedPaths: jsonStringArray(row.expected_paths, "task", id, "expected_paths"),
+    allowedPaths: jsonStringArray(row.allowed_paths, "task", id, "allowed_paths"),
+    deniedPaths: jsonStringArray(row.denied_paths, "task", id, "denied_paths"),
+    ...(maxChangedFiles === undefined ? {} : { maxChangedFiles }),
+    verifyCommands: jsonStringArray(row.verify_commands, "task", id, "verify_commands"),
+    approvalCheckpoints: jsonStringArray(
+      row.approval_checkpoints,
+      "task",
+      id,
+      "approval_checkpoints",
+    ),
+    baseDriftPolicy: enumValue(
+      row.base_drift_policy,
+      BASE_DRIFT_POLICIES,
+      "task",
+      id,
+      "base_drift_policy",
+    ),
+    landStrategy: enumValue(row.land_strategy, LAND_STRATEGIES, "task", id, "land_strategy"),
+    ...(createdBaseSha === undefined ? {} : { createdBaseSha }),
     provider: enumValue(row.provider, PROVIDERS, "task", id, "provider"),
     priority: integerValue(row.priority, "task", id, "priority"),
     status: enumValue(row.status, TASK_STATUSES, "task", id, "status"),
+    currentPhase: enumValue(row.current_phase, CURRENT_PHASES, "task", id, "current_phase"),
+    deliveryStatus: enumValue(
+      row.delivery_status,
+      DELIVERY_STATUSES,
+      "task",
+      id,
+      "delivery_status",
+    ),
+    ...(blockedReason === undefined ? {} : { blockedReason }),
+    ...(failureClass === undefined ? {} : { failureClass }),
+    ...(failureReason === undefined ? {} : { failureReason }),
+    ...(retryDisposition === undefined ? {} : { retryDisposition }),
+    ...(resultRunId === undefined ? {} : { resultRunId }),
+    ...(resultCommitSha === undefined ? {} : { resultCommitSha }),
+    changedFiles: jsonStringArray(row.changed_files, "task", id, "changed_files"),
+    verificationResults: verificationResults(
+      row.verification_results,
+      "task",
+      id,
+      "verification_results",
+    ),
+    ...(integrationBranch === undefined ? {} : { integrationBranch }),
+    ...(integratedSha === undefined ? {} : { integratedSha }),
+    ...(landedSha === undefined ? {} : { landedSha }),
+    ...(integratedAt === undefined ? {} : { integratedAt }),
+    ...(landedAt === undefined ? {} : { landedAt }),
+    inputTokens: integerValue(row.input_tokens, "task", id, "input_tokens"),
+    outputTokens: integerValue(row.output_tokens, "task", id, "output_tokens"),
+    costUsd: finiteNumberValue(row.cost_usd, "task", id, "cost_usd"),
     sourceKind: enumValue(
       row.source_kind,
       ["manual", "agent", "api"] as const,
@@ -439,6 +830,14 @@ function mapTask(row: TaskRow): Task {
 function mapRun(row: RunRow): Run {
   const id = rowId(row, "run");
   const snapshot = taskSpecSnapshot(row.task_snapshot, "run", id, "task_snapshot");
+  const failureClass =
+    row.failure_class === null || row.failure_class === undefined
+      ? undefined
+      : enumValue(row.failure_class, FAILURE_CLASSES, "run", id, "failure_class");
+  const retryDisposition =
+    row.retry_disposition === null || row.retry_disposition === undefined
+      ? undefined
+      : enumValue(row.retry_disposition, RETRY_DISPOSITIONS, "run", id, "retry_disposition");
   const optional = <K extends keyof Run>(
     key: K,
     value: Run[K] | undefined,
@@ -472,6 +871,28 @@ function mapRun(row: RunRow): Run {
     ),
     ...optional("ownerPid", optionalInteger(row.owner_pid, "run", id, "owner_pid")),
     ...optional("taskSnapshot", snapshot),
+    dependencySnapshot: dependencySnapshots(
+      row.dependency_snapshot,
+      "run",
+      id,
+      "dependency_snapshot",
+    ),
+    ...optional(
+      "resultCommitSha",
+      optionalString(row.result_commit_sha, "run", id, "result_commit_sha"),
+    ),
+    changedFiles: jsonStringArray(row.changed_files, "run", id, "changed_files"),
+    verificationResults: verificationResults(
+      row.verification_results,
+      "run",
+      id,
+      "verification_results",
+    ),
+    ...optional("failureClass", failureClass),
+    ...optional("retryDisposition", retryDisposition),
+    inputTokens: integerValue(row.input_tokens, "run", id, "input_tokens"),
+    outputTokens: integerValue(row.output_tokens, "run", id, "output_tokens"),
+    costUsd: finiteNumberValue(row.cost_usd, "run", id, "cost_usd"),
     startedAt: stringValue(row.started_at, "run", id, "started_at"),
     heartbeatAt: stringValue(row.heartbeat_at, "run", id, "heartbeat_at"),
     ...optional("finishedAt", optionalString(row.finished_at, "run", id, "finished_at")),
@@ -655,6 +1076,16 @@ export class AgentQStore {
     const concurrency = integerInput(input.concurrency ?? 1, "concurrency", 1);
     const maxAttempts = integerInput(input.maxAttempts ?? 3, "maxAttempts", 1);
     const verifyCommands = stringArrayInput(input.verifyCommands ?? [], "verifyCommands");
+    const allowedPaths = stringArrayInput(input.allowedPaths ?? [], "allowedPaths");
+    const deniedPaths = stringArrayInput(input.deniedPaths ?? [], "deniedPaths");
+    const maxChangedFiles =
+      input.maxChangedFiles === undefined
+        ? null
+        : integerInput(input.maxChangedFiles, "maxChangedFiles", 1);
+    const approvalCheckpoints = stringArrayInput(
+      input.approvalCheckpoints ?? [],
+      "approvalCheckpoints",
+    );
     const now = isoNow();
 
     try {
@@ -663,8 +1094,10 @@ export class AgentQStore {
           INSERT INTO queues(
             id, name, repo_key, repo_path, base_ref, default_provider, concurrency,
             plan_model, plan_instructions, implement_model, implement_instructions,
-            max_attempts, verify_commands, auto_commit, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            max_attempts, verify_commands, auto_commit, allowed_paths, denied_paths,
+            max_changed_files, approval_checkpoints, base_drift_policy, land_strategy,
+            auto_land, file_concurrency, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
           id,
@@ -681,6 +1114,14 @@ export class AgentQStore {
           maxAttempts,
           JSON.stringify(verifyCommands),
           input.autoCommit === true ? 1 : 0,
+          JSON.stringify(allowedPaths),
+          JSON.stringify(deniedPaths),
+          maxChangedFiles,
+          JSON.stringify(approvalCheckpoints),
+          input.baseDriftPolicy ?? "replan",
+          input.landStrategy ?? "none",
+          input.autoLand === true ? 1 : 0,
+          input.fileConcurrency ?? "off",
           now,
           now,
         ],
@@ -790,6 +1231,25 @@ export class AgentQStore {
       );
     }
     if (patch.autoCommit !== undefined) set("auto_commit", patch.autoCommit ? 1 : 0);
+    if (patch.allowedPaths !== undefined) {
+      set("allowed_paths", JSON.stringify(stringArrayInput(patch.allowedPaths, "allowedPaths")));
+    }
+    if (patch.deniedPaths !== undefined) {
+      set("denied_paths", JSON.stringify(stringArrayInput(patch.deniedPaths, "deniedPaths")));
+    }
+    if (patch.maxChangedFiles !== undefined) {
+      set("max_changed_files", integerInput(patch.maxChangedFiles, "maxChangedFiles", 1));
+    }
+    if (patch.approvalCheckpoints !== undefined) {
+      set(
+        "approval_checkpoints",
+        JSON.stringify(stringArrayInput(patch.approvalCheckpoints, "approvalCheckpoints")),
+      );
+    }
+    if (patch.baseDriftPolicy !== undefined) set("base_drift_policy", patch.baseDriftPolicy);
+    if (patch.landStrategy !== undefined) set("land_strategy", patch.landStrategy);
+    if (patch.autoLand !== undefined) set("auto_land", patch.autoLand ? 1 : 0);
+    if (patch.fileConcurrency !== undefined) set("file_concurrency", patch.fileConcurrency);
 
     if (fields.length === 0) return queue;
 
@@ -890,6 +1350,31 @@ export class AgentQStore {
         "SELECT id FROM tasks WHERE queue_id = ? ORDER BY id",
         [queue.id],
       ).map(({ id }) => id);
+      const externalDependent = selectOne<{ task_id: string }, [string, string]>(
+        this.#database,
+        `
+          SELECT dependency.task_id
+          FROM task_dependencies dependency
+          JOIN tasks blocker ON blocker.id = dependency.blocker_task_id
+          JOIN tasks dependent ON dependent.id = dependency.task_id
+          WHERE blocker.queue_id = ? AND dependent.queue_id <> ?
+          LIMIT 1
+        `,
+        [queue.id, queue.id],
+      );
+      if (externalDependent) {
+        throw new AgentQError(
+          `Delete dependent task ${externalDependent.task_id} before deleting queue ${queue.name}`,
+          "QUEUE_HAS_DEPENDENTS",
+        );
+      }
+      this.#database.run(
+        `
+          DELETE FROM task_dependencies
+          WHERE task_id IN (SELECT id FROM tasks WHERE queue_id = ?)
+        `,
+        [queue.id],
+      );
       const changed = this.#database.run("DELETE FROM queues WHERE id = ?", [queue.id]).changes;
       if (changed < 1) {
         throw new AgentQError(`Queue changed while being deleted: ${queue.name}`, "QUEUE_CHANGED");
@@ -960,16 +1445,38 @@ export class AgentQStore {
         input.acceptanceCriteria ?? [],
         "acceptanceCriteria",
       );
+      const objective =
+        input.objective === undefined ? title : nonEmpty(input.objective, "objective");
+      const invariants = stringArrayInput(input.invariants ?? [], "invariants");
+      const handoffRequirements = stringArrayInput(
+        input.handoffRequirements ?? [],
+        "handoffRequirements",
+      );
+      const expectedPaths = stringArrayInput(input.expectedPaths ?? [], "expectedPaths");
+      const allowedPaths = stringArrayInput(input.allowedPaths ?? [], "allowedPaths");
+      const deniedPaths = stringArrayInput(input.deniedPaths ?? [], "deniedPaths");
+      const maxChangedFiles =
+        input.maxChangedFiles === undefined
+          ? null
+          : integerInput(input.maxChangedFiles, "maxChangedFiles", 1);
+      const verifyCommands = stringArrayInput(input.verifyCommands ?? [], "verifyCommands");
+      const approvalCheckpoints = stringArrayInput(
+        input.approvalCheckpoints ?? [],
+        "approvalCheckpoints",
+      );
+      const blockedBy = [...new Set(stringArrayInput(input.blockedBy ?? [], "blockedBy"))].sort();
       const priority = integerInput(input.priority ?? 0, "priority");
 
       try {
         this.#database.run(
           `
             INSERT INTO tasks(
-              id, queue_id, title, instructions, acceptance_criteria, provider,
-              priority, status, source_kind, parent_task_id, idempotency_key,
-              attempt_count, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?)
+              id, queue_id, title, instructions, acceptance_criteria, objective,
+              invariants, handoff_requirements, expected_paths, allowed_paths, denied_paths,
+              max_changed_files, verify_commands, approval_checkpoints, base_drift_policy,
+              land_strategy, created_base_sha, provider, priority, status, current_phase,
+              source_kind, parent_task_id, idempotency_key, attempt_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, 0, ?, ?)
           `,
           [
             id,
@@ -977,8 +1484,21 @@ export class AgentQStore {
             title,
             input.instructions ?? "",
             JSON.stringify(acceptanceCriteria),
+            objective,
+            JSON.stringify(invariants),
+            JSON.stringify(handoffRequirements),
+            JSON.stringify(expectedPaths),
+            JSON.stringify(allowedPaths),
+            JSON.stringify(deniedPaths),
+            maxChangedFiles,
+            JSON.stringify(verifyCommands),
+            JSON.stringify(approvalCheckpoints),
+            input.baseDriftPolicy ?? queue.baseDriftPolicy,
+            input.landStrategy ?? queue.landStrategy,
+            input.createdBaseSha ?? null,
             input.provider ?? queue.defaultProvider,
             priority,
+            blockedBy.length > 0 ? "blocked" : "queued",
             input.sourceKind ?? "manual",
             input.parentTaskId ?? null,
             idempotencyKey ?? null,
@@ -994,10 +1514,43 @@ export class AgentQStore {
         );
       }
 
+      this.#replaceTaskDependencies(id, blockedBy, now);
       return this.#requireTask(id);
     });
 
     return add.immediate();
+  }
+
+  listTaskDependencies(id: string): Task[] {
+    this.#requireTask(id);
+    return selectAll<TaskRow, [string]>(
+      this.#database,
+      `
+        SELECT ${TASK_COLUMNS}
+        FROM task_dependencies dependency
+        JOIN tasks t ON t.id = dependency.blocker_task_id
+        JOIN queues q ON q.id = t.queue_id
+        WHERE dependency.task_id = ?
+        ORDER BY dependency.created_at, t.id
+      `,
+      [id],
+    ).map(mapTask);
+  }
+
+  listTaskDependents(id: string): Task[] {
+    this.#requireTask(id);
+    return selectAll<TaskRow, [string]>(
+      this.#database,
+      `
+        SELECT ${TASK_COLUMNS}
+        FROM task_dependencies dependency
+        JOIN tasks t ON t.id = dependency.task_id
+        JOIN queues q ON q.id = t.queue_id
+        WHERE dependency.blocker_task_id = ?
+        ORDER BY dependency.created_at, t.id
+      `,
+      [id],
+    ).map(mapTask);
   }
 
   getTask(id: string): Task | undefined {
@@ -1094,6 +1647,51 @@ export class AgentQStore {
       set("cancel_requested_at", patch.cancelRequestedAt);
     }
     if (patch.completedAt !== undefined) set("completed_at", patch.completedAt);
+    if (patch.currentPhase !== undefined) set("current_phase", patch.currentPhase);
+    if (patch.deliveryStatus !== undefined) set("delivery_status", patch.deliveryStatus);
+    if (patch.blockedReason !== undefined) set("blocked_reason", patch.blockedReason);
+    if (patch.failureClass !== undefined) set("failure_class", patch.failureClass);
+    if (patch.failureReason !== undefined) set("failure_reason", patch.failureReason);
+    if (patch.retryDisposition !== undefined) {
+      set("retry_disposition", patch.retryDisposition);
+    }
+    if (patch.resultRunId !== undefined) set("result_run_id", patch.resultRunId);
+    if (patch.resultCommitSha !== undefined) set("result_commit_sha", patch.resultCommitSha);
+    if (patch.changedFiles !== undefined) {
+      set("changed_files", JSON.stringify(stringArrayInput(patch.changedFiles, "changedFiles")));
+    }
+    if (patch.verificationResults !== undefined) {
+      set(
+        "verification_results",
+        JSON.stringify(
+          verificationResults(
+            JSON.stringify(patch.verificationResults),
+            "task",
+            id,
+            "verificationResults",
+          ),
+        ),
+      );
+    }
+    if (patch.integrationBranch !== undefined) {
+      set("integration_branch", patch.integrationBranch);
+    }
+    if (patch.integratedSha !== undefined) set("integrated_sha", patch.integratedSha);
+    if (patch.landedSha !== undefined) set("landed_sha", patch.landedSha);
+    if (patch.integratedAt !== undefined) set("integrated_at", patch.integratedAt);
+    if (patch.landedAt !== undefined) set("landed_at", patch.landedAt);
+    if (patch.inputTokens !== undefined) {
+      set("input_tokens", integerInput(patch.inputTokens, "inputTokens", 0));
+    }
+    if (patch.outputTokens !== undefined) {
+      set("output_tokens", integerInput(patch.outputTokens, "outputTokens", 0));
+    }
+    if (patch.costUsd !== undefined) {
+      if (!Number.isFinite(patch.costUsd) || patch.costUsd < 0) {
+        throw new AgentQError("costUsd must be non-negative", "INVALID_INPUT", 2);
+      }
+      set("cost_usd", patch.costUsd);
+    }
 
     if (fields.length === 0) return this.#requireTask(id);
 
@@ -1132,6 +1730,39 @@ export class AgentQStore {
         JSON.stringify(stringArrayInput(patch.acceptanceCriteria, "acceptanceCriteria")),
       );
     }
+    if (patch.objective !== undefined) {
+      set("objective", "objective", nonEmpty(patch.objective, "objective"));
+    }
+    for (const [field, column] of [
+      ["invariants", "invariants"],
+      ["handoffRequirements", "handoff_requirements"],
+      ["expectedPaths", "expected_paths"],
+      ["allowedPaths", "allowed_paths"],
+      ["deniedPaths", "denied_paths"],
+      ["verifyCommands", "verify_commands"],
+      ["approvalCheckpoints", "approval_checkpoints"],
+    ] as const) {
+      const value = patch[field];
+      if (value !== undefined) {
+        set(field, column, JSON.stringify(stringArrayInput(value, field)));
+      }
+    }
+    if (patch.maxChangedFiles !== undefined) {
+      set(
+        "maxChangedFiles",
+        "max_changed_files",
+        integerInput(patch.maxChangedFiles, "maxChangedFiles", 1),
+      );
+    }
+    if (patch.baseDriftPolicy !== undefined) {
+      set("baseDriftPolicy", "base_drift_policy", patch.baseDriftPolicy);
+    }
+    if (patch.landStrategy !== undefined) {
+      set("landStrategy", "land_strategy", patch.landStrategy);
+    }
+    if (patch.createdBaseSha !== undefined) {
+      set("createdBaseSha", "created_base_sha", nonEmpty(patch.createdBaseSha, "createdBaseSha"));
+    }
     if (patch.provider !== undefined) {
       // A queued resume is provider-specific. Preserve it only when an edit
       // keeps the provider unchanged; switching providers must start fresh.
@@ -1142,7 +1773,8 @@ export class AgentQStore {
     if (patch.priority !== undefined) {
       set("priority", "priority", integerInput(patch.priority, "priority"));
     }
-    if (fields.length === 0) {
+    const hasDependencyPatch = patch.blockedBy !== undefined;
+    if (fields.length === 0 && !hasDependencyPatch) {
       throw new AgentQError("A task edit must change at least one field", "INVALID_INPUT", 2);
     }
     const expected =
@@ -1192,6 +1824,10 @@ export class AgentQStore {
         );
       }
 
+      if (patch.blockedBy !== undefined) {
+        editedFields.push("blockedBy");
+        this.#replaceTaskDependencies(id, patch.blockedBy, editedAt);
+      }
       this.appendEvent({
         taskId: id,
         kind: "task.edited",
@@ -1222,6 +1858,8 @@ export class AgentQStore {
         `
           UPDATE tasks
           SET status = 'succeeded', completed_at = ?, cancel_requested_at = NULL,
+              current_phase = 'complete', delivery_status = 'verified',
+              failure_class = NULL, failure_reason = NULL, retry_disposition = NULL,
               updated_at = ?
           WHERE id = ?
             AND current_run_id IS NULL
@@ -1292,6 +1930,18 @@ export class AgentQStore {
         );
       }
 
+      const graphDependent = selectOne<{ task_id: string }, [string]>(
+        this.#database,
+        "SELECT task_id FROM task_dependencies WHERE blocker_task_id = ? LIMIT 1",
+        [id],
+      );
+      if (graphDependent) {
+        throw new AgentQError(
+          `Delete dependent task ${graphDependent.task_id} before deleting blocker task ${id}`,
+          "TASK_HAS_DEPENDENTS",
+        );
+      }
+
       const changed = this.#database.run(
         `
           DELETE FROM tasks
@@ -1309,8 +1959,11 @@ export class AgentQStore {
             AND NOT EXISTS (
               SELECT 1 FROM tasks child WHERE child.parent_task_id = ?
             )
+            AND NOT EXISTS (
+              SELECT 1 FROM task_dependencies dependency WHERE dependency.blocker_task_id = ?
+            )
         `,
-        [id, id, id, id],
+        [id, id, id, id, id],
       ).changes;
       // Bun reports cascaded run/event deletions in `changes`, so only zero
       // means the guarded task row was not removed.
@@ -1470,6 +2123,39 @@ export class AgentQStore {
           WHERE t.status = 'queued'
             AND t.cancel_requested_at IS NULL
             AND t.attempt_count < q.max_attempts
+            AND NOT EXISTS (
+              SELECT 1
+              FROM task_dependencies dependency
+              JOIN tasks blocker ON blocker.id = dependency.blocker_task_id
+              WHERE dependency.task_id = t.id
+                AND (
+                  blocker.status <> 'succeeded'
+                  OR blocker.delivery_status NOT IN (
+                    'ready_to_integrate', 'integrated', 'landed'
+                  )
+                  OR blocker.result_run_id IS NULL
+                  OR blocker.result_commit_sha IS NULL
+                )
+            )
+            AND (
+              (SELECT COUNT(*) FROM task_dependencies dependency WHERE dependency.task_id = t.id)
+                <= 1
+              OR (
+                NOT EXISTS (
+                  SELECT 1
+                  FROM task_dependencies dependency
+                  JOIN tasks blocker ON blocker.id = dependency.blocker_task_id
+                  WHERE dependency.task_id = t.id
+                    AND COALESCE(blocker.landed_sha, blocker.integrated_sha) IS NULL
+                )
+                AND (
+                  SELECT COUNT(DISTINCT COALESCE(blocker.landed_sha, blocker.integrated_sha))
+                  FROM task_dependencies dependency
+                  JOIN tasks blocker ON blocker.id = dependency.blocker_task_id
+                  WHERE dependency.task_id = t.id
+                ) = 1
+              )
+            )
             ${queueClause}
             ${repoClause}
             ${globalClause}
@@ -1490,6 +2176,29 @@ export class AgentQStore {
 
       const task = mapTask(candidate);
       const queue = this.#requireQueue(task.queueId);
+      const dependencyTasks = this.listTaskDependencies(task.id);
+      const dependencySnapshot: TaskDependencySnapshot[] = dependencyTasks.map((blocker) => {
+        if (!blocker.resultRunId || !blocker.resultCommitSha) {
+          throw new AgentQError(
+            `Task ${task.id} was claimed before blocker ${blocker.id} produced a result`,
+            "CLAIM_DEPENDENCY_CONFLICT",
+          );
+        }
+        return {
+          taskId: blocker.id,
+          runId: blocker.resultRunId,
+          resultCommitSha: blocker.resultCommitSha,
+          deliveryStatus: blocker.deliveryStatus,
+          ...(blocker.integratedSha === undefined ? {} : { integratedSha: blocker.integratedSha }),
+          ...(blocker.landedSha === undefined ? {} : { landedSha: blocker.landedSha }),
+        };
+      });
+      const dependencyBaseSha =
+        dependencySnapshot.length === 1
+          ? dependencySnapshot[0]?.resultCommitSha
+          : dependencySnapshot.length > 1
+            ? (dependencySnapshot[0]?.landedSha ?? dependencySnapshot[0]?.integratedSha)
+            : undefined;
       // attempt_count is the retry budget for the current enqueue cycle and is
       // reset by an explicit retry. Run attempt numbers are permanent history,
       // so derive them from prior runs to preserve the unique (task, attempt)
@@ -1515,6 +2224,20 @@ export class AgentQStore {
         title: task.title,
         instructions: task.instructions,
         acceptanceCriteria: [...task.acceptanceCriteria],
+        objective: task.objective,
+        invariants: [...task.invariants],
+        handoffRequirements: [...task.handoffRequirements],
+        blockedBy: [...task.blockedBy],
+        expectedPaths: [...task.expectedPaths],
+        allowedPaths: [...task.allowedPaths],
+        deniedPaths: [...task.deniedPaths],
+        ...(task.maxChangedFiles === undefined ? {} : { maxChangedFiles: task.maxChangedFiles }),
+        verifyCommands: [...task.verifyCommands],
+        approvalCheckpoints: [...task.approvalCheckpoints],
+        baseDriftPolicy: task.baseDriftPolicy,
+        landStrategy: task.landStrategy,
+        ...(task.createdBaseSha === undefined ? {} : { createdBaseSha: task.createdBaseSha }),
+        dependencies: dependencySnapshot,
         provider: task.provider,
         priority: task.priority,
         workflow: {
@@ -1547,8 +2270,9 @@ export class AgentQStore {
         `
           INSERT INTO runs(
             id, task_id, attempt_no, provider, status, phase, owner_token, owner_pid,
-            task_snapshot, plan_output, plan_session_id, started_at, heartbeat_at
-          ) VALUES (?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?)
+            task_snapshot, dependency_snapshot, base_sha, plan_output, plan_session_id,
+            started_at, heartbeat_at
+          ) VALUES (?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
           runId,
@@ -1559,6 +2283,8 @@ export class AgentQStore {
           ownerToken,
           ownerPid,
           JSON.stringify(snapshot),
+          JSON.stringify(dependencySnapshot),
+          dependencyBaseSha ?? null,
           planOutput,
           planSessionId,
           now,
@@ -1570,10 +2296,17 @@ export class AgentQStore {
         `
           UPDATE tasks
           SET status = 'starting', attempt_count = ?, current_run_id = ?,
-              resume_run_id = ?, updated_at = ?
+              resume_run_id = ?, current_phase = ?, blocked_reason = NULL, updated_at = ?
           WHERE id = ? AND status = 'queued'
         `,
-        [attemptCount, runId, resumedRun?.id ?? null, now, task.id],
+        [
+          attemptCount,
+          runId,
+          resumedRun?.id ?? null,
+          phase === "plan" ? "plan" : "implement",
+          now,
+          task.id,
+        ],
       ).changes;
 
       if (changed !== 1) {
@@ -1728,6 +2461,41 @@ export class AgentQStore {
       if (patch.summary !== undefined) set("summary", patch.summary);
       if (patch.error !== undefined) set("error", patch.error);
       if (patch.logPath !== undefined) set("log_path", patch.logPath);
+      if (patch.resultCommitSha !== undefined) {
+        set("result_commit_sha", patch.resultCommitSha);
+      }
+      if (patch.changedFiles !== undefined) {
+        set("changed_files", JSON.stringify(stringArrayInput(patch.changedFiles, "changedFiles")));
+      }
+      if (patch.verificationResults !== undefined) {
+        set(
+          "verification_results",
+          JSON.stringify(
+            verificationResults(
+              JSON.stringify(patch.verificationResults),
+              "run",
+              id,
+              "verificationResults",
+            ),
+          ),
+        );
+      }
+      if (patch.failureClass !== undefined) set("failure_class", patch.failureClass);
+      if (patch.retryDisposition !== undefined) {
+        set("retry_disposition", patch.retryDisposition);
+      }
+      if (patch.inputTokens !== undefined) {
+        set("input_tokens", integerInput(patch.inputTokens, "inputTokens", 0));
+      }
+      if (patch.outputTokens !== undefined) {
+        set("output_tokens", integerInput(patch.outputTokens, "outputTokens", 0));
+      }
+      if (patch.costUsd !== undefined) {
+        if (!Number.isFinite(patch.costUsd) || patch.costUsd < 0) {
+          throw new AgentQError("costUsd must be non-negative", "INVALID_INPUT", 2);
+        }
+        set("cost_usd", patch.costUsd);
+      }
 
       if (fields.length === 0) return this.#requireRun(id);
       values.push(id);
@@ -1799,9 +2567,11 @@ export class AgentQStore {
       if (task.currentRunId === id) {
         this.#database.run(
           `
-            UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?
+            UPDATE tasks
+            SET status = ?, current_phase = ?, updated_at = ?
+            WHERE id = ?
           `,
-          [status, at, task.id],
+          [status, run.phase === "plan" ? "plan" : "implement", at, task.id],
         );
       }
       return this.#requireRun(id);
@@ -1877,6 +2647,14 @@ export class AgentQStore {
       if (changed !== 1) {
         throw new AgentQError(`Run ${id} phase or lease changed`, "RUN_PHASE_CHANGED");
       }
+      this.#database.run(
+        `
+          UPDATE tasks
+          SET current_phase = 'implement', updated_at = ?
+          WHERE id = ? AND current_run_id = ?
+        `,
+        [isoNow(), task.id, id],
+      );
       return this.#requireRun(id);
     });
     return advance.immediate();
@@ -1895,12 +2673,28 @@ export class AgentQStore {
       const finishedAt = timestamp(input.finishedAt, "finishedAt");
       const wasCancelled = input.status === "cancelled" || task.cancelRequestedAt !== undefined;
       const runStatus: RunStatus = wasCancelled ? "cancelled" : input.status;
+      const changedFiles = stringArrayInput(input.changedFiles ?? [], "changedFiles");
+      const checkedVerificationResults = verificationResults(
+        JSON.stringify(input.verificationResults ?? []),
+        "run",
+        id,
+        "verificationResults",
+      );
+      const inputTokens = integerInput(input.inputTokens ?? 0, "inputTokens", 0);
+      const outputTokens = integerInput(input.outputTokens ?? 0, "outputTokens", 0);
+      const costUsd = finiteNumberValue(input.costUsd ?? 0, "run", id, "costUsd");
+      if (costUsd < 0) {
+        throw new AgentQError("costUsd must be non-negative", "INVALID_INPUT", 2);
+      }
 
       this.#database.run(
         `
           UPDATE runs
           SET status = ?, heartbeat_at = ?, finished_at = ?, exit_code = ?,
-              summary = ?, error = ?, provider_session_id = COALESCE(?, provider_session_id)
+              summary = ?, error = ?, provider_session_id = COALESCE(?, provider_session_id),
+              result_commit_sha = ?, changed_files = ?, verification_results = ?,
+              failure_class = ?, retry_disposition = ?, input_tokens = ?,
+              output_tokens = ?, cost_usd = ?
           WHERE id = ?
         `,
         [
@@ -1911,6 +2705,14 @@ export class AgentQStore {
           input.summary ?? null,
           input.error ?? null,
           input.providerSessionId ?? null,
+          input.resultCommitSha ?? null,
+          JSON.stringify(changedFiles),
+          JSON.stringify(checkedVerificationResults),
+          input.failureClass ?? (wasCancelled ? "cancelled" : null),
+          input.retryDisposition ?? null,
+          inputTokens,
+          outputTokens,
+          costUsd,
           id,
         ],
       );
@@ -1934,12 +2736,24 @@ export class AgentQStore {
       const restoredAttemptCount = input.requeue
         ? Math.max(0, task.attemptCount - 1)
         : task.attemptCount;
+      const deliveryStatus =
+        runStatus === "succeeded"
+          ? input.resultCommitSha
+            ? "ready_to_integrate"
+            : "verified"
+          : task.deliveryStatus;
+      const currentPhase =
+        taskStatus === "queued" ? (task.blockedBy.length > 0 ? "blocked" : "queued") : "complete";
       this.#database.run(
         `
           UPDATE tasks
           SET status = ?, attempt_count = ?, current_run_id = NULL, completed_at = ?,
               resume_run_id = CASE WHEN ? = 1 THEN NULL ELSE resume_run_id END,
-              updated_at = ?
+              current_phase = ?, delivery_status = ?, failure_class = ?,
+              failure_reason = ?, retry_disposition = ?, result_run_id = ?,
+              result_commit_sha = ?, changed_files = ?, verification_results = ?,
+              input_tokens = input_tokens + ?, output_tokens = output_tokens + ?,
+              cost_usd = cost_usd + ?, updated_at = ?
           WHERE id = ? AND current_run_id = ?
         `,
         [
@@ -1947,11 +2761,56 @@ export class AgentQStore {
           restoredAttemptCount,
           completedAt,
           taskStatus === "queued" ? 0 : 1,
+          currentPhase,
+          deliveryStatus,
+          input.failureClass ?? (wasCancelled ? "cancelled" : null),
+          input.error ?? null,
+          input.retryDisposition ?? null,
+          runStatus === "succeeded" && input.resultCommitSha ? id : null,
+          runStatus === "succeeded" ? (input.resultCommitSha ?? null) : null,
+          JSON.stringify(runStatus === "succeeded" ? changedFiles : task.changedFiles),
+          JSON.stringify(
+            runStatus === "succeeded" ? checkedVerificationResults : task.verificationResults,
+          ),
+          inputTokens,
+          outputTokens,
+          costUsd,
           finishedAt,
           task.id,
           id,
         ],
       );
+
+      if (runStatus === "succeeded" && input.resultCommitSha) {
+        this.#database.run(
+          `
+            UPDATE tasks
+            SET current_phase = 'queued', blocked_reason = NULL, updated_at = ?
+            WHERE status = 'queued'
+              AND current_phase = 'blocked'
+              AND id IN (
+                SELECT dependency.task_id
+                FROM task_dependencies dependency
+                WHERE dependency.blocker_task_id = ?
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM task_dependencies dependency
+                JOIN tasks blocker ON blocker.id = dependency.blocker_task_id
+                WHERE dependency.task_id = tasks.id
+                  AND (
+                    blocker.status <> 'succeeded'
+                    OR blocker.delivery_status NOT IN (
+                      'ready_to_integrate', 'integrated', 'landed'
+                    )
+                    OR blocker.result_run_id IS NULL
+                    OR blocker.result_commit_sha IS NULL
+                  )
+              )
+          `,
+          [finishedAt, task.id],
+        );
+      }
 
       return { run: this.#requireRun(id), task: this.#requireTask(task.id) };
     });
@@ -2249,6 +3108,96 @@ export class AgentQStore {
     );
     if (!row) throw new AgentQError(`Event ${id} does not exist`, "EVENT_NOT_FOUND");
     return mapEvent(row);
+  }
+
+  #replaceTaskDependencies(taskId: string, blockerIds: readonly string[], at: string): void {
+    const task = this.#requireTask(taskId);
+    const queue = this.#requireQueue(task.queueId);
+    const normalized = [
+      ...new Set(stringArrayInput(blockerIds, "blockedBy").map((id) => nonEmpty(id, "blockedBy"))),
+    ].sort();
+    if (normalized.includes(taskId)) {
+      throw new AgentQError("A task cannot block itself", "TASK_DEPENDENCY_SELF", 2);
+    }
+
+    const blockers = normalized.map((blockerId) => {
+      const blocker = this.getTask(blockerId);
+      if (!blocker) {
+        throw new AgentQError(`Task ${blockerId} does not exist`, "TASK_NOT_FOUND", 2);
+      }
+      const blockerQueue = this.#requireQueue(blocker.queueId);
+      if (blockerQueue.repoKey !== queue.repoKey) {
+        throw new AgentQError(
+          `Task ${blockerId} belongs to a different repository`,
+          "TASK_DEPENDENCY_REPOSITORY_MISMATCH",
+          2,
+        );
+      }
+      return blocker;
+    });
+
+    this.#database.run("DELETE FROM task_dependencies WHERE task_id = ?", [taskId]);
+    for (const blocker of blockers) {
+      this.#database.run(
+        `
+          INSERT INTO task_dependencies(task_id, blocker_task_id, created_at)
+          VALUES (?, ?, ?)
+        `,
+        [taskId, blocker.id, at],
+      );
+    }
+
+    const cycle = selectOne<{ id: string }, [string, string]>(
+      this.#database,
+      `
+        WITH RECURSIVE ancestors(id) AS (
+          SELECT blocker_task_id
+          FROM task_dependencies
+          WHERE task_id = ?
+          UNION
+          SELECT dependency.blocker_task_id
+          FROM task_dependencies dependency
+          JOIN ancestors ON dependency.task_id = ancestors.id
+        )
+        SELECT id
+        FROM ancestors
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [taskId, taskId],
+    );
+    if (cycle) {
+      throw new AgentQError(
+        `Task dependency would create a cycle involving ${taskId}`,
+        "TASK_DEPENDENCY_CYCLE",
+        2,
+      );
+    }
+
+    this.#database.run(
+      `
+        UPDATE tasks
+        SET current_phase = CASE
+              WHEN status = 'queued' AND ? > 0 THEN 'blocked'
+              WHEN status = 'queued' AND current_phase = 'blocked' THEN 'queued'
+              ELSE current_phase
+            END,
+            blocked_reason = CASE
+              WHEN status <> 'queued' THEN blocked_reason
+              WHEN ? > 0 THEN ?
+              ELSE NULL
+            END
+        WHERE id = ?
+      `,
+      [
+        normalized.length,
+        normalized.length,
+        normalized.length === 1
+          ? `Waiting for blocker ${normalized[0]}`
+          : `Waiting for ${normalized.length} blockers`,
+        taskId,
+      ],
+    );
   }
 }
 

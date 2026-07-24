@@ -235,7 +235,13 @@ export class Supervisor {
           worktreePath: resume.worktreePath,
         };
       } else {
-        prepared = await this.app.worktrees.prepare(queue, task, run.attemptNo, controller.signal);
+        prepared = await this.app.worktrees.prepare(
+          queue,
+          task,
+          run.attemptNo,
+          controller.signal,
+          run.baseSha,
+        );
       }
       // Persist the retained workspace before either provider starts. This
       // keeps a saved implementation handoff resumable even if intake or

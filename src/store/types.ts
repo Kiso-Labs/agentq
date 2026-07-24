@@ -1,11 +1,14 @@
 import type {
+  FailureClass,
   Provider,
   Queue,
+  RetryDisposition,
   Run,
   RunStatus,
   Task,
   TaskEvent,
   TaskStatus,
+  VerificationResult,
 } from "../core/types.ts";
 
 export interface StoreOptions {
@@ -28,11 +31,39 @@ export type UpdateQueueInput = Partial<
     | "maxAttempts"
     | "verifyCommands"
     | "autoCommit"
+    | "allowedPaths"
+    | "deniedPaths"
+    | "maxChangedFiles"
+    | "approvalCheckpoints"
+    | "baseDriftPolicy"
+    | "landStrategy"
+    | "autoLand"
+    | "fileConcurrency"
   >
 >;
 
 export type EditTaskInput = Partial<
-  Pick<Task, "title" | "instructions" | "acceptanceCriteria" | "provider" | "priority">
+  Pick<
+    Task,
+    | "title"
+    | "instructions"
+    | "acceptanceCriteria"
+    | "objective"
+    | "invariants"
+    | "handoffRequirements"
+    | "blockedBy"
+    | "expectedPaths"
+    | "allowedPaths"
+    | "deniedPaths"
+    | "maxChangedFiles"
+    | "verifyCommands"
+    | "approvalCheckpoints"
+    | "baseDriftPolicy"
+    | "landStrategy"
+    | "createdBaseSha"
+    | "provider"
+    | "priority"
+  >
 >;
 
 export interface TaskFilter {
@@ -60,6 +91,24 @@ export interface UpdateTaskInput {
   currentRunId?: string | null;
   cancelRequestedAt?: string | null;
   completedAt?: string | null;
+  currentPhase?: Task["currentPhase"];
+  deliveryStatus?: Task["deliveryStatus"];
+  blockedReason?: string | null;
+  failureClass?: FailureClass | null;
+  failureReason?: string | null;
+  retryDisposition?: RetryDisposition | null;
+  resultRunId?: string | null;
+  resultCommitSha?: string | null;
+  changedFiles?: string[];
+  verificationResults?: VerificationResult[];
+  integrationBranch?: string | null;
+  integratedSha?: string | null;
+  landedSha?: string | null;
+  integratedAt?: string | null;
+  landedAt?: string | null;
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
 }
 
 export interface ClaimOptions {
@@ -107,6 +156,14 @@ export interface UpdateRunInput {
   summary?: string | null;
   error?: string | null;
   logPath?: string | null;
+  resultCommitSha?: string | null;
+  changedFiles?: string[];
+  verificationResults?: VerificationResult[];
+  failureClass?: FailureClass | null;
+  retryDisposition?: RetryDisposition | null;
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
 }
 
 export interface AdvanceRunToImplementationInput {
@@ -132,6 +189,14 @@ export interface FinishRunInput {
   finishedAt?: string;
   /** Requeue without consuming retry budget, used for graceful supervisor shutdown. */
   requeue?: boolean;
+  resultCommitSha?: string | null;
+  changedFiles?: string[];
+  verificationResults?: VerificationResult[];
+  failureClass?: FailureClass | null;
+  retryDisposition?: RetryDisposition | null;
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
 }
 
 export interface FinishedRun {

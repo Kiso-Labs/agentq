@@ -246,6 +246,170 @@ const migrations: readonly Migration[] = [
       `);
     },
   },
+  {
+    version: 7,
+    name: "structured_delivery_pipeline",
+    up(database) {
+      // Queue-level policy is inherited by tasks. Compatibility defaults leave
+      // existing queues' scheduling and landing behavior unchanged.
+      database.run(
+        "ALTER TABLE queues ADD COLUMN allowed_paths TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(allowed_paths))",
+      );
+      database.run(
+        "ALTER TABLE queues ADD COLUMN denied_paths TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(denied_paths))",
+      );
+      database.run(
+        "ALTER TABLE queues ADD COLUMN max_changed_files INTEGER CHECK (max_changed_files IS NULL OR max_changed_files > 0)",
+      );
+      database.run(
+        "ALTER TABLE queues ADD COLUMN approval_checkpoints TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(approval_checkpoints))",
+      );
+      database.run(
+        "ALTER TABLE queues ADD COLUMN base_drift_policy TEXT NOT NULL DEFAULT 'replan' CHECK (base_drift_policy IN ('rebase', 'replan', 'fail'))",
+      );
+      database.run(
+        "ALTER TABLE queues ADD COLUMN land_strategy TEXT NOT NULL DEFAULT 'none' CHECK (land_strategy IN ('none', 'stack', 'merge-train'))",
+      );
+      database.run(
+        "ALTER TABLE queues ADD COLUMN auto_land INTEGER NOT NULL DEFAULT 0 CHECK (auto_land IN (0, 1))",
+      );
+      database.run(
+        "ALTER TABLE queues ADD COLUMN file_concurrency TEXT NOT NULL DEFAULT 'off' CHECK (file_concurrency IN ('off', 'advisory', 'enforced'))",
+      );
+
+      // Structured task specifications remain additive to the original human
+      // title/instructions fields, allowing older clients to keep working.
+      database.run("ALTER TABLE tasks ADD COLUMN objective TEXT NOT NULL DEFAULT ''");
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN invariants TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(invariants))",
+      );
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN handoff_requirements TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(handoff_requirements))",
+      );
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN expected_paths TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(expected_paths))",
+      );
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN allowed_paths TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(allowed_paths))",
+      );
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN denied_paths TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(denied_paths))",
+      );
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN max_changed_files INTEGER CHECK (max_changed_files IS NULL OR max_changed_files > 0)",
+      );
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN verify_commands TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(verify_commands))",
+      );
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN approval_checkpoints TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(approval_checkpoints))",
+      );
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN base_drift_policy TEXT NOT NULL DEFAULT 'replan' CHECK (base_drift_policy IN ('rebase', 'replan', 'fail'))",
+      );
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN land_strategy TEXT NOT NULL DEFAULT 'none' CHECK (land_strategy IN ('none', 'stack', 'merge-train'))",
+      );
+      database.run("ALTER TABLE tasks ADD COLUMN created_base_sha TEXT");
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN current_phase TEXT NOT NULL DEFAULT 'queued' CHECK (current_phase IN ('queued', 'blocked', 'plan', 'red_test', 'approval', 'implement', 'verify', 'integrate', 'land', 'complete'))",
+      );
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'not_started' CHECK (delivery_status IN ('not_started', 'implemented', 'verified', 'ready_to_integrate', 'integrated', 'landed'))",
+      );
+      database.run("ALTER TABLE tasks ADD COLUMN blocked_reason TEXT");
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN failure_class TEXT CHECK (failure_class IS NULL OR failure_class IN ('transient_infrastructure', 'stale_base', 'test_regression', 'blocked_dependency', 'file_conflict', 'policy_violation', 'integration_conflict', 'agent_failure', 'cancelled', 'unknown'))",
+      );
+      database.run("ALTER TABLE tasks ADD COLUMN failure_reason TEXT");
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN retry_disposition TEXT CHECK (retry_disposition IS NULL OR retry_disposition IN ('retry', 'rebase_and_retry', 'return_to_implementation', 'wait', 'stop', 'manual_resolution'))",
+      );
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN result_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL",
+      );
+      database.run("ALTER TABLE tasks ADD COLUMN result_commit_sha TEXT");
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN changed_files TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(changed_files))",
+      );
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN verification_results TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(verification_results))",
+      );
+      database.run("ALTER TABLE tasks ADD COLUMN integration_branch TEXT");
+      database.run("ALTER TABLE tasks ADD COLUMN integrated_sha TEXT");
+      database.run("ALTER TABLE tasks ADD COLUMN landed_sha TEXT");
+      database.run("ALTER TABLE tasks ADD COLUMN integrated_at TEXT");
+      database.run("ALTER TABLE tasks ADD COLUMN landed_at TEXT");
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0)",
+      );
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0)",
+      );
+      database.run(
+        "ALTER TABLE tasks ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0 CHECK (cost_usd >= 0)",
+      );
+
+      // Every attempt captures exactly which blocker artifacts it was based on
+      // and owns its own verification/result evidence.
+      database.run(
+        "ALTER TABLE runs ADD COLUMN dependency_snapshot TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(dependency_snapshot))",
+      );
+      database.run("ALTER TABLE runs ADD COLUMN result_commit_sha TEXT");
+      database.run(
+        "ALTER TABLE runs ADD COLUMN changed_files TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(changed_files))",
+      );
+      database.run(
+        "ALTER TABLE runs ADD COLUMN verification_results TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(verification_results))",
+      );
+      database.run(
+        "ALTER TABLE runs ADD COLUMN failure_class TEXT CHECK (failure_class IS NULL OR failure_class IN ('transient_infrastructure', 'stale_base', 'test_regression', 'blocked_dependency', 'file_conflict', 'policy_violation', 'integration_conflict', 'agent_failure', 'cancelled', 'unknown'))",
+      );
+      database.run(
+        "ALTER TABLE runs ADD COLUMN retry_disposition TEXT CHECK (retry_disposition IS NULL OR retry_disposition IN ('retry', 'rebase_and_retry', 'return_to_implementation', 'wait', 'stop', 'manual_resolution'))",
+      );
+      database.run(
+        "ALTER TABLE runs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0)",
+      );
+      database.run(
+        "ALTER TABLE runs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0)",
+      );
+      database.run(
+        "ALTER TABLE runs ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0 CHECK (cost_usd >= 0)",
+      );
+
+      database.run(`
+        CREATE TABLE task_dependencies (
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          blocker_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (task_id, blocker_task_id),
+          CHECK (task_id <> blocker_task_id)
+        )
+      `);
+      database.run(`
+        CREATE INDEX task_dependencies_by_blocker
+        ON task_dependencies(blocker_task_id, task_id)
+      `);
+      database.run(`
+        CREATE INDEX tasks_delivery_progress
+        ON tasks(queue_id, delivery_status, current_phase, created_at, id)
+      `);
+      database.run(`
+        CREATE INDEX tasks_result_commit
+        ON tasks(result_commit_sha)
+        WHERE result_commit_sha IS NOT NULL
+      `);
+
+      database.run("UPDATE tasks SET objective = title WHERE trim(objective) = ''");
+      database.run(`
+        UPDATE tasks
+        SET delivery_status = 'verified',
+            current_phase = 'complete'
+        WHERE status = 'succeeded'
+      `);
+    },
+  },
 ];
 
 interface VersionRow {

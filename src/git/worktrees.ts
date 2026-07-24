@@ -82,19 +82,24 @@ export class WorktreeManager {
     task: Task,
     attemptNo: number,
     signal?: AbortSignal,
+    effectiveBaseSha?: string,
   ): Promise<PreparedWorktree> {
     const repoRoot = await this.resolveRepo(queue.repoPath);
     const commonDir = await this.resolveCommonDir(repoRoot, signal);
     const baseResult = await runGit(
       repoRoot,
-      ["rev-parse", "--verify", `${queue.baseRef}^{commit}`],
+      ["rev-parse", "--verify", `${effectiveBaseSha ?? queue.baseRef}^{commit}`],
       {
         signal,
       },
     );
     const baseSha = baseResult.stdout.trim();
-    if (!baseSha)
-      throw new AgentQError(`Could not resolve base ref ${queue.baseRef}`, "INVALID_BASE_REF");
+    if (!baseSha) {
+      throw new AgentQError(
+        `Could not resolve base ${effectiveBaseSha ?? queue.baseRef}`,
+        "INVALID_BASE_REF",
+      );
+    }
 
     const shortTask = task.id.replace(/^task_/, "").slice(0, 10);
     const queueSlug = slug(queue.name) || `queue-${queue.id.replace(/^queue_/, "").slice(0, 8)}`;

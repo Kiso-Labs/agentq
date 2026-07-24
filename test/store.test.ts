@@ -231,7 +231,7 @@ describe("AgentQStore", () => {
       expect(
         inspection.query<CountRow, []>("SELECT COUNT(*) AS count FROM schema_migrations").get()
           ?.count,
-      ).toBe(6);
+      ).toBe(7);
     } finally {
       inspection.close();
     }
@@ -851,6 +851,171 @@ describe("AgentQStore", () => {
     expect(() => first.addTask({ queue: queue.id, title: "", priority: 0 })).toThrow(AgentQError);
   });
 
+  test("stores structured task specifications and enforces a native dependency DAG", () => {
+    const store = open();
+    const queue = store.createQueue({
+      name: "dependency-graph",
+      repoKey: "repo",
+      repoPath: "/repo",
+      allowedPaths: ["src/**", "test/**"],
+      deniedPaths: ["src/api/**"],
+      maxChangedFiles: 25,
+      approvalCheckpoints: ["after-plan"],
+      baseDriftPolicy: "replan",
+      landStrategy: "stack",
+    });
+    const blocker = store.addTask({
+      queue: queue.id,
+      title: "Create the service seam",
+      objective: "Create a reusable service seam.",
+    });
+    const dependent = store.addTask({
+      queue: queue.id,
+      title: "Use the service seam",
+      objective: "Move the feature onto the new service seam.",
+      instructions: "Preserve the public API.",
+      acceptanceCriteria: ["Focused tests pass"],
+      invariants: ["Existing callers keep working"],
+      handoffRequirements: ["Document the new ownership boundary"],
+      blockedBy: [blocker.id, blocker.id],
+      expectedPaths: ["src/services/feature.ts"],
+      allowedPaths: ["src/services/**", "test/services/**"],
+      deniedPaths: ["src/api/**", "test/api/**"],
+      maxChangedFiles: 20,
+      verifyCommands: ["bun test test/services"],
+      approvalCheckpoints: ["after-plan", "before-integrate"],
+      baseDriftPolicy: "rebase",
+      landStrategy: "stack",
+    });
+
+    expect(queue).toMatchObject({
+      allowedPaths: ["src/**", "test/**"],
+      deniedPaths: ["src/api/**"],
+      maxChangedFiles: 25,
+      approvalCheckpoints: ["after-plan"],
+      baseDriftPolicy: "replan",
+      landStrategy: "stack",
+    });
+    expect(dependent).toMatchObject({
+      objective: "Move the feature onto the new service seam.",
+      invariants: ["Existing callers keep working"],
+      handoffRequirements: ["Document the new ownership boundary"],
+      blockedBy: [blocker.id],
+      expectedPaths: ["src/services/feature.ts"],
+      allowedPaths: ["src/services/**", "test/services/**"],
+      deniedPaths: ["src/api/**", "test/api/**"],
+      maxChangedFiles: 20,
+      verifyCommands: ["bun test test/services"],
+      approvalCheckpoints: ["after-plan", "before-integrate"],
+      baseDriftPolicy: "rebase",
+      landStrategy: "stack",
+      currentPhase: "blocked",
+      deliveryStatus: "not_started",
+    });
+    expect(store.listTaskDependents(blocker.id).map((task) => task.id)).toEqual([dependent.id]);
+
+    const foreignQueue = store.createQueue({
+      name: "foreign",
+      repoKey: "other-repo",
+      repoPath: "/other",
+    });
+    try {
+      store.addTask({
+        queue: foreignQueue.id,
+        title: "Invalid cross-repository dependency",
+        blockedBy: [blocker.id],
+      });
+      throw new Error("Expected cross-repository dependency to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentQError);
+      expect((error as AgentQError).code).toBe("TASK_DEPENDENCY_REPOSITORY_MISMATCH");
+    }
+
+    try {
+      store.editTask(blocker.id, { blockedBy: [dependent.id] }, blocker.updatedAt);
+      throw new Error("Expected a dependency cycle to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentQError);
+      expect((error as AgentQError).code).toBe("TASK_DEPENDENCY_CYCLE");
+    }
+    expect(store.getTask(blocker.id)?.blockedBy).toEqual([]);
+    try {
+      store.deleteTask(blocker.id);
+      throw new Error("Expected blocker deletion to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentQError);
+      expect((error as AgentQError).code).toBe("TASK_HAS_DEPENDENTS");
+    }
+
+    expect(store.deleteTask(dependent.id)).toBe(true);
+    expect(store.deleteTask(blocker.id)).toBe(true);
+  });
+
+  test("blocks claims without spending attempts and snapshots the blocker result commit", () => {
+    const store = open();
+    const queue = store.createQueue({
+      name: "dependency-scheduler",
+      repoKey: "repo",
+      repoPath: "/repo",
+      concurrency: 2,
+      landStrategy: "stack",
+    });
+    const blocker = store.addTask({ queue: queue.id, title: "Build foundation", priority: 1 });
+    const dependent = store.addTask({
+      queue: queue.id,
+      title: "Build on foundation",
+      priority: 100,
+      blockedBy: [blocker.id],
+      landStrategy: "stack",
+    });
+
+    const blockerClaim = store.claimNextTask({ queue: queue.id });
+    expect(blockerClaim?.task.id).toBe(blocker.id);
+    expect(store.claimNextTask({ queue: queue.id })).toBeUndefined();
+    expect(store.getTask(dependent.id)).toMatchObject({
+      status: "queued",
+      currentPhase: "blocked",
+      attemptCount: 0,
+    });
+    if (!blockerClaim) throw new Error("Expected blocker claim");
+
+    const finished = store.finishRun(blockerClaim.run.id, {
+      status: "succeeded",
+      exitCode: 0,
+      resultCommitSha: "0123456789abcdef",
+      changedFiles: ["src/foundation.ts"],
+      verificationResults: [
+        {
+          kind: "command",
+          command: "bun test",
+          status: "passed",
+          exitCode: 0,
+          startedAt: "2026-07-24T12:00:00.000Z",
+          finishedAt: "2026-07-24T12:00:01.000Z",
+        },
+      ],
+    });
+    expect(finished.task).toMatchObject({
+      status: "succeeded",
+      deliveryStatus: "ready_to_integrate",
+      resultCommitSha: "0123456789abcdef",
+      changedFiles: ["src/foundation.ts"],
+    });
+
+    const dependentClaim = store.claimNextTask({ queue: queue.id });
+    expect(dependentClaim?.task.id).toBe(dependent.id);
+    expect(dependentClaim?.run).toMatchObject({
+      baseSha: "0123456789abcdef",
+      dependencySnapshot: [
+        {
+          taskId: blocker.id,
+          runId: blockerClaim.run.id,
+          resultCommitSha: "0123456789abcdef",
+        },
+      ],
+    });
+  });
+
   test("edits only operator-owned task fields and appends one atomic audit event", () => {
     const store = open();
     const queue = store.createQueue({ name: "edit", repoKey: "repo", repoPath: "/repo" });
@@ -962,12 +1127,27 @@ describe("AgentQStore", () => {
     });
     const first = store.claimNextTask({ queue: queue.id });
     if (!first) throw new Error("Expected first claim");
+    const structuredSnapshot = {
+      objective: "Original title",
+      invariants: [],
+      handoffRequirements: [],
+      blockedBy: [],
+      expectedPaths: [],
+      allowedPaths: [],
+      deniedPaths: [],
+      verifyCommands: [],
+      approvalCheckpoints: [],
+      baseDriftPolicy: "replan" as const,
+      landStrategy: "none" as const,
+      dependencies: [],
+    };
     expect(first.run.taskSnapshot).toEqual({
       title: "Original title",
       instructions: "Original instructions",
       acceptanceCriteria: ["Original criterion"],
       provider: "codex",
       priority: 2,
+      ...structuredSnapshot,
       workflow: {
         planModel: "planner-v1",
         planInstructions: "Inspect dependencies first.",
@@ -1001,6 +1181,7 @@ describe("AgentQStore", () => {
       acceptanceCriteria: ["Revised criterion"],
       provider: "claude",
       priority: 8,
+      ...structuredSnapshot,
       workflow: {
         planModel: "",
         planInstructions: "Inspect dependencies first.",
@@ -1014,6 +1195,7 @@ describe("AgentQStore", () => {
       acceptanceCriteria: ["Original criterion"],
       provider: "codex",
       priority: 2,
+      ...structuredSnapshot,
       workflow: {
         planModel: "planner-v1",
         planInstructions: "Inspect dependencies first.",
