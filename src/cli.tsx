@@ -6,7 +6,18 @@ import { z } from "zod";
 import { AgentQApp } from "./app.ts";
 import { AgentQError, errorMessage } from "./core/errors.ts";
 import { resolvePaths } from "./core/paths.ts";
-import { type AddTaskInput, PROVIDERS, type Provider, TASK_STATUSES } from "./core/types.ts";
+import {
+  type AddTaskInput,
+  BASE_DRIFT_POLICIES,
+  type BaseDriftPolicy,
+  FILE_CONCURRENCY_MODES,
+  type FileConcurrencyMode,
+  LAND_STRATEGIES,
+  type LandStrategy,
+  PROVIDERS,
+  type Provider,
+  TASK_STATUSES,
+} from "./core/types.ts";
 import { findRepositoryContext } from "./git/repository.ts";
 import { submitDelegatedTask } from "./intake/delegated-tasks.ts";
 import type { IntegrationTarget } from "./integrations/instructions.ts";
@@ -14,7 +25,6 @@ import { Supervisor } from "./supervisor/supervisor.ts";
 import { activityEntries } from "./ui/activity.ts";
 import { renderAgentq } from "./ui/index.tsx";
 import { sanitizeTerminalText } from "./ui/sanitize.ts";
-import type { UiQueuePatch } from "./ui/types.ts";
 
 const version = typeof AGENTQ_VERSION === "string" ? AGENTQ_VERSION : "0.1.0";
 const program = new Command();
@@ -47,6 +57,30 @@ queue
   .option("-c, --concurrency <number>", "parallel tasks for this queue", positiveInteger, 2)
   .option("--max-attempts <number>", "maximum attempts per task", positiveInteger, 2)
   .option("--verify <command>", "verification command; repeatable", collect, [])
+  .option("--allow-path <glob>", "allowed repository path; repeatable", collect, [])
+  .option("--deny-path <glob>", "forbidden repository path; repeatable", collect, [])
+  .option(
+    "--max-changed-files <number>",
+    "maximum number of changed files per task",
+    positiveInteger,
+  )
+  .option("--checkpoint <name>", "required approval checkpoint; repeatable", collect, [])
+  .option(
+    "--base-drift <policy>",
+    "stale-base policy: rebase, replan, or fail",
+    parseBaseDriftPolicy,
+  )
+  .option(
+    "--land-strategy <strategy>",
+    "delivery strategy: none, stack, or merge-train",
+    parseLandStrategy,
+  )
+  .option("--auto-land", "land integrated results automatically")
+  .option(
+    "--file-concurrency <mode>",
+    "file-overlap policy: off, advisory, or enforced",
+    parseFileConcurrency,
+  )
   .option("--no-auto-commit", "leave successful changes uncommitted")
   .option("--json", "print machine-readable JSON")
   .action(async (name, options) => {
@@ -63,6 +97,14 @@ queue
         concurrency: options.concurrency,
         maxAttempts: options.maxAttempts,
         verifyCommands: options.verify,
+        allowedPaths: options.allowPath,
+        deniedPaths: options.denyPath,
+        maxChangedFiles: options.maxChangedFiles,
+        approvalCheckpoints: options.checkpoint,
+        baseDriftPolicy: options.baseDrift,
+        landStrategy: options.landStrategy,
+        autoLand: options.autoLand,
+        fileConcurrency: options.fileConcurrency,
         autoCommit: options.autoCommit,
       });
       print(
@@ -92,6 +134,34 @@ queue
   .option("--max-attempts <number>", "replace maximum attempts per task", positiveInteger)
   .option("--verify <command>", "replace verification commands; repeatable", collectOptional)
   .option("--clear-verify", "remove all verification commands")
+  .option("--allow-path <glob>", "replace allowed repository paths; repeatable", collectOptional)
+  .option("--clear-allowed-paths", "remove all allowed repository paths")
+  .option("--deny-path <glob>", "replace forbidden repository paths; repeatable", collectOptional)
+  .option("--clear-denied-paths", "remove all forbidden repository paths")
+  .option(
+    "--max-changed-files <number>",
+    "replace the maximum number of changed files",
+    positiveInteger,
+  )
+  .option("--checkpoint <name>", "replace approval checkpoints; repeatable", collectOptional)
+  .option("--clear-checkpoints", "remove all approval checkpoints")
+  .option(
+    "--base-drift <policy>",
+    "replace stale-base policy: rebase, replan, or fail",
+    parseBaseDriftPolicy,
+  )
+  .option(
+    "--land-strategy <strategy>",
+    "replace delivery strategy: none, stack, or merge-train",
+    parseLandStrategy,
+  )
+  .option("--auto-land", "land integrated results automatically")
+  .option("--no-auto-land", "require explicit queue landing")
+  .option(
+    "--file-concurrency <mode>",
+    "replace file-overlap policy: off, advisory, or enforced",
+    parseFileConcurrency,
+  )
   .option("--auto-commit", "commit successful task changes")
   .option("--no-auto-commit", "leave successful task changes uncommitted")
   .option("--json", "print machine-readable JSON")
@@ -134,7 +204,20 @@ queue
         2,
       );
     }
-    const patch: UiQueuePatch = {
+    const listConflicts = [
+      [options.allowPath, options.clearAllowedPaths, "--allow-path", "--clear-allowed-paths"],
+      [options.denyPath, options.clearDeniedPaths, "--deny-path", "--clear-denied-paths"],
+      [options.checkpoint, options.clearCheckpoints, "--checkpoint", "--clear-checkpoints"],
+    ] as const;
+    const listConflict = listConflicts.find(([value, clear]) => value !== undefined && clear);
+    if (listConflict) {
+      throw new AgentQError(
+        `Use either ${listConflict[2]} or ${listConflict[3]}, not both`,
+        "INVALID_QUEUE_EDIT",
+        2,
+      );
+    }
+    const patch = {
       name: options.name as string | undefined,
       baseRef: options.base as string | undefined,
       defaultProvider: options.provider as Provider | undefined,
@@ -151,6 +234,16 @@ queue
       concurrency: options.concurrency as number | undefined,
       maxAttempts: options.maxAttempts as number | undefined,
       verifyCommands: options.clearVerify ? [] : (options.verify as string[] | undefined),
+      allowedPaths: options.clearAllowedPaths ? [] : (options.allowPath as string[] | undefined),
+      deniedPaths: options.clearDeniedPaths ? [] : (options.denyPath as string[] | undefined),
+      maxChangedFiles: options.maxChangedFiles as number | undefined,
+      approvalCheckpoints: options.clearCheckpoints
+        ? []
+        : (options.checkpoint as string[] | undefined),
+      baseDriftPolicy: options.baseDrift as BaseDriftPolicy | undefined,
+      landStrategy: options.landStrategy as LandStrategy | undefined,
+      autoLand: options.autoLand as boolean | undefined,
+      fileConcurrency: options.fileConcurrency as FileConcurrencyMode | undefined,
       autoCommit: options.autoCommit as boolean | undefined,
     };
     if (Object.values(patch).every((value) => value === undefined)) {
@@ -227,6 +320,26 @@ task
   .option("-t, --title <title>", "short task title (alternative to the positional argument)")
   .option("-q, --queue <queue>", "queue name or id (defaults to $AGENTQ_QUEUE)")
   .option("-i, --instructions <text>", "complete task instructions")
+  .option("--objective <text>", "structured task objective")
+  .option("--blocked-by <task-id>", "blocking task id; repeatable", collect, [])
+  .option("--invariant <text>", "invariant the change must preserve; repeatable", collect, [])
+  .option("--allow-path <glob>", "allowed repository path; repeatable", collect, [])
+  .option("--deny-path <glob>", "forbidden repository path; repeatable", collect, [])
+  .option("--expected-path <glob>", "expected changed path; repeatable", collect, [])
+  .option("--max-changed-files <number>", "maximum number of changed files", positiveInteger)
+  .option("--verify <command>", "task-specific verification command; repeatable", collect, [])
+  .option("--checkpoint <name>", "required approval checkpoint; repeatable", collect, [])
+  .option(
+    "--base-drift <policy>",
+    "stale-base policy: rebase, replan, or fail",
+    parseBaseDriftPolicy,
+  )
+  .option(
+    "--land-strategy <strategy>",
+    "delivery strategy: none, stack, or merge-train",
+    parseLandStrategy,
+  )
+  .option("--handoff <text>", "handoff requirement; repeatable", collect, [])
   .option("-p, --provider <provider>", "override queue provider", parseProvider)
   .option("--priority <number>", "higher values run first", integer, 0)
   .option("--accept <criterion>", "acceptance criterion; repeatable", collect, [])
@@ -247,6 +360,18 @@ task
           queue: options.queue ?? process.env.AGENTQ_QUEUE,
           title: options.title ?? title,
           instructions: options.instructions,
+          objective: options.objective,
+          blockedBy: options.blockedBy,
+          invariants: options.invariant,
+          allowedPaths: options.allowPath,
+          deniedPaths: options.denyPath,
+          expectedPaths: options.expectedPath,
+          maxChangedFiles: options.maxChangedFiles,
+          verifyCommands: options.verify,
+          approvalCheckpoints: options.checkpoint,
+          baseDriftPolicy: options.baseDrift,
+          landStrategy: options.landStrategy,
+          handoffRequirements: options.handoff,
           acceptanceCriteria: options.accept,
           provider: options.provider,
           priority: options.priority,
@@ -296,6 +421,50 @@ task
   });
 
 task
+  .command("graph")
+  .description("Show the task dependency graph")
+  .option("-q, --queue <queue>", "filter by queue")
+  .option("--json", "print machine-readable JSON")
+  .action(async (options) => {
+    await withApp(async (app) => {
+      const queueId = options.queue ? (await app.getQueue(options.queue)).id : undefined;
+      const tasks = [...(await app.listTasks(queueId))].sort((left, right) =>
+        left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
+      );
+      const nodeIds = new Set(tasks.map(({ id }) => id));
+      const nodes = tasks.map(
+        ({ id, title, status, currentPhase, deliveryStatus, queueId, queueName }) => ({
+          id,
+          title,
+          status,
+          currentPhase,
+          deliveryStatus,
+          queueId,
+          ...(queueName ? { queueName } : {}),
+        }),
+      );
+      const edges = tasks
+        .flatMap((dependent) =>
+          dependent.blockedBy
+            .filter((blockerId) => nodeIds.has(blockerId))
+            .map((blockerId) => ({ from: blockerId, to: dependent.id })),
+        )
+        .sort((left, right) => {
+          if (left.from !== right.from) return left.from < right.from ? -1 : 1;
+          return left.to < right.to ? -1 : left.to > right.to ? 1 : 0;
+        });
+      if (options.json) return printJson({ nodes, edges });
+      if (nodes.length === 0) return console.log("No matching tasks.");
+      console.log("ID\tSTATUS\tPHASE\tBLOCKED BY\tTITLE");
+      for (const item of tasks) {
+        console.log(
+          `${item.id}\t${item.status}\t${item.currentPhase}\t${item.blockedBy.join(",") || "-"}\t${human(item.title)}`,
+        );
+      }
+    });
+  });
+
+task
   .command("show")
   .description("Show a task, attempts, and recent events")
   .argument("<task-id>")
@@ -315,15 +484,64 @@ task
   .argument("<task-id>")
   .option("--title <title>", "replace the task title")
   .option("--instructions <text>", "replace the complete task instructions")
+  .option("--objective <text>", "replace the structured task objective")
+  .option("--blocked-by <task-id>", "replace blocking task ids; repeatable", collectOptional)
+  .option("--clear-blockers", "remove all blocking task ids")
+  .option("--invariant <text>", "replace invariants; repeatable", collectOptional)
+  .option("--clear-invariants", "remove all invariants")
+  .option("--allow-path <glob>", "replace allowed repository paths; repeatable", collectOptional)
+  .option("--clear-allowed-paths", "remove all task-specific allowed paths")
+  .option("--deny-path <glob>", "replace forbidden repository paths; repeatable", collectOptional)
+  .option("--clear-denied-paths", "remove all task-specific forbidden paths")
+  .option("--expected-path <glob>", "replace expected changed paths; repeatable", collectOptional)
+  .option("--clear-expected-paths", "remove all expected changed paths")
+  .option(
+    "--max-changed-files <number>",
+    "replace the maximum number of changed files",
+    positiveInteger,
+  )
+  .option("--verify <command>", "replace task-specific verification commands", collectOptional)
+  .option("--clear-verify", "remove all task-specific verification commands")
+  .option("--checkpoint <name>", "replace approval checkpoints; repeatable", collectOptional)
+  .option("--clear-checkpoints", "remove all approval checkpoints")
+  .option(
+    "--base-drift <policy>",
+    "replace stale-base policy: rebase, replan, or fail",
+    parseBaseDriftPolicy,
+  )
+  .option(
+    "--land-strategy <strategy>",
+    "replace delivery strategy: none, stack, or merge-train",
+    parseLandStrategy,
+  )
+  .option("--handoff <text>", "replace handoff requirements; repeatable", collectOptional)
+  .option("--clear-handoff", "remove all handoff requirements")
   .option("-p, --provider <provider>", "replace the provider", parseProvider)
   .option("--priority <number>", "replace the scheduling priority", integer)
   .option("--accept <criterion>", "replace acceptance criteria; repeatable", collectOptional)
   .option("--clear-acceptance", "remove all acceptance criteria")
   .option("--json", "print machine-readable JSON")
   .action(async (taskId, options) => {
-    if (options.accept && options.clearAcceptance) {
+    const conflicts = [
+      [options.accept, options.clearAcceptance, "--accept", "--clear-acceptance"],
+      [options.blockedBy, options.clearBlockers, "--blocked-by", "--clear-blockers"],
+      [options.invariant, options.clearInvariants, "--invariant", "--clear-invariants"],
+      [options.allowPath, options.clearAllowedPaths, "--allow-path", "--clear-allowed-paths"],
+      [options.denyPath, options.clearDeniedPaths, "--deny-path", "--clear-denied-paths"],
+      [
+        options.expectedPath,
+        options.clearExpectedPaths,
+        "--expected-path",
+        "--clear-expected-paths",
+      ],
+      [options.verify, options.clearVerify, "--verify", "--clear-verify"],
+      [options.checkpoint, options.clearCheckpoints, "--checkpoint", "--clear-checkpoints"],
+      [options.handoff, options.clearHandoff, "--handoff", "--clear-handoff"],
+    ] as const;
+    const conflict = conflicts.find(([value, clear]) => value !== undefined && clear);
+    if (conflict) {
       throw new AgentQError(
-        "Use either --accept or --clear-acceptance, not both",
+        `Use either ${conflict[2]} or ${conflict[3]}, not both`,
         "INVALID_TASK_EDIT",
         2,
       );
@@ -331,7 +549,23 @@ task
     const patch = {
       title: options.title as string | undefined,
       instructions: options.instructions as string | undefined,
+      objective: options.objective as string | undefined,
       acceptanceCriteria: options.clearAcceptance ? [] : (options.accept as string[] | undefined),
+      blockedBy: options.clearBlockers ? [] : (options.blockedBy as string[] | undefined),
+      invariants: options.clearInvariants ? [] : (options.invariant as string[] | undefined),
+      allowedPaths: options.clearAllowedPaths ? [] : (options.allowPath as string[] | undefined),
+      deniedPaths: options.clearDeniedPaths ? [] : (options.denyPath as string[] | undefined),
+      expectedPaths: options.clearExpectedPaths
+        ? []
+        : (options.expectedPath as string[] | undefined),
+      maxChangedFiles: options.maxChangedFiles as number | undefined,
+      verifyCommands: options.clearVerify ? [] : (options.verify as string[] | undefined),
+      approvalCheckpoints: options.clearCheckpoints
+        ? []
+        : (options.checkpoint as string[] | undefined),
+      baseDriftPolicy: options.baseDrift as BaseDriftPolicy | undefined,
+      landStrategy: options.landStrategy as LandStrategy | undefined,
+      handoffRequirements: options.clearHandoff ? [] : (options.handoff as string[] | undefined),
       provider: options.provider as Provider | undefined,
       priority: options.priority as number | undefined,
     };
@@ -613,6 +847,18 @@ const taskJsonSchema = z.object({
   title: z.string().min(1),
   instructions: z.string().optional(),
   acceptanceCriteria: z.array(z.string()).optional(),
+  objective: z.string().min(1).optional(),
+  invariants: z.array(z.string().min(1)).optional(),
+  handoffRequirements: z.array(z.string().min(1)).optional(),
+  blockedBy: z.array(z.string().min(1)).optional(),
+  expectedPaths: z.array(z.string().min(1)).optional(),
+  allowedPaths: z.array(z.string().min(1)).optional(),
+  deniedPaths: z.array(z.string().min(1)).optional(),
+  maxChangedFiles: z.number().int().positive().optional(),
+  verifyCommands: z.array(z.string().min(1)).optional(),
+  approvalCheckpoints: z.array(z.string().min(1)).optional(),
+  baseDriftPolicy: z.enum(BASE_DRIFT_POLICIES).optional(),
+  landStrategy: z.enum(LAND_STRATEGIES).optional(),
   provider: z.enum(PROVIDERS).optional(),
   priority: z.number().int().optional(),
   idempotencyKey: z.string().min(1).optional(),
@@ -631,6 +877,23 @@ async function readTaskJson(): Promise<z.infer<typeof taskJsonSchema>> {
 function parseProvider(value: string): Provider {
   if (PROVIDERS.includes(value as Provider)) return value as Provider;
   throw new InvalidArgumentError("Expected codex or claude.");
+}
+
+function parseBaseDriftPolicy(value: string): BaseDriftPolicy {
+  if (BASE_DRIFT_POLICIES.includes(value as BaseDriftPolicy)) return value as BaseDriftPolicy;
+  throw new InvalidArgumentError(`Expected one of: ${BASE_DRIFT_POLICIES.join(", ")}.`);
+}
+
+function parseLandStrategy(value: string): LandStrategy {
+  if (LAND_STRATEGIES.includes(value as LandStrategy)) return value as LandStrategy;
+  throw new InvalidArgumentError(`Expected one of: ${LAND_STRATEGIES.join(", ")}.`);
+}
+
+function parseFileConcurrency(value: string): FileConcurrencyMode {
+  if (FILE_CONCURRENCY_MODES.includes(value as FileConcurrencyMode)) {
+    return value as FileConcurrencyMode;
+  }
+  throw new InvalidArgumentError(`Expected one of: ${FILE_CONCURRENCY_MODES.join(", ")}.`);
 }
 
 function parseIntegrationTarget(value: string): IntegrationTarget {

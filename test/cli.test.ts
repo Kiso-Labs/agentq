@@ -104,12 +104,101 @@ describe("agentq CLI", () => {
     expect(JSON.parse(listed.stdout)).toHaveLength(1);
   });
 
+  test("creates a queue with structured policy and delivery defaults", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-structured-queue-"));
+    roots.push(stateDir);
+    const repositoryRoot = await repository("agentq-structured-queue-repo-");
+
+    const result = await cli(
+      stateDir,
+      [
+        "queue",
+        "create",
+        "governed",
+        "--allow-path",
+        "src/**",
+        "--allow-path",
+        "test/**",
+        "--deny-path",
+        "src/generated/**",
+        "--max-changed-files",
+        "25",
+        "--checkpoint",
+        "after-plan",
+        "--base-drift",
+        "rebase",
+        "--land-strategy",
+        "stack",
+        "--auto-land",
+        "--file-concurrency",
+        "enforced",
+        "--json",
+      ],
+      undefined,
+      repositoryRoot,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      name: "governed",
+      allowedPaths: ["src/**", "test/**"],
+      deniedPaths: ["src/generated/**"],
+      maxChangedFiles: 25,
+      approvalCheckpoints: ["after-plan"],
+      baseDriftPolicy: "rebase",
+      landStrategy: "stack",
+      autoLand: true,
+      fileConcurrency: "enforced",
+    });
+  });
+
   test("returns a script-friendly error for invalid JSON", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-error-"));
     roots.push(stateDir);
     const result = await cli(stateDir, ["task", "add", "--stdin-json"], "not-json");
     expect(result.exitCode).toBe(2);
     expect(result.stderr).toContain("Invalid task JSON");
+  });
+
+  test("accepts structured task fields through JSON stdin", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-structured-json-"));
+    roots.push(stateDir);
+    await cli(stateDir, ["queue", "create", "json-spec", "--repo", projectRoot, "--json"]);
+
+    const result = await cli(
+      stateDir,
+      ["task", "add", "--stdin-json"],
+      JSON.stringify({
+        queue: "json-spec",
+        title: "JSON structured task",
+        objective: "Exercise the complete machine-readable task contract",
+        invariants: ["Preserve JSON compatibility"],
+        handoffRequirements: ["Report changed files"],
+        expectedPaths: ["src/**"],
+        allowedPaths: ["src/**", "test/**"],
+        deniedPaths: ["src/generated/**"],
+        maxChangedFiles: 12,
+        verifyCommands: ["bun test"],
+        approvalCheckpoints: ["after-plan"],
+        baseDriftPolicy: "rebase",
+        landStrategy: "merge-train",
+      }),
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      objective: "Exercise the complete machine-readable task contract",
+      invariants: ["Preserve JSON compatibility"],
+      handoffRequirements: ["Report changed files"],
+      expectedPaths: ["src/**"],
+      allowedPaths: ["src/**", "test/**"],
+      deniedPaths: ["src/generated/**"],
+      maxChangedFiles: 12,
+      verifyCommands: ["bun test"],
+      approvalCheckpoints: ["after-plan"],
+      baseDriftPolicy: "rebase",
+      landStrategy: "merge-train",
+    });
   });
 
   test("fails closed when a managed planning agent has no child-task intake", async () => {
@@ -170,6 +259,77 @@ describe("agentq CLI", () => {
       queueName: "docs",
       title: "Fix expired-session redirects",
       instructions: "Reproduce the redirect loop and add a regression test",
+    });
+  });
+
+  test("accepts a complete structured task specification from repeatable flags", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-structured-task-"));
+    roots.push(stateDir);
+    const repositoryRoot = await repository("agentq-structured-task-repo-");
+    await cli(stateDir, ["queue", "create", "delivery", "--json"], undefined, repositoryRoot);
+    const blockerResult = await cli(
+      stateDir,
+      ["task", "add", "Prepare service boundary", "--queue", "delivery", "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    const blockerId = (JSON.parse(blockerResult.stdout) as { id: string }).id;
+
+    const result = await cli(
+      stateDir,
+      [
+        "task",
+        "add",
+        "Restore bounded retries",
+        "--queue",
+        "delivery",
+        "--objective",
+        "Restore bounded retries without changing API behavior",
+        "--blocked-by",
+        blockerId,
+        "--invariant",
+        "Existing response schemas remain unchanged",
+        "--invariant",
+        "Retries remain bounded",
+        "--allow-path",
+        "src/services/**",
+        "--deny-path",
+        "src/api/**",
+        "--expected-path",
+        "src/services/retry.ts",
+        "--max-changed-files",
+        "20",
+        "--verify",
+        "bun test test/services.test.ts",
+        "--checkpoint",
+        "after-plan",
+        "--base-drift",
+        "replan",
+        "--land-strategy",
+        "stack",
+        "--handoff",
+        "Document the retry guarantees",
+        "--json",
+      ],
+      undefined,
+      repositoryRoot,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      title: "Restore bounded retries",
+      objective: "Restore bounded retries without changing API behavior",
+      blockedBy: [blockerId],
+      invariants: ["Existing response schemas remain unchanged", "Retries remain bounded"],
+      allowedPaths: ["src/services/**"],
+      deniedPaths: ["src/api/**"],
+      expectedPaths: ["src/services/retry.ts"],
+      maxChangedFiles: 20,
+      verifyCommands: ["bun test test/services.test.ts"],
+      approvalCheckpoints: ["after-plan"],
+      baseDriftPolicy: "replan",
+      landStrategy: "stack",
+      handoffRequirements: ["Document the retry guarantees"],
     });
   });
 
@@ -379,6 +539,21 @@ describe("agentq CLI", () => {
         "bun run lint",
         "--verify",
         "bun test",
+        "--allow-path",
+        "src/**",
+        "--deny-path",
+        "src/generated/**",
+        "--max-changed-files",
+        "11",
+        "--checkpoint",
+        "after-plan",
+        "--base-drift",
+        "fail",
+        "--land-strategy",
+        "merge-train",
+        "--auto-land",
+        "--file-concurrency",
+        "advisory",
         "--no-auto-commit",
         "--json",
       ],
@@ -398,6 +573,14 @@ describe("agentq CLI", () => {
       implementModel: "claude-sonnet",
       implementInstructions: "Preserve compatibility.",
       verifyCommands: ["bun run lint", "bun test"],
+      allowedPaths: ["src/**"],
+      deniedPaths: ["src/generated/**"],
+      maxChangedFiles: 11,
+      approvalCheckpoints: ["after-plan"],
+      baseDriftPolicy: "fail",
+      landStrategy: "merge-train",
+      autoLand: true,
+      fileConcurrency: "advisory",
       autoCommit: false,
       repoKey: original.repoKey,
       repoPath: original.repoPath,
@@ -414,6 +597,12 @@ describe("agentq CLI", () => {
         "--clear-implement-model",
         "--clear-implement-instructions",
         "--clear-verify",
+        "--clear-allowed-paths",
+        "--clear-denied-paths",
+        "--clear-checkpoints",
+        "--no-auto-land",
+        "--file-concurrency",
+        "off",
         "--auto-commit",
         "--json",
       ],
@@ -426,6 +615,12 @@ describe("agentq CLI", () => {
       implementModel: "",
       implementInstructions: "",
       verifyCommands: [],
+      allowedPaths: [],
+      deniedPaths: [],
+      maxChangedFiles: 11,
+      approvalCheckpoints: [],
+      autoLand: false,
+      fileConcurrency: "off",
       autoCommit: true,
     });
 
@@ -597,5 +792,158 @@ describe("agentq CLI", () => {
         (event: { kind: string }) => event.kind === "task.edited",
       ),
     ).toHaveLength(2);
+  });
+
+  test("replaces and clears structured task specification fields", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-structured-edit-"));
+    roots.push(stateDir);
+    const repositoryRoot = await repository("agentq-structured-edit-repo-");
+    await cli(stateDir, ["queue", "create", "edit", "--json"], undefined, repositoryRoot);
+    const blockerResult = await cli(
+      stateDir,
+      ["task", "add", "Blocker", "--queue", "edit", "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    const blockerId = (JSON.parse(blockerResult.stdout) as { id: string }).id;
+    const taskResult = await cli(
+      stateDir,
+      ["task", "add", "Structured edit", "--queue", "edit", "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    const taskId = (JSON.parse(taskResult.stdout) as { id: string }).id;
+
+    const edited = await cli(
+      stateDir,
+      [
+        "task",
+        "edit",
+        taskId,
+        "--objective",
+        "Implement the reviewed structured specification",
+        "--blocked-by",
+        blockerId,
+        "--invariant",
+        "Preserve compatibility",
+        "--allow-path",
+        "src/**",
+        "--deny-path",
+        "src/generated/**",
+        "--expected-path",
+        "src/worker.ts",
+        "--max-changed-files",
+        "9",
+        "--verify",
+        "bun test",
+        "--checkpoint",
+        "after-plan",
+        "--base-drift",
+        "fail",
+        "--land-strategy",
+        "merge-train",
+        "--handoff",
+        "Report verification evidence",
+        "--json",
+      ],
+      undefined,
+      repositoryRoot,
+    );
+    expect(edited.exitCode).toBe(0);
+    expect(JSON.parse(edited.stdout)).toMatchObject({
+      objective: "Implement the reviewed structured specification",
+      blockedBy: [blockerId],
+      invariants: ["Preserve compatibility"],
+      allowedPaths: ["src/**"],
+      deniedPaths: ["src/generated/**"],
+      expectedPaths: ["src/worker.ts"],
+      maxChangedFiles: 9,
+      verifyCommands: ["bun test"],
+      approvalCheckpoints: ["after-plan"],
+      baseDriftPolicy: "fail",
+      landStrategy: "merge-train",
+      handoffRequirements: ["Report verification evidence"],
+    });
+
+    const cleared = await cli(
+      stateDir,
+      [
+        "task",
+        "edit",
+        taskId,
+        "--clear-blockers",
+        "--clear-invariants",
+        "--clear-allowed-paths",
+        "--clear-denied-paths",
+        "--clear-expected-paths",
+        "--clear-verify",
+        "--clear-checkpoints",
+        "--clear-handoff",
+        "--json",
+      ],
+      undefined,
+      repositoryRoot,
+    );
+    expect(cleared.exitCode).toBe(0);
+    expect(JSON.parse(cleared.stdout)).toMatchObject({
+      blockedBy: [],
+      invariants: [],
+      allowedPaths: [],
+      deniedPaths: [],
+      expectedPaths: [],
+      verifyCommands: [],
+      approvalCheckpoints: [],
+      handoffRequirements: [],
+    });
+    expect(JSON.parse(cleared.stdout).maxChangedFiles).toBe(9);
+  });
+
+  test("renders a stable repository task dependency graph with an optional queue filter", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-task-graph-"));
+    roots.push(stateDir);
+    const repositoryRoot = await repository("agentq-task-graph-repo-");
+    await cli(stateDir, ["queue", "create", "graph", "--json"], undefined, repositoryRoot);
+    await cli(stateDir, ["queue", "create", "other", "--json"], undefined, repositoryRoot);
+    const blocker = JSON.parse(
+      (
+        await cli(
+          stateDir,
+          ["task", "add", "Foundation", "--queue", "graph", "--json"],
+          undefined,
+          repositoryRoot,
+        )
+      ).stdout,
+    ) as { id: string };
+    const dependent = JSON.parse(
+      (
+        await cli(
+          stateDir,
+          ["task", "add", "Dependent", "--queue", "graph", "--blocked-by", blocker.id, "--json"],
+          undefined,
+          repositoryRoot,
+        )
+      ).stdout,
+    ) as { id: string };
+    await cli(
+      stateDir,
+      ["task", "add", "Unrelated", "--queue", "other", "--json"],
+      undefined,
+      repositoryRoot,
+    );
+
+    const result = await cli(
+      stateDir,
+      ["task", "graph", "--queue", "graph", "--json"],
+      undefined,
+      repositoryRoot,
+    );
+
+    expect(result.exitCode).toBe(0);
+    const graph = JSON.parse(result.stdout) as {
+      nodes: { id: string; title: string }[];
+      edges: { from: string; to: string }[];
+    };
+    expect(graph.nodes.map(({ id }) => id)).toEqual([blocker.id, dependent.id].sort());
+    expect(graph.edges).toEqual([{ from: blocker.id, to: dependent.id }]);
   });
 });
