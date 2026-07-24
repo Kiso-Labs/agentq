@@ -1,14 +1,12 @@
 <div align="center">
 
-<h1>🌮 agentq 🌮</h1>
+<h1>agentq</h1>
 <h3>Dependency in. Verified local change out.</h3>
 <p>Durable parallel task queues for Codex and Claude Code—from structured work to an integrated local branch.</p>
 <p><code>Bun</code> · <code>Ink</code> · <code>SQLite</code> · <code>Git worktrees</code> · <code>Codex</code> · <code>Claude Code</code></p>
 <p><code>blocked → planned → implemented → verified → integrated → landed</code></p>
 
 </div>
-
-> **The taco workflow:** the queue is the shell, the task graph is the order ticket, planning is the recipe, implementation is the filling, verification is the taste test, and the integration train carries the finished tacos to a local target branch.
 
 `agentq` is a local engineering task queue for running Codex and Claude Code agents in parallel. Every attempt gets its own Git branch and worktree. Dependencies, scope rules, verification evidence, approvals, delivery operations, and result commits are persisted in SQLite instead of living only in a prompt.
 
@@ -19,7 +17,7 @@ Every task uses AgentQ's mandatory two-agent workflow:
 
 This is AgentQ's own pipeline, not Codex or Claude Code's built-in plan mode. The planner cannot edit the repository or enqueue child tasks.
 
-## 🌮 What's on the tray
+## Features
 
 - Native `blocked_by` dependency graphs enforced by the scheduler.
 - Exact blocker result commits used as dependent-task bases.
@@ -31,7 +29,7 @@ This is AgentQ's own pipeline, not Codex or Claude Code's built-in plan mode. Th
 - Immutable result refs, ordered local integration lanes, conflict reporting, and atomic local landing.
 - Full-screen Ink UI, scriptable JSON commands, normalized live logs, and Codex-style activity output.
 
-## 🌮 Install
+## Install
 
 AgentQ runs on [Bun](https://bun.sh/) 1.3 or newer. Its package manifest includes the official Codex and Claude Code CLI packages. After the public npm release, the global install is:
 
@@ -56,7 +54,7 @@ bun run check
 bun link
 ```
 
-## 🌮 Quick start
+## Quick start
 
 Create a governed queue for an existing Git repository:
 
@@ -134,7 +132,7 @@ agentq queue land app --yes
 
 Landing updates a configured **local branch**. AgentQ does not push remotes or open pull requests.
 
-## 🫘 Repository scope
+## Repository scope
 
 When started inside a Git working tree, AgentQ uses the repository's canonical Git common directory as its scope. The Ink UI shows and runs only queues for that repository, and linked worktrees share the same scope. Queue names are case-insensitively unique within a repository, so two repositories can each have a queue named `app`.
 
@@ -148,7 +146,7 @@ agentq run --all
 
 In the UI, press `g` to switch between the current repository and all repositories. The supervisor follows that scope immediately.
 
-## 🌶️ Queue recipes
+## Queue configuration
 
 Queue settings are available in both the CLI and the Ink create/edit form:
 
@@ -199,7 +197,7 @@ Queue and task configuration is copied into an immutable run snapshot when an at
 
 Delivery requires a local branch target. When `--land-strategy` is `stack` or `merge-train`, AgentQ canonicalizes the queue base to `refs/heads/<branch>` and rejects tags, detached commits, or remote-tracking refs as landing targets. `--auto-land` requires a non-`none` landing strategy.
 
-## 🧅 Structured task specifications
+## Structured task specifications
 
 Tasks are not one enormous instruction string. These are native, independently inspectable fields:
 
@@ -260,7 +258,7 @@ printf '%s' '{
 }' | agentq task add --stdin-json
 ```
 
-## 🌮 Native dependency graphs
+## Native dependency graphs
 
 `blocked_by` is scheduler state, not prose:
 
@@ -281,7 +279,7 @@ agentq task graph --queue app --json
 
 The UI details pane shows blockers and their result evidence alongside the selected task.
 
-## 🌮 Parallel prep stations and file concurrency
+## Parallel execution and file concurrency
 
 The supervisor atomically claims queued work and launches each task in a dedicated branch and worktree:
 
@@ -302,7 +300,7 @@ File concurrency uses a task's `expectedPaths`, then task `allowedPaths`, then q
 
 This keeps independent packages parallel while preventing two agents from simultaneously changing the same service or project metadata. It is conservative by design; ambiguous globs serialize rather than gamble.
 
-## 🌮 Plan → implement
+## Plan → implement
 
 A successful attempt proceeds through:
 
@@ -319,7 +317,7 @@ A successful attempt proceeds through:
 
 An empty planner response or any Git-visible planner change fails planning and prevents implementation. A retained planning session can resume and still hands off to a fresh implementation process. A retained implementation session resumes with its stored plan. A normal retry always starts a new attempt from planning.
 
-## 🌮 Machine-enforced scope and verification
+## Machine-enforced scope and verification
 
 Scope policy is evaluated from Git, not from the agent's final message:
 
@@ -345,7 +343,7 @@ refs/agentq/results/<task-id>/<run-id>
 
 Integration repeats scope evaluation and verification against the replayed candidate before advancing the train. A branch produced by an agent is therefore different from a verified artifact, and a verified artifact is different from an integrated or landed result.
 
-## 🌮 Base drift and typed retries
+## Base drift and typed retries
 
 Each task records the target SHA visible when it was created. Before a root task starts, AgentQ compares that SHA with the queue's current local base:
 
@@ -369,7 +367,7 @@ Failures carry a class and disposition:
 
 The dashboard and JSON task records show the class, concise reason, and retry disposition.
 
-## 🌮 Approval checkpoints
+## Approval checkpoints
 
 Approval decisions are durable records with checkpoint, status, actor, note, and decision time. Queue and task checkpoints are combined and deduplicated.
 
@@ -395,7 +393,7 @@ agentq task reject task_456 security-review \
 
 Rejection stops the task as a policy decision. In Ink, press `p` to open approvals, `a`/`Enter` to approve, and `r` to reject; actor and note are collected in a confirmed form.
 
-## 🌮 Delivery: verified result → local target
+## Delivery: verified result → local target
 
 Task delivery state is explicit:
 
@@ -441,7 +439,7 @@ agentq queue land app --yes
 
 AgentQ's delivery boundary is intentionally local: it updates local Git refs and checked-out local target branches. It does **not** push, create pull requests, or merge a remote hosting branch.
 
-## 🧅 Ink UI
+## Ink UI
 
 The dashboard works in wide, medium, narrow, resized, and zoomed terminals. The details pane shows:
 
@@ -471,7 +469,7 @@ Task forms expose every structured field described above. Inputs are large indiv
 
 Consequential actions use confirmation screens. Active work and retained worktrees block deletion. Provider login temporarily yields the terminal to the real provider CLI, then restores Ink.
 
-## 🌮 Adding tasks from Codex or Claude Code
+## Adding tasks from Codex or Claude Code
 
 Agents use the same durable intake as humans. During a managed run, AgentQ injects `AGENTQ_QUEUE`, `AGENTQ_TASK_ID`, `AGENTQ_RUN_ID`, and `AGENTQ_STAGE` (`plan` or `implement`).
 
@@ -479,7 +477,7 @@ Only the implementation process receives the private task-intake directory, so t
 
 Codex remains sandboxed: managed `task add` requests cross a per-run intake directory, and the supervisor atomically stages, validates, and inserts them. The agent never needs database access or another task's worktree. Delegation defaults to 16 child tasks per parent and four ancestry levels; lower those bounds with `AGENTQ_MAX_CHILD_TASKS_PER_RUN` and `AGENTQ_MAX_DELEGATION_DEPTH`.
 
-## 🌮 Deleting tasks and queues safely
+## Deleting tasks and queues safely
 
 Task and queue deletion require explicit confirmation in Ink or `--yes` in the CLI. Deleting a task removes its attempts, events, local logs, approvals, and delivery metadata. Deleting a queue atomically removes the queue and all inactive task history.
 
@@ -493,7 +491,7 @@ agentq queue remove <queue> --yes
 
 Local-log cleanup failures report the remaining paths rather than silently ignoring them.
 
-## 🌮 Command menu
+## Command reference
 
 ```text
 agentq                                  open Ink and run the supervisor
@@ -533,7 +531,7 @@ agentq integrate <codex|claude|all>      install agent task-creation instruction
 
 Commands intended for automation support `--json`; task intake also supports JSON stdin. Run `agentq <command> --help` for complete options.
 
-## 🌮 State and recovery
+## State and recovery
 
 State defaults to:
 
@@ -556,7 +554,7 @@ SQLite runs in WAL mode with foreign keys, a busy timeout, atomic task claims, d
 
 Providers start behind a gate: their random process identity is persisted before the real Codex or Claude command is released. If a supervisor dies, a live peer fences the stale run, verifies and terminates its orphan process tree, then makes the task retryable. Reused PIDs are never signalled, and ambiguous exits are never reported as success.
 
-## 🌮 Security model
+## Security model
 
 - Codex planning runs read-only; implementation runs workspace-write and receives only its run's intake directory as an additional writable root.
 - Claude Code planning is restricted to `Read`, `Glob`, and `Grep`; implementation uses its configured coding-tool allow-list. Claude Code does not provide the same filesystem sandbox as Codex.
@@ -569,7 +567,7 @@ Providers start behind a gate: their random process identity is persisted before
 
 See [docs/security.md](docs/security.md) for exact trust boundaries.
 
-## 🌮 Development
+## Development
 
 ```bash
 bun install
@@ -582,6 +580,6 @@ bun run check
 
 Architecture details live in [docs/architecture.md](docs/architecture.md). Maintainers can follow [docs/releasing.md](docs/releasing.md) for the token-free npm release process.
 
-## 🌮 License
+## License
 
 MIT
