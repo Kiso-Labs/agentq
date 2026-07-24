@@ -874,16 +874,17 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     });
     expect(stored?.resultCommitSha).toBeString();
     expect(run?.resultCommitSha).toBe(stored?.resultCommitSha);
+    if (!stored?.resultCommitSha || !run) throw new Error("Expected a durable blocker result");
     expect(
       (
         await runCommand("git", [
           "-C",
           repo,
           "rev-parse",
-          `refs/agentq/results/${blocker.id}/${run?.id}`,
+          `refs/agentq/results/${blocker.id}/${run.id}`,
         ])
       ).stdout.trim(),
-    ).toBe(stored?.resultCommitSha);
+    ).toBe(stored.resultCommitSha);
     app.close();
   });
 
