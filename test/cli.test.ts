@@ -45,6 +45,17 @@ async function git(cwd: string, args: string[]): Promise<void> {
   if (exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${stderr}`);
 }
 
+async function gitOutput(cwd: string, args: string[]): Promise<string> {
+  const process = Bun.spawn({ cmd: ["git", ...args], cwd, stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    process.stdout.text(),
+    process.stderr.text(),
+    process.exited,
+  ]);
+  if (exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${stderr}`);
+  return stdout.trim();
+}
+
 async function repository(prefix: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), prefix));
   roots.push(root);
@@ -569,7 +580,7 @@ describe("agentq CLI", () => {
     expect(edited.exitCode).toBe(0);
     expect(JSON.parse(edited.stdout)).toMatchObject({
       name: "delivery",
-      baseRef: "release",
+      baseRef: "refs/heads/release",
       defaultProvider: "claude",
       concurrency: 5,
       maxAttempts: 7,
@@ -1023,6 +1034,140 @@ describe("agentq CLI", () => {
       deliveryStatus: "ready_to_integrate",
     });
   });
+
+  test("integrates, inspects, and explicitly lands a verified task result", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-delivery-"));
+    roots.push(stateDir);
+    const repositoryRoot = await repository("agentq-cli-delivery-repo-");
+    await cli(
+      stateDir,
+      ["queue", "create", "delivery", "--land-strategy", "stack", "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    const added = await cli(
+      stateDir,
+      ["task", "add", "Deliver a real commit", "--queue", "delivery", "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    const taskId = (JSON.parse(added.stdout) as { id: string }).id;
+
+    const store = new AgentQStore(join(stateDir, "agentq.sqlite"));
+    const claim = store.claimNextTask({ queue: "delivery" });
+    if (!claim) throw new Error("Expected task claim");
+    try {
+      const baseSha = await gitOutput(repositoryRoot, ["rev-parse", "main"]);
+      store.updateRun(claim.run.id, { baseSha });
+      await git(repositoryRoot, ["switch", "-c", "fixture-result"]);
+      await writeFile(join(repositoryRoot, "delivered.txt"), "landed by AgentQ\n");
+      await git(repositoryRoot, ["add", "delivered.txt"]);
+      await git(repositoryRoot, ["commit", "-m", "Add delivered result"]);
+      const resultSha = await gitOutput(repositoryRoot, ["rev-parse", "HEAD"]);
+      await git(repositoryRoot, [
+        "update-ref",
+        `refs/agentq/results/${taskId}/${claim.run.id}`,
+        resultSha,
+      ]);
+      await git(repositoryRoot, ["switch", "main"]);
+      store.finishRun(claim.run.id, {
+        status: "succeeded",
+        exitCode: 0,
+        summary: "Created the verified delivery fixture.",
+        resultCommitSha: resultSha,
+        changedFiles: ["delivered.txt"],
+      });
+    } finally {
+      store.close();
+    }
+
+    const integrated = await cli(
+      stateDir,
+      ["task", "integrate", taskId, "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    expect(integrated).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(JSON.parse(integrated.stdout)).toMatchObject({
+      status: "integrated",
+    });
+    const reintegrated = await cli(
+      stateDir,
+      ["task", "integrate", taskId, "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    expect(reintegrated.exitCode).toBe(0);
+    expect(JSON.parse(reintegrated.stdout)).toMatchObject({
+      status: "already-integrated",
+    });
+
+    const delivery = await cli(
+      stateDir,
+      ["queue", "delivery", "delivery", "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    expect(delivery.exitCode).toBe(0);
+    expect(JSON.parse(delivery.stdout)).toMatchObject({
+      queue: { name: "delivery" },
+      lane: { targetRef: "refs/heads/main" },
+      tasks: [{ id: taskId, deliveryStatus: "integrated" }],
+      operations: [{ kind: "integrate", status: "succeeded", taskId }],
+    });
+    const humanDelivery = await cli(
+      stateDir,
+      ["queue", "delivery", "delivery"],
+      undefined,
+      repositoryRoot,
+    );
+    expect(humanDelivery.stdout).toContain("DELIVERY\tdelivery");
+    expect(humanDelivery.stdout).toContain("LANE\trefs/heads/main");
+    expect(humanDelivery.stdout).toContain(`${taskId}\tintegrated`);
+
+    const unconfirmed = await cli(
+      stateDir,
+      ["queue", "land", "delivery", "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    expect(unconfirmed.exitCode).toBe(2);
+    expect(unconfirmed.stderr).toContain("Queue landing requires --yes");
+
+    const landed = await cli(
+      stateDir,
+      ["queue", "land", "delivery", "--yes", "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    expect(landed.exitCode).toBe(0);
+    expect(JSON.parse(landed.stdout)).toMatchObject({
+      status: "landed",
+    });
+    expect(await gitOutput(repositoryRoot, ["show", "main:delivered.txt"])).toBe(
+      "landed by AgentQ",
+    );
+    const relanded = await cli(
+      stateDir,
+      ["queue", "land", "delivery", "--yes", "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    expect(relanded.exitCode).toBe(0);
+    expect(JSON.parse(relanded.stdout)).toMatchObject({
+      status: "already-landed",
+    });
+
+    const landedDelivery = await cli(
+      stateDir,
+      ["queue", "delivery", "delivery", "--json"],
+      undefined,
+      repositoryRoot,
+    );
+    expect(JSON.parse(landedDelivery.stdout)).toMatchObject({
+      tasks: [{ id: taskId, deliveryStatus: "landed" }],
+    });
+  }, 20_000);
 
   test("renders a stable repository task dependency graph with an optional queue filter", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-task-graph-"));

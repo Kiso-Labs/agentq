@@ -3,7 +3,12 @@
 import { resolve } from "node:path";
 import { Command, CommanderError, InvalidArgumentError } from "commander";
 import { z } from "zod";
-import { AgentQApp } from "./app.ts";
+import {
+  AgentQApp,
+  type QueueDeliverySnapshot,
+  type QueueLandingOutcome,
+  type TaskIntegrationOutcome,
+} from "./app.ts";
 import { AgentQError, errorMessage } from "./core/errors.ts";
 import { resolvePaths } from "./core/paths.ts";
 import {
@@ -306,6 +311,41 @@ queue
   });
 
 queue
+  .command("delivery")
+  .description("Show the integration lane, task delivery states, and recent operations")
+  .argument("<queue>", "queue name or id")
+  .option("--json", "print machine-readable JSON")
+  .action(async (queueRef, options) => {
+    await withApp(async (app) => {
+      const found = await app.getQueue(queueRef);
+      const delivery = await app.getQueueDelivery(found.id);
+      if (options.json) return printJson(delivery);
+      printQueueDelivery(found.name, delivery);
+    });
+  });
+
+queue
+  .command("land")
+  .description("Atomically land a queue's verified integration train on its target branch")
+  .argument("<queue>", "queue name or id")
+  .option("--yes", "confirm landing the integration train")
+  .option("--json", "print machine-readable JSON")
+  .action(async (queueRef, options) => {
+    if (!options.yes) {
+      throw new AgentQError("Queue landing requires --yes", "CONFIRMATION_REQUIRED", 2);
+    }
+    const controller = signalController();
+    try {
+      await withApp(async (app) => {
+        const outcome = await app.landQueue(queueRef, controller.signal);
+        print(outcome, options.json, landingOutcomeMessage(queueRef, outcome));
+      });
+    } finally {
+      controller.abort("Queue landing command completed");
+    }
+  });
+
+queue
   .command("remove")
   .alias("rm")
   .description("Delete a queue and all inactive tasks and history")
@@ -510,6 +550,24 @@ task
         );
       }
     });
+  });
+
+task
+  .command("integrate")
+  .description("Verify and add a completed task result to its queue's integration train")
+  .argument("<task-id>")
+  .option("--json", "print machine-readable JSON")
+  .action(async (taskId, options) => {
+    const controller = signalController();
+    try {
+      await withApp(async (app) => {
+        const outcome = await app.integrateTask(taskId, controller.signal);
+        print(outcome, options.json, integrationOutcomeMessage(taskId, outcome));
+        if (!["integrated", "already-integrated"].includes(outcome.status)) process.exitCode = 1;
+      });
+    } finally {
+      controller.abort("Task integration command completed");
+    }
   });
 
 task
@@ -1020,6 +1078,93 @@ function print(value: unknown, json = false, message?: string): void {
 
 function printJson(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
+}
+
+function printQueueDelivery(queueName: string, delivery: QueueDeliverySnapshot): void {
+  console.log(`DELIVERY\t${human(queueName)}`);
+  if (delivery.lane) {
+    console.log(
+      [
+        "LANE",
+        human(delivery.lane.targetRef),
+        human(delivery.lane.trainRef),
+        shortSha(delivery.lane.headSha),
+        `generation ${delivery.lane.generation}`,
+      ].join("\t"),
+    );
+  } else {
+    console.log("LANE\tNot created");
+  }
+
+  const artifactByTask = new Map(delivery.artifacts.map((artifact) => [artifact.taskId, artifact]));
+  console.log("TASK\tDELIVERY\tPHASE\tBRANCH\tBASE\tRESULT\tTITLE");
+  for (const task of delivery.tasks) {
+    const artifact = artifactByTask.get(task.id);
+    console.log(
+      [
+        human(task.id),
+        task.deliveryStatus,
+        task.currentPhase,
+        task.integrationBranch ? human(task.integrationBranch) : "-",
+        artifact?.baseSha
+          ? shortSha(artifact.baseSha)
+          : task.createdBaseSha
+            ? shortSha(task.createdBaseSha)
+            : "-",
+        task.integratedSha
+          ? shortSha(task.integratedSha)
+          : task.resultCommitSha
+            ? shortSha(task.resultCommitSha)
+            : "-",
+        human(task.title),
+      ].join("\t"),
+    );
+  }
+
+  const operations = delivery.operations.slice(-10);
+  if (operations.length === 0) {
+    console.log("OPERATIONS\tNone");
+    return;
+  }
+  console.log("OPERATION\tSTATUS\tTASK\tCONFLICTS\tERROR");
+  for (const operation of operations) {
+    console.log(
+      [
+        operation.kind,
+        operation.status,
+        operation.taskId ? human(operation.taskId) : "-",
+        operation.conflictFiles.length > 0 ? operation.conflictFiles.map(human).join(",") : "-",
+        operation.error ? human(operation.error) : "-",
+      ].join("\t"),
+    );
+  }
+}
+
+function integrationOutcomeMessage(taskId: string, outcome: TaskIntegrationOutcome): string {
+  switch (outcome.status) {
+    case "integrated":
+      return `Integrated ${human(taskId)} at ${shortSha(outcome.integratedSha)} on lane ${human(outcome.laneId)}`;
+    case "already-integrated":
+      return `${human(taskId)} is already integrated at ${shortSha(outcome.integratedSha)} on lane ${human(outcome.laneId)}`;
+    case "conflict":
+      return `Integration conflict for ${human(taskId)}: ${outcome.conflictPaths.map(human).join(", ") || "unknown paths"}`;
+    case "verification-failed":
+      return `Integration verification failed for ${human(taskId)} (${outcome.failureClass})`;
+    case "contended":
+      return `Integration deferred for ${human(taskId)}: ${human(outcome.message)}`;
+  }
+}
+
+function landingOutcomeMessage(queueRef: string, outcome: QueueLandingOutcome): string {
+  if (outcome.status === "already-landed") {
+    return `${human(queueRef)} is already landed at ${shortSha(outcome.landedSha)}`;
+  }
+  const taskLabel = outcome.artifactIds.length === 1 ? "task result" : "task results";
+  return `Landed ${outcome.artifactIds.length} ${taskLabel} from ${human(queueRef)} at ${shortSha(outcome.landedSha)}`;
+}
+
+function shortSha(value: string): string {
+  return human(value.slice(0, 12));
 }
 
 function human(value: string): string {
