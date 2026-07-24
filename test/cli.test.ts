@@ -9,7 +9,7 @@ afterEach(async () => {
   await Promise.all(
     roots
       .splice(0)
-      .map((root) => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })),
+      .map((root) => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })),
   );
 });
 
@@ -206,12 +206,26 @@ describe("agentq CLI", () => {
     expect(JSON.parse(removed.stdout)).toEqual({ removed: true, queue: "empty" });
   });
 
-  test("requires confirmation before deleting an inactive task through the CLI", async () => {
+  test("requires confirmation before deleting terminal task history through the CLI", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-task-delete-"));
     roots.push(stateDir);
     await cli(stateDir, ["queue", "create", "work", "--repo", projectRoot, "--json"]);
     const added = await cli(stateDir, ["task", "add", "Delete me", "--queue", "work", "--json"]);
     const taskId = (JSON.parse(added.stdout) as { id: string }).id;
+    const store = new AgentQStore(join(stateDir, "agentq.sqlite"));
+    try {
+      const claim = store.claimNextTask({ queue: "work" });
+      if (!claim) throw new Error("Expected task claim");
+      store.appendEvent({
+        taskId,
+        runId: claim.run.id,
+        kind: "assistant",
+        payload: { text: "done" },
+      });
+      store.finishRun(claim.run.id, { status: "succeeded", exitCode: 0 });
+    } finally {
+      store.close();
+    }
 
     const unconfirmed = await cli(stateDir, ["task", "remove", taskId, "--json"]);
     expect(unconfirmed.exitCode).toBe(2);

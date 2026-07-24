@@ -308,6 +308,26 @@ describe("AgentQApp", () => {
     await access(retained);
   });
 
+  test("reports partial deletion when local log cleanup fails", async () => {
+    const value = await fixture();
+    const queue = await value.app.createQueue({ name: "log-cleanup", repoPath: value.firstRepo });
+    const task = await value.app.addTask({ queue: queue.id, title: "Keep cleanup observable" });
+    const notifications: string[] = [];
+    const unsubscribe = value.app.subscribe(() => notifications.push("changed"));
+    await rm(value.app.paths.logsDir, { recursive: true, force: true });
+    await writeFile(value.app.paths.logsDir, "not a directory");
+
+    await expect(value.app.deleteTask(task.id)).rejects.toMatchObject({
+      code: "LOG_CLEANUP_FAILED",
+      message: expect.stringContaining("was deleted"),
+    } satisfies Partial<AgentQError>);
+    await expect(value.app.getTask(task.id)).rejects.toMatchObject({
+      code: "TASK_NOT_FOUND",
+    } satisfies Partial<AgentQError>);
+    expect(notifications).toHaveLength(1);
+    unsubscribe();
+  });
+
   test("lists run history and resumes only a session from the task's current provider", async () => {
     const value = await fixture();
     const queue = await value.app.createQueue({

@@ -574,6 +574,51 @@ describe("AgentQStore", () => {
     expect(store.getTask(activeTask.id)?.id).toBe(activeTask.id);
   });
 
+  test("preserves delegation provenance by deleting only leaf tasks", () => {
+    const store = open();
+    const queue = store.createQueue({ name: "task-tree", repoKey: "repo", repoPath: "/repo" });
+    const parent = store.addTask({ queue: queue.id, title: "parent" });
+    const child = store.addTask({
+      queue: queue.id,
+      title: "child",
+      parentTaskId: parent.id,
+      sourceKind: "agent",
+    });
+
+    try {
+      store.deleteTask(parent.id);
+      throw new Error("Expected parent task deletion to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentQError);
+      expect((error as AgentQError).code).toBe("TASK_HAS_CHILDREN");
+    }
+    expect(store.getTask(parent.id)?.id).toBe(parent.id);
+    expect(store.getTask(child.id)?.parentTaskId).toBe(parent.id);
+
+    expect(store.deleteTask(child.id)).toBe(true);
+    expect(store.deleteTask(parent.id)).toBe(true);
+  });
+
+  test("refuses task deletion while any run remains active", () => {
+    const store = open();
+    const queue = store.createQueue({ name: "active-run", repoKey: "repo", repoPath: "/repo" });
+    const task = store.addTask({ queue: queue.id, title: "active run" });
+    const claim = store.claimNextTask({ queue: queue.id });
+    if (!claim) throw new Error("Expected task claim");
+
+    // Exercise the defensive store boundary with deliberately inconsistent task metadata.
+    store.updateTask(task.id, { status: "failed", currentRunId: null });
+    try {
+      store.deleteTask(task.id);
+      throw new Error("Expected active run deletion to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentQError);
+      expect((error as AgentQError).code).toBe("TASK_ACTIVE");
+    }
+    expect(store.getTask(task.id)?.id).toBe(task.id);
+    expect(store.getRun(claim.run.id)?.status).toBe("starting");
+  });
+
   test("serializes queue removal with a task added by another writer", async () => {
     const store = open();
     const queue = store.createQueue({ name: "delete-race", repoKey: "repo", repoPath: "/repo" });

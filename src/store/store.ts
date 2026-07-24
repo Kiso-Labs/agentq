@@ -1254,6 +1254,20 @@ export class AgentQStore {
         throw new AgentQError(`Cannot delete active task ${id}`, "TASK_ACTIVE");
       }
 
+      const activeRun = selectOne<{ id: string }, [string]>(
+        this.#database,
+        `
+          SELECT id
+          FROM runs
+          WHERE task_id = ? AND status IN ('starting', 'running', 'cancelling')
+          LIMIT 1
+        `,
+        [id],
+      );
+      if (activeRun) {
+        throw new AgentQError(`Cannot delete active task ${id}`, "TASK_ACTIVE");
+      }
+
       const retainedWorktree = selectOne<{ id: string }, [string]>(
         this.#database,
         "SELECT id FROM runs WHERE task_id = ? AND worktree_path IS NOT NULL LIMIT 1",
@@ -1266,6 +1280,18 @@ export class AgentQStore {
         );
       }
 
+      const dependentTask = selectOne<{ id: string }, [string]>(
+        this.#database,
+        "SELECT id FROM tasks WHERE parent_task_id = ? LIMIT 1",
+        [id],
+      );
+      if (dependentTask) {
+        throw new AgentQError(
+          `Delete dependent task ${dependentTask.id} before deleting parent task ${id}`,
+          "TASK_HAS_CHILDREN",
+        );
+      }
+
       const changed = this.#database.run(
         `
           DELETE FROM tasks
@@ -1273,10 +1299,18 @@ export class AgentQStore {
             AND current_run_id IS NULL
             AND status NOT IN ('starting', 'running', 'cancelling')
             AND NOT EXISTS (
+              SELECT 1
+              FROM runs
+              WHERE task_id = ? AND status IN ('starting', 'running', 'cancelling')
+            )
+            AND NOT EXISTS (
               SELECT 1 FROM runs WHERE task_id = ? AND worktree_path IS NOT NULL
             )
+            AND NOT EXISTS (
+              SELECT 1 FROM tasks child WHERE child.parent_task_id = ?
+            )
         `,
-        [id, id],
+        [id, id, id, id],
       ).changes;
       // Bun reports cascaded run/event deletions in `changes`, so only zero
       // means the guarded task row was not removed.

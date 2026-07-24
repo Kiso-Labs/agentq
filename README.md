@@ -220,7 +220,7 @@ agentq never merges, pushes, or opens pull requests automatically.
 
 Task and queue deletion require explicit confirmation in the Ink UI or `--yes` in the CLI. Deleting a task removes its attempts, events, and local logs. Deleting a queue atomically removes the queue and all of its inactive tasks, attempts, events, and local logs.
 
-Deletion refuses active work and any task that still has a retained worktree. Cancel or finish active tasks first, then run `agentq task clean <id> --yes` for each retained worktree before retrying deletion. This guard keeps agentq from orphaning an agent process or silently discarding an inspection/resume worktree. Both delete commands support `--json` for automation.
+Deletion refuses active work, retained worktrees, and parent tasks that still have dependent tasks. Delete leaf tasks before their parents. If a queued task retains an earlier worktree, cancel it first, then run `agentq task clean <id> --yes` before retrying deletion. These guards preserve agent processes, inspection/resume worktrees, and delegation ancestry. Local-log cleanup failures are reported with the remaining paths instead of being silently ignored. Both delete commands support `--json` for automation.
 
 ## 🌮 Commands
 

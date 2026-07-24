@@ -182,8 +182,8 @@ export class AgentQApp implements UiController {
     if (!removed) {
       throw new AgentQError(`Queue not found: ${idOrName}`, "QUEUE_NOT_FOUND");
     }
-    await this.removeTaskLogs(removed.taskIds);
     this.notify();
+    await this.removeTaskLogs(removed.taskIds);
   }
 
   async addTask(
@@ -236,14 +236,15 @@ export class AgentQApp implements UiController {
     if (!this.store.deleteTask(taskId)) {
       throw new AgentQError(`Task not found: ${taskId}`, "TASK_NOT_FOUND");
     }
-    await this.removeTaskLogs([taskId]);
     this.notify();
+    await this.removeTaskLogs([taskId]);
   }
 
   private async removeTaskLogs(taskIds: readonly string[]): Promise<void> {
-    await Promise.allSettled(
-      taskIds.map((taskId) =>
-        rm(join(this.paths.logsDir, taskId), {
+    const logPaths = taskIds.map((taskId) => join(this.paths.logsDir, taskId));
+    const results = await Promise.allSettled(
+      logPaths.map((path) =>
+        rm(path, {
           recursive: true,
           force: true,
           maxRetries: 5,
@@ -251,6 +252,17 @@ export class AgentQApp implements UiController {
         }),
       ),
     );
+    const failedPaths = results.flatMap((result, index) =>
+      result.status === "rejected" && logPaths[index] ? [logPaths[index]] : [],
+    );
+    if (failedPaths.length > 0) {
+      const displayed = failedPaths.slice(0, 3).join(", ");
+      const remainder = failedPaths.length > 3 ? ` and ${failedPaths.length - 3} more` : "";
+      throw new AgentQError(
+        `The task or queue was deleted, but agentq could not remove local logs at ${displayed}${remainder}. Remove those paths manually.`,
+        "LOG_CLEANUP_FAILED",
+      );
+    }
   }
 
   async listEvents(
