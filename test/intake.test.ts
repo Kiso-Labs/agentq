@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentQApp } from "../src/app.ts";
 import type { AgentQPaths } from "../src/core/types.ts";
+import { runCommand } from "../src/git/command.ts";
 import { DelegatedTaskIntake, submitDelegatedTask } from "../src/intake/delegated-tasks.ts";
 
 const roots: string[] = [];
@@ -25,9 +26,30 @@ async function setup() {
   };
   const app = await AgentQApp.create(paths);
   const repoPath = join(root, "repo");
-  const queue = app.store.createQueue({ name: "intake", repoKey: repoPath, repoPath });
+  await mkdir(repoPath, { recursive: true });
+  await git(repoPath, "init", "--initial-branch=main");
+  await writeFile(join(repoPath, "README.md"), "# Intake fixture\n");
+  await git(repoPath, "add", "--all");
+  await git(
+    repoPath,
+    "-c",
+    "user.name=AgentQ Intake Tests",
+    "-c",
+    "user.email=agentq-intake@example.invalid",
+    "commit",
+    "-m",
+    "Initial fixture",
+  );
+  const queue = await app.createQueue({ name: "intake", repoPath, baseRef: "main" });
   const parent = app.store.addTask({ queue: queue.id, title: "Parent" });
   return { app, parent, queue, stateDir };
+}
+
+async function git(cwd: string, ...args: string[]): Promise<void> {
+  const result = await runCommand("git", args, { cwd });
+  if (result.exitCode !== 0) {
+    throw new Error(result.stderr.trim() || result.stdout.trim() || `git ${args[0]} failed`);
+  }
 }
 
 async function waitUntil(predicate: () => Promise<boolean>): Promise<void> {
