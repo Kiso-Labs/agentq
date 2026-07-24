@@ -82,6 +82,36 @@ describe("durable delivery store", () => {
     return { task: store.getTask(task.id) as Task, artifact };
   }
 
+  function integrateArtifact(
+    store: AgentQStore,
+    laneId: string,
+    task: Task,
+    artifact: TaskArtifact,
+    newHeadSha: string,
+  ): void {
+    const lane = store.getIntegrationLane(laneId);
+    if (!lane) throw new Error("Expected integration lane");
+    const operation = store.createDeliveryOperation({
+      laneId,
+      kind: "integrate",
+      taskId: task.id,
+      artifactId: artifact.id,
+    });
+    const claim = store.claimDeliveryOperation({
+      operationId: operation.id,
+      ownerToken: `integrator-${task.id}`,
+    });
+    if (!claim) throw new Error("Expected delivery operation claim");
+    store.completeIntegration({
+      operationId: operation.id,
+      leaseToken: claim.leaseToken,
+      fenceToken: claim.fenceToken,
+      expectedLaneGeneration: lane.generation,
+      expectedHeadSha: lane.headSha,
+      newHeadSha,
+    });
+  }
+
   test("persists canonical immutable evidence and atomically integrates and lands it", () => {
     const store = open();
     const queue = store.createQueue({
@@ -516,6 +546,97 @@ describe("durable delivery store", () => {
     const claim = store.claimNextTask({ queue: queue.id });
     expect(claim?.task.id).toBe(task.id);
     expect(claim?.run.baseSha).toBeUndefined();
+  });
+
+  test("pins a fan-in task to the shared lane head after sequential blocker integrations", () => {
+    const store = open();
+    const queue = store.createQueue({
+      name: "fan-in",
+      repoKey: "repo",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    const lane = store.getOrCreateIntegrationLane({
+      repoKey: queue.repoKey,
+      repoPath: queue.repoPath,
+      targetRef: queue.baseRef,
+      trainRef: "refs/agentq/trains/repo/main",
+      initialHeadSha: BASE_SHA,
+    });
+    const first = successfulArtifact(store, queue, "a");
+    const firstIntegratedSha = "b".repeat(40);
+    integrateArtifact(store, lane.id, first.task, first.artifact, firstIntegratedSha);
+
+    const second = successfulArtifact(store, queue, "c");
+    const sharedLaneHead = "d".repeat(40);
+    integrateArtifact(store, lane.id, second.task, second.artifact, sharedLaneHead);
+    expect(store.getTask(first.task.id)?.integratedSha).toBe(firstIntegratedSha);
+    expect(store.getTask(second.task.id)?.integratedSha).toBe(sharedLaneHead);
+
+    const fanIn = store.addTask({
+      queue: queue.id,
+      title: "Combine both integrated blockers",
+      blockedBy: [first.task.id, second.task.id],
+    });
+    const claim = store.claimNextTask({ queue: queue.id });
+    expect(claim?.task.id).toBe(fanIn.id);
+    expect(claim?.run.baseSha).toBe(sharedLaneHead);
+    expect(
+      new Set(claim?.run.dependencySnapshot.map((dependency) => dependency.resultCommitSha)),
+    ).toEqual(new Set([first.artifact.resultSha, second.artifact.resultSha]));
+    expect(store.getTask(fanIn.id)?.attemptCount).toBe(1);
+  });
+
+  test("refuses fan-in blockers integrated into different delivery lanes", () => {
+    const store = open();
+    const mainQueue = store.createQueue({
+      name: "main-work",
+      repoKey: "repo",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    const releaseQueue = store.createQueue({
+      name: "release-work",
+      repoKey: "repo",
+      repoPath: "/repo",
+      baseRef: "release",
+    });
+    const mainLane = store.getOrCreateIntegrationLane({
+      repoKey: "repo",
+      repoPath: "/repo",
+      targetRef: "main",
+      trainRef: "refs/agentq/trains/repo/main",
+      initialHeadSha: BASE_SHA,
+    });
+    const releaseLane = store.getOrCreateIntegrationLane({
+      repoKey: "repo",
+      repoPath: "/repo",
+      targetRef: "release",
+      trainRef: "refs/agentq/trains/repo/release",
+      initialHeadSha: BASE_SHA,
+    });
+    const mainBlocker = successfulArtifact(store, mainQueue, "e");
+    integrateArtifact(store, mainLane.id, mainBlocker.task, mainBlocker.artifact, "f".repeat(40));
+    const releaseBlocker = successfulArtifact(store, releaseQueue, "2");
+    integrateArtifact(
+      store,
+      releaseLane.id,
+      releaseBlocker.task,
+      releaseBlocker.artifact,
+      "3".repeat(40),
+    );
+    const fanIn = store.addTask({
+      queue: mainQueue.id,
+      title: "Unsafe cross-lane fan-in",
+      blockedBy: [mainBlocker.task.id, releaseBlocker.task.id],
+    });
+
+    expect(store.claimNextTask({ queue: mainQueue.id })).toBeUndefined();
+    expect(store.getTask(fanIn.id)).toMatchObject({
+      status: "queued",
+      currentPhase: "blocked",
+      attemptCount: 0,
+    });
   });
 
   test("permanently stops a task whose integration violates policy", () => {

@@ -2586,25 +2586,6 @@ export class AgentQStore {
                   OR blocker.result_commit_sha IS NULL
                 )
             )
-            AND (
-              (SELECT COUNT(*) FROM task_dependencies dependency WHERE dependency.task_id = t.id)
-                <= 1
-              OR (
-                NOT EXISTS (
-                  SELECT 1
-                  FROM task_dependencies dependency
-                  JOIN tasks blocker ON blocker.id = dependency.blocker_task_id
-                  WHERE dependency.task_id = t.id
-                    AND COALESCE(blocker.landed_sha, blocker.integrated_sha) IS NULL
-                )
-                AND (
-                  SELECT COUNT(DISTINCT COALESCE(blocker.landed_sha, blocker.integrated_sha))
-                  FROM task_dependencies dependency
-                  JOIN tasks blocker ON blocker.id = dependency.blocker_task_id
-                  WHERE dependency.task_id = t.id
-                ) = 1
-              )
-            )
             ${queueClause}
             ${repoClause}
             ${globalClause}
@@ -2622,7 +2603,11 @@ export class AgentQStore {
       const candidate = candidates.find((row) => {
         const candidateTask = mapTask(row);
         const candidateQueue = this.#requireQueue(candidateTask.queueId);
-        return this.#fileConcurrencyAllows(candidateTask, candidateQueue);
+        const dependenciesShareLane =
+          candidateTask.blockedBy.length <= 1 ||
+          this.#multiDependencyLaneHead(candidateTask.id, candidateTask.blockedBy.length) !==
+            undefined;
+        return dependenciesShareLane && this.#fileConcurrencyAllows(candidateTask, candidateQueue);
       });
 
       if (!candidate) return undefined;
@@ -2650,8 +2635,14 @@ export class AgentQStore {
         dependencySnapshot.length === 1
           ? dependencySnapshot[0]?.resultCommitSha
           : dependencySnapshot.length > 1
-            ? (dependencySnapshot[0]?.landedSha ?? dependencySnapshot[0]?.integratedSha)
+            ? this.#multiDependencyLaneHead(task.id, dependencySnapshot.length)
             : undefined;
+      if (dependencySnapshot.length > 1 && dependencyBaseSha === undefined) {
+        throw new AgentQError(
+          `Task ${task.id} blockers are not integrated into one delivery lane`,
+          "CLAIM_DEPENDENCY_CONFLICT",
+        );
+      }
       const claimBaseSha =
         dependencyBaseSha ??
         (task.failureClass === "test_regression" &&
@@ -5141,6 +5132,54 @@ export class AgentQStore {
       return this.#requireTaskApproval(task.id, checkedCheckpoint);
     });
     return decide.immediate();
+  }
+
+  #multiDependencyLaneHead(taskId: string, dependencyCount: number): string | undefined {
+    if (dependencyCount <= 1) return undefined;
+    const lanes = selectAll<
+      { lane_id: unknown; head_sha: unknown; blocker_count: unknown },
+      [string, number]
+    >(
+      this.#database,
+      `
+        SELECT lane.id AS lane_id,
+               lane.head_sha,
+               COUNT(DISTINCT dependency.blocker_task_id) AS blocker_count
+        FROM task_dependencies dependency
+        JOIN tasks blocker ON blocker.id = dependency.blocker_task_id
+        JOIN task_artifacts artifact
+          ON artifact.task_id = blocker.id
+         AND artifact.run_id = blocker.result_run_id
+         AND artifact.result_sha = blocker.result_commit_sha
+        JOIN delivery_operations operation
+          ON operation.artifact_id = artifact.id
+         AND operation.task_id = blocker.id
+         AND operation.kind = 'integrate'
+         AND operation.status = 'succeeded'
+        JOIN integration_lanes lane ON lane.id = operation.lane_id
+        WHERE dependency.task_id = ?
+          AND blocker.status = 'succeeded'
+          AND blocker.delivery_status IN ('integrated', 'landed')
+        GROUP BY lane.id, lane.head_sha
+        HAVING COUNT(DISTINCT dependency.blocker_task_id) = ?
+      `,
+      [taskId, dependencyCount],
+    );
+    if (lanes.length !== 1) return undefined;
+    const lane = lanes[0] as {
+      lane_id: unknown;
+      head_sha: unknown;
+      blocker_count: unknown;
+    };
+    const laneId = stringValue(lane.lane_id, "dependency lane", taskId, "lane_id");
+    const blockerCount = integerValue(
+      lane.blocker_count,
+      "dependency lane",
+      laneId,
+      "blocker_count",
+    );
+    if (blockerCount !== dependencyCount) return undefined;
+    return stringValue(lane.head_sha, "dependency lane", laneId, "head_sha");
   }
 
   #fileConcurrencyAllows(task: Task, queue: Queue): boolean {
