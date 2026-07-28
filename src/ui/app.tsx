@@ -1,35 +1,639 @@
 import { Box, Text, useApp, useInput, useWindowSize } from "ink";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import stringWidth from "string-width";
 import {
+  BASE_DRIFT_POLICIES,
   canCancelTask,
   canCompleteTaskManually,
   canRetryTask,
+  FILE_CONCURRENCY_MODES,
   isTaskActive,
   isTaskTerminal,
+  LAND_STRATEGIES,
   PROVIDERS,
+  type Provider,
   type Queue,
+  type Run,
+  TASK_STATUSES,
   type Task,
+  type TaskApproval,
   type TaskEvent,
 } from "../core/types.ts";
+import type { IntegrationResult, IntegrationTarget } from "../integrations/instructions.ts";
+import {
+  type ActivityEntry,
+  type ActivityTone,
+  activityEntries,
+  visibleActivityEntries,
+} from "./activity.ts";
 import { sanitizeTerminalText } from "./sanitize.ts";
-import type { AgentqAppProps } from "./types.ts";
+import type {
+  AgentqAppProps,
+  UiContext,
+  UiDoctorCheck,
+  UiQueueDelivery,
+  UiQueuePatch,
+  UiTaskPatch,
+} from "./types.ts";
 
 type FocusPane = "queues" | "tasks" | "details";
-type ScreenMode = "dashboard" | "add" | "confirm-cancel" | "confirm-retry";
+type ScreenMode =
+  | "dashboard"
+  | "add"
+  | "edit"
+  | "queue-form"
+  | "help"
+  | "actions"
+  | "confirm"
+  | "attempts"
+  | "approvals"
+  | "approval-form"
+  | "doctor"
+  | "integration-results";
 
 interface Snapshot {
   queues: Queue[];
   tasks: Task[];
 }
 
-interface AddDraft {
-  queueIndex: number;
+interface TaskDraftFields {
   providerIndex: number;
+  priority: string;
   title: string;
   instructions: string;
-  field: 0 | 1 | 2 | 3;
+  acceptanceCriteria: string;
+  objective: string;
+  invariants: string;
+  handoffRequirements: string;
+  blockedBy: string;
+  expectedPaths: string;
+  allowedPaths: string;
+  deniedPaths: string;
+  maxChangedFiles: string;
+  verifyCommands: string;
+  approvalCheckpoints: string;
+  baseDriftPolicyIndex: number;
+  landStrategyIndex: number;
+  idempotencyKey: string;
+  field: number;
   error?: string;
 }
+
+interface AddDraft extends TaskDraftFields {
+  queueId: string;
+}
+
+interface EditDraft extends TaskDraftFields {
+  taskId: string;
+  expectedUpdatedAt: string;
+}
+
+interface ApprovalDraft {
+  taskId: string;
+  checkpoint: string;
+  decision: "approve" | "reject";
+  actor: string;
+  note: string;
+  field: 0 | 1;
+  error?: string;
+}
+
+type TaskDraftTextKey =
+  | "priority"
+  | "title"
+  | "instructions"
+  | "acceptanceCriteria"
+  | "objective"
+  | "invariants"
+  | "handoffRequirements"
+  | "blockedBy"
+  | "expectedPaths"
+  | "allowedPaths"
+  | "deniedPaths"
+  | "maxChangedFiles"
+  | "verifyCommands"
+  | "approvalCheckpoints"
+  | "idempotencyKey";
+
+type TaskFormControl =
+  | { kind: "queue"; label: string; focusIndex: number }
+  | { kind: "provider"; label: string; focusIndex: number }
+  | {
+      kind: "text";
+      key: TaskDraftTextKey;
+      label: string;
+      focusIndex: number;
+      multiline?: boolean;
+      placeholder?: string;
+    }
+  | {
+      kind: "selector";
+      key: "baseDriftPolicyIndex" | "landStrategyIndex";
+      label: string;
+      focusIndex: number;
+      options: readonly string[];
+    };
+
+const TASK_STRUCTURED_CONTROLS = (firstIndex: number): readonly TaskFormControl[] => [
+  {
+    kind: "text",
+    key: "objective",
+    label: "Objective",
+    focusIndex: firstIndex,
+    multiline: true,
+    placeholder: "Use title and instructions",
+  },
+  {
+    kind: "text",
+    key: "invariants",
+    label: "Invariants",
+    focusIndex: firstIndex + 1,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  {
+    kind: "text",
+    key: "handoffRequirements",
+    label: "Handoff requirements",
+    focusIndex: firstIndex + 2,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  {
+    kind: "text",
+    key: "blockedBy",
+    label: "Blocked by task IDs",
+    focusIndex: firstIndex + 3,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  {
+    kind: "text",
+    key: "expectedPaths",
+    label: "Expected paths",
+    focusIndex: firstIndex + 4,
+    multiline: true,
+    placeholder: "none · globs separated with ;",
+  },
+  {
+    kind: "text",
+    key: "allowedPaths",
+    label: "Allowed paths",
+    focusIndex: firstIndex + 5,
+    multiline: true,
+    placeholder: "inherit queue · globs separated with ;",
+  },
+  {
+    kind: "text",
+    key: "deniedPaths",
+    label: "Denied paths",
+    focusIndex: firstIndex + 6,
+    multiline: true,
+    placeholder: "inherit queue · globs separated with ;",
+  },
+  {
+    kind: "text",
+    key: "maxChangedFiles",
+    label: "Maximum changed files",
+    focusIndex: firstIndex + 7,
+    placeholder: "inherit queue",
+  },
+  {
+    kind: "text",
+    key: "verifyCommands",
+    label: "Verification commands",
+    focusIndex: firstIndex + 8,
+    multiline: true,
+    placeholder: "inherit queue · separate with ; or ctrl+n",
+  },
+  {
+    kind: "text",
+    key: "approvalCheckpoints",
+    label: "Approval checkpoints",
+    focusIndex: firstIndex + 9,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  {
+    kind: "selector",
+    key: "baseDriftPolicyIndex",
+    label: "Base drift policy",
+    focusIndex: firstIndex + 10,
+    options: BASE_DRIFT_POLICIES,
+  },
+  {
+    kind: "selector",
+    key: "landStrategyIndex",
+    label: "Land strategy",
+    focusIndex: firstIndex + 11,
+    options: LAND_STRATEGIES,
+  },
+];
+
+const ADD_TASK_CONTROLS: readonly TaskFormControl[] = [
+  { kind: "queue", label: "Queue", focusIndex: 0 },
+  { kind: "provider", label: "Provider", focusIndex: 1 },
+  { kind: "text", key: "title", label: "Title", focusIndex: 2 },
+  {
+    kind: "text",
+    key: "instructions",
+    label: "Instructions",
+    focusIndex: 3,
+    multiline: true,
+  },
+  { kind: "text", key: "priority", label: "Priority", focusIndex: 4 },
+  {
+    kind: "text",
+    key: "acceptanceCriteria",
+    label: "Acceptance criteria",
+    focusIndex: 5,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  {
+    kind: "text",
+    key: "idempotencyKey",
+    label: "Idempotency key",
+    focusIndex: 6,
+    placeholder: "optional",
+  },
+  ...TASK_STRUCTURED_CONTROLS(7),
+];
+
+const EDIT_TASK_CONTROLS: readonly TaskFormControl[] = [
+  { kind: "provider", label: "Provider", focusIndex: 0 },
+  { kind: "text", key: "priority", label: "Priority", focusIndex: 1 },
+  { kind: "text", key: "title", label: "Title", focusIndex: 2 },
+  {
+    kind: "text",
+    key: "instructions",
+    label: "Instructions",
+    focusIndex: 3,
+    multiline: true,
+  },
+  {
+    kind: "text",
+    key: "acceptanceCriteria",
+    label: "Acceptance criteria",
+    focusIndex: 4,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  ...TASK_STRUCTURED_CONTROLS(5),
+];
+
+interface QueueDraft {
+  kind: "create" | "edit";
+  queueId?: string;
+  name: string;
+  repoPath: string;
+  baseRef: string;
+  providerIndex: number;
+  planModel: string;
+  planInstructions: string;
+  implementModel: string;
+  implementInstructions: string;
+  concurrency: string;
+  maxAttempts: string;
+  verifyCommands: string;
+  autoCommit: boolean;
+  allowedPaths: string;
+  deniedPaths: string;
+  maxChangedFiles: string;
+  approvalCheckpoints: string;
+  baseDriftPolicyIndex: number;
+  landStrategyIndex: number;
+  autoLand: boolean;
+  fileConcurrencyIndex: number;
+  field: number;
+  error?: string;
+}
+
+type QueueDraftTextKey =
+  | "name"
+  | "repoPath"
+  | "baseRef"
+  | "planModel"
+  | "planInstructions"
+  | "implementModel"
+  | "implementInstructions"
+  | "concurrency"
+  | "maxAttempts"
+  | "verifyCommands"
+  | "allowedPaths"
+  | "deniedPaths"
+  | "maxChangedFiles"
+  | "approvalCheckpoints";
+
+type QueueFormControl =
+  | {
+      kind: "text";
+      key: QueueDraftTextKey;
+      label: string;
+      focusIndex: number;
+      multiline?: boolean;
+      placeholder?: string;
+    }
+  | { kind: "provider"; label: string; focusIndex: number }
+  | {
+      kind: "toggle";
+      key: "autoCommit" | "autoLand";
+      label: string;
+      focusIndex: number;
+    }
+  | {
+      kind: "selector";
+      key: "baseDriftPolicyIndex" | "landStrategyIndex" | "fileConcurrencyIndex";
+      label: string;
+      focusIndex: number;
+      options: readonly string[];
+    }
+  | { kind: "readonly"; key: "repoPath"; label: string };
+
+const CREATE_QUEUE_CONTROLS: readonly QueueFormControl[] = [
+  { kind: "text", key: "name", label: "Name", focusIndex: 0 },
+  { kind: "text", key: "repoPath", label: "Repository", focusIndex: 1 },
+  {
+    kind: "text",
+    key: "baseRef",
+    label: "Base ref",
+    focusIndex: 2,
+    placeholder: "auto (current branch)",
+  },
+  { kind: "provider", label: "Provider", focusIndex: 3 },
+  {
+    kind: "text",
+    key: "planModel",
+    label: "Plan model",
+    focusIndex: 4,
+    placeholder: "provider default",
+  },
+  {
+    kind: "text",
+    key: "planInstructions",
+    label: "Plan instructions",
+    focusIndex: 5,
+    multiline: true,
+    placeholder: "none",
+  },
+  {
+    kind: "text",
+    key: "implementModel",
+    label: "Implementation model",
+    focusIndex: 6,
+    placeholder: "provider default",
+  },
+  {
+    kind: "text",
+    key: "implementInstructions",
+    label: "Implementation instructions",
+    focusIndex: 7,
+    multiline: true,
+    placeholder: "none",
+  },
+  { kind: "text", key: "concurrency", label: "Concurrency", focusIndex: 8 },
+  { kind: "text", key: "maxAttempts", label: "Max attempts", focusIndex: 9 },
+  {
+    kind: "text",
+    key: "verifyCommands",
+    label: "Verify commands",
+    focusIndex: 10,
+    multiline: true,
+    placeholder: "none",
+  },
+  { kind: "toggle", key: "autoCommit", label: "Auto-commit", focusIndex: 11 },
+  {
+    kind: "text",
+    key: "allowedPaths",
+    label: "Allowed paths",
+    focusIndex: 12,
+    multiline: true,
+    placeholder: "unrestricted · globs separated with ;",
+  },
+  {
+    kind: "text",
+    key: "deniedPaths",
+    label: "Denied paths",
+    focusIndex: 13,
+    multiline: true,
+    placeholder: "none · globs separated with ;",
+  },
+  {
+    kind: "text",
+    key: "maxChangedFiles",
+    label: "Maximum changed files",
+    focusIndex: 14,
+    placeholder: "unlimited",
+  },
+  {
+    kind: "text",
+    key: "approvalCheckpoints",
+    label: "Approval checkpoints",
+    focusIndex: 15,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  {
+    kind: "selector",
+    key: "baseDriftPolicyIndex",
+    label: "Base drift policy",
+    focusIndex: 16,
+    options: BASE_DRIFT_POLICIES,
+  },
+  {
+    kind: "selector",
+    key: "landStrategyIndex",
+    label: "Land strategy",
+    focusIndex: 17,
+    options: LAND_STRATEGIES,
+  },
+  { kind: "toggle", key: "autoLand", label: "Auto-land", focusIndex: 18 },
+  {
+    kind: "selector",
+    key: "fileConcurrencyIndex",
+    label: "File concurrency",
+    focusIndex: 19,
+    options: FILE_CONCURRENCY_MODES,
+  },
+];
+
+const EDIT_QUEUE_CONTROLS: readonly QueueFormControl[] = [
+  { kind: "text", key: "name", label: "Name", focusIndex: 0 },
+  { kind: "readonly", key: "repoPath", label: "Repository (read-only)" },
+  { kind: "text", key: "baseRef", label: "Base ref", focusIndex: 1 },
+  { kind: "provider", label: "Provider", focusIndex: 2 },
+  {
+    kind: "text",
+    key: "planModel",
+    label: "Plan model",
+    focusIndex: 3,
+    placeholder: "provider default",
+  },
+  {
+    kind: "text",
+    key: "planInstructions",
+    label: "Plan instructions",
+    focusIndex: 4,
+    multiline: true,
+    placeholder: "none",
+  },
+  {
+    kind: "text",
+    key: "implementModel",
+    label: "Implementation model",
+    focusIndex: 5,
+    placeholder: "provider default",
+  },
+  {
+    kind: "text",
+    key: "implementInstructions",
+    label: "Implementation instructions",
+    focusIndex: 6,
+    multiline: true,
+    placeholder: "none",
+  },
+  { kind: "text", key: "concurrency", label: "Concurrency", focusIndex: 7 },
+  { kind: "text", key: "maxAttempts", label: "Max attempts", focusIndex: 8 },
+  {
+    kind: "text",
+    key: "verifyCommands",
+    label: "Verify commands",
+    focusIndex: 9,
+    multiline: true,
+    placeholder: "none",
+  },
+  { kind: "toggle", key: "autoCommit", label: "Auto-commit", focusIndex: 10 },
+  {
+    kind: "text",
+    key: "allowedPaths",
+    label: "Allowed paths",
+    focusIndex: 11,
+    multiline: true,
+    placeholder: "unrestricted · globs separated with ;",
+  },
+  {
+    kind: "text",
+    key: "deniedPaths",
+    label: "Denied paths",
+    focusIndex: 12,
+    multiline: true,
+    placeholder: "none · globs separated with ;",
+  },
+  {
+    kind: "text",
+    key: "maxChangedFiles",
+    label: "Maximum changed files",
+    focusIndex: 13,
+    placeholder: "unlimited",
+  },
+  {
+    kind: "text",
+    key: "approvalCheckpoints",
+    label: "Approval checkpoints",
+    focusIndex: 14,
+    multiline: true,
+    placeholder: "none · separate with ; or ctrl+n",
+  },
+  {
+    kind: "selector",
+    key: "baseDriftPolicyIndex",
+    label: "Base drift policy",
+    focusIndex: 15,
+    options: BASE_DRIFT_POLICIES,
+  },
+  {
+    kind: "selector",
+    key: "landStrategyIndex",
+    label: "Land strategy",
+    focusIndex: 16,
+    options: LAND_STRATEGIES,
+  },
+  { kind: "toggle", key: "autoLand", label: "Auto-land", focusIndex: 17 },
+  {
+    kind: "selector",
+    key: "fileConcurrencyIndex",
+    label: "File concurrency",
+    focusIndex: 18,
+    options: FILE_CONCURRENCY_MODES,
+  },
+];
+
+const queueFormControls = (kind: QueueDraft["kind"]): readonly QueueFormControl[] =>
+  kind === "create" ? CREATE_QUEUE_CONTROLS : EDIT_QUEUE_CONTROLS;
+
+type Confirmation =
+  | { kind: "cancel"; task: Task }
+  | { kind: "retry"; task: Task }
+  | { kind: "delete-queue"; queue: Queue }
+  | { kind: "delete-task"; task: Task }
+  | { kind: "clean"; task: Task; force: boolean }
+  | { kind: "integration"; target: IntegrationTarget; repoPath: string }
+  | { kind: "integrate-task"; task: Task }
+  | { kind: "land-queue"; queue: Queue };
+
+type ActionId =
+  | "create-queue"
+  | "edit-queue"
+  | "delete-queue"
+  | "add-task"
+  | "edit-task"
+  | "delete-task"
+  | "cancel-task"
+  | "retry-task"
+  | "resume-task"
+  | "complete-task"
+  | "attempts"
+  | "clean-task"
+  | "filter-status"
+  | "doctor"
+  | "login-codex"
+  | "login-claude"
+  | "integrate-codex"
+  | "integrate-claude"
+  | "integrate-all"
+  | "toggle-scope"
+  | "refresh"
+  | "help"
+  | "quit"
+  | "view-approvals"
+  | "approve-checkpoint"
+  | "reject-checkpoint"
+  | "integrate-result"
+  | "land-queue";
+
+interface ActionItem {
+  id: ActionId;
+  label: string;
+  detail: string;
+  available: boolean;
+}
+
+type TaskStatusFilter = "all" | Task["status"];
+
+const EDITABLE_TASK_STATUSES = new Set<Task["status"]>([
+  "queued",
+  "failed",
+  "interrupted",
+  "cancelled",
+]);
+const TASK_FILTERS: readonly TaskStatusFilter[] = ["all", ...TASK_STATUSES];
+
+const isTaskEditable = (task: Task): boolean => EDITABLE_TASK_STATUSES.has(task.status);
+
+const canIntegrateTaskResult = (task: Task | undefined): task is Task =>
+  Boolean(
+    task?.status === "succeeded" &&
+      task.resultRunId &&
+      task.resultCommitSha &&
+      task.verificationResults.every((result) => result.status === "passed") &&
+      task.deliveryStatus === "ready_to_integrate",
+  );
+
+const parseAcceptanceCriteria = (value: string): string[] =>
+  value
+    .split(/[;\n]/u)
+    .map((criterion) => criterion.trim())
+    .filter((criterion) => criterion.length > 0);
 
 const STATUS_LABEL: Record<Task["status"], string> = {
   queued: "QUEUED",
@@ -53,7 +657,85 @@ const STATUS_COLOR: Record<Task["status"], string> = {
   cancelled: "gray",
 };
 
+const queueModelLabel = (queue: Queue, model: string): string =>
+  model.trim() || `${queue.defaultProvider} default`;
+
+const queueInstructionSummary = (instructions: string): string => {
+  const summary = sanitizeTerminalText(instructions).replace(/\s+/gu, " ").trim();
+  return summary || "none";
+};
+
+const workflowLabel = (value: string): string =>
+  value.replace(/[_-]+/gu, " ").replace(/\s+/gu, " ").trim().toUpperCase();
+
+const listSummary = (values: readonly string[], fallback = "none"): string =>
+  values.length > 0 ? sanitizeTerminalText(values.join(", ")) : fallback;
+
+const formatElapsed = (run: Run | undefined, task: Task): string => {
+  const started = Date.parse(run?.startedAt ?? task.createdAt);
+  const finished = Date.parse(
+    run?.finishedAt ?? run?.heartbeatAt ?? task.completedAt ?? task.updatedAt,
+  );
+  if (!Number.isFinite(started) || !Number.isFinite(finished) || finished < started) {
+    return "unknown";
+  }
+  const seconds = Math.floor((finished - started) / 1_000);
+  const hours = Math.floor(seconds / 3_600);
+  const minutes = Math.floor((seconds % 3_600) / 60);
+  const remainder = seconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${remainder}s`;
+  return `${remainder}s`;
+};
+
+const formatCost = (costUsd: number): string =>
+  costUsd === 0 ? "$0" : `$${costUsd.toFixed(costUsd < 0.01 ? 4 : 2)}`;
+
 const FOCUS_ORDER: FocusPane[] = ["queues", "tasks", "details"];
+type PaneWeights = Record<FocusPane, number>;
+
+const DEFAULT_PANE_WEIGHTS: PaneWeights = {
+  queues: 0.2,
+  tasks: 0.32,
+  details: 0.48,
+};
+const MIN_PANE_WEIGHT = 0.16;
+const PANE_RESIZE_STEP = 0.05;
+
+const resizePaneWeights = (current: PaneWeights, pane: FocusPane, delta: number): PaneWeights => {
+  const others = FOCUS_ORDER.filter((candidate) => candidate !== pane);
+  const next = { ...current };
+
+  if (delta > 0) {
+    const capacities = others.map((candidate) => Math.max(0, current[candidate] - MIN_PANE_WEIGHT));
+    const available = capacities.reduce((total, capacity) => total + capacity, 0);
+    const amount = Math.min(delta, available);
+    if (amount <= 0 || available <= 0) return current;
+    next[pane] += amount;
+    for (const [index, candidate] of others.entries()) {
+      next[candidate] -= amount * ((capacities[index] ?? 0) / available);
+    }
+  } else {
+    const available = Math.max(0, current[pane] - MIN_PANE_WEIGHT);
+    const amount = Math.min(-delta, available);
+    if (amount <= 0) return current;
+    next[pane] -= amount;
+    const otherTotal = others.reduce((total, candidate) => total + current[candidate], 0);
+    for (const candidate of others) {
+      next[candidate] += amount * (current[candidate] / otherTotal);
+    }
+  }
+
+  const total = FOCUS_ORDER.reduce((sum, candidate) => sum + next[candidate], 0);
+  for (const candidate of FOCUS_ORDER) next[candidate] /= total;
+  return next;
+};
+
+const paneWidths = (width: number, weights: PaneWeights): Record<FocusPane, number> => {
+  const queues = Math.floor(width * weights.queues);
+  const tasks = Math.floor(width * weights.tasks);
+  return { queues, tasks, details: Math.max(1, width - queues - tasks) };
+};
 
 interface WindowedItems<T> {
   items: T[];
@@ -75,20 +757,39 @@ const messageFrom = (error: unknown): string => {
   return String(error);
 };
 
-const eventText = (event: TaskEvent): string => {
-  const text = event.payload.text ?? event.payload.message ?? event.payload.detail;
-  if (typeof text === "string" && text.length > 0) return sanitizeTerminalText(text);
+const errorCodeFrom = (error: unknown): string | undefined =>
+  typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+    ? error.code
+    : undefined;
 
-  const name = typeof event.payload.name === "string" ? event.payload.name : undefined;
-  const state = typeof event.payload.state === "string" ? event.payload.state : undefined;
-  if (name) {
-    return sanitizeTerminalText(state ? `${name} · ${state}` : name);
+const parseCommands = (value: string): string[] =>
+  value
+    .split(/[;\n]/u)
+    .map((command) => command.trim())
+    .filter((command) => command.length > 0);
+
+const parseList = parseCommands;
+
+const positiveIntegerFrom = (value: string, label: string): number => {
+  if (!/^\d+$/u.test(value.trim())) throw new Error(`${label} must be a positive whole number.`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error(`${label} must be a positive whole number.`);
   }
-
-  const keys = Object.keys(event.payload);
-  if (keys.length === 0) return sanitizeTerminalText(event.kind);
-  return sanitizeTerminalText(JSON.stringify(event.payload));
+  return parsed;
 };
+
+const optionalPositiveIntegerFrom = (value: string, label: string): number | undefined =>
+  value.trim() ? positiveIntegerFrom(value, label) : undefined;
+
+const selectedOption = <T extends string>(options: readonly T[], index: number, fallback: T): T =>
+  options[index] ?? fallback;
+
+const selectedOptionIndex = <T extends string>(options: readonly T[], value: T): number =>
+  Math.max(0, options.indexOf(value));
+
+const runSummary = (run: Run): string =>
+  run.error ?? run.summary ?? run.taskSnapshot?.title ?? "No summary recorded.";
 
 const nextIndex = (current: number, length: number, delta: number): number => {
   if (length === 0) return 0;
@@ -133,19 +834,30 @@ function Panel({ title, active, children, width, height, flexGrow }: PanelProps)
   );
 }
 
-function Header({ tasks, focus, narrow }: { tasks: Task[]; focus: FocusPane; narrow: boolean }) {
+function Header({
+  tasks,
+  focus,
+  narrow,
+  scopeLabel,
+}: {
+  tasks: Task[];
+  focus: FocusPane;
+  narrow: boolean;
+  scopeLabel?: string;
+}) {
   const running = tasks.filter((task) => isTaskActive(task.status)).length;
   const queued = tasks.filter((task) => task.status === "queued").length;
   const failed = tasks.filter(
     (task) => task.status === "failed" || task.status === "interrupted",
   ).length;
+  const scope = scopeLabel ? sanitizeTerminalText(scopeLabel) : undefined;
 
   if (narrow) {
     return (
       <Box height={3} paddingX={1} flexDirection="column">
         <Box justifyContent="space-between">
-          <Text bold color="cyan">
-            ◆ AGENTQ
+          <Text bold color="cyan" wrap="truncate-end">
+            ◆ AGENTQ{scope ? ` · ${scope}` : ""}
           </Text>
           <Text dimColor>
             {running} run · {queued} wait · {failed} alert
@@ -164,7 +876,9 @@ function Header({ tasks, focus, narrow }: { tasks: Task[]; focus: FocusPane; nar
         <Text bold color="cyan">
           ◆ AGENTQ <Text color="gray">/ parallel coding queue</Text>
         </Text>
-        <Text dimColor>isolated worktrees · durable runs · live output</Text>
+        <Text dimColor wrap="truncate-end">
+          {scope ? `${scope} · ` : ""}isolated worktrees · durable runs · live output
+        </Text>
       </Box>
       <Box flexDirection="column" alignItems="flex-end">
         <Text>
@@ -185,6 +899,8 @@ function QueuePane({
   active,
   height,
   width,
+  scopeLabel,
+  showRepositories,
 }: {
   queues: Queue[];
   tasks: Task[];
@@ -192,9 +908,13 @@ function QueuePane({
   active: boolean;
   height?: number | string;
   width?: number | string;
+  scopeLabel?: string;
+  showRepositories: boolean;
 }) {
   const selectedIndex = queues.findIndex((queue) => queue.id === selectedId);
-  const rowCapacity = typeof height === "number" ? Math.max(1, height - 3) : queues.length;
+  const rowHeight = showRepositories ? 2 : 1;
+  const rowCapacity =
+    typeof height === "number" ? Math.max(1, Math.floor((height - 3) / rowHeight)) : queues.length;
   const visible = windowItems(queues, selectedIndex, rowCapacity);
   const position = selectedIndex >= 0 ? `  ${selectedIndex + 1}/${queues.length}` : "";
 
@@ -202,8 +922,9 @@ function QueuePane({
     <Panel title={`QUEUES${position}`} active={active} height={height} width={width}>
       {queues.length === 0 ? (
         <Box flexGrow={1} flexDirection="column" justifyContent="center">
-          <Text bold>No queues yet</Text>
-          <Text dimColor>Create one with `agentq queue create`.</Text>
+          <Text bold>{scopeLabel ? "No queues for this repository" : "No queues yet"}</Text>
+          {scopeLabel ? <Text dimColor>{sanitizeTerminalText(scopeLabel)}</Text> : null}
+          <Text dimColor>Press n to create one, or run `agentq queue create &lt;name&gt;`.</Text>
         </Box>
       ) : (
         visible.items.map((queue) => {
@@ -212,13 +933,20 @@ function QueuePane({
           const queuedCount = queueTasks.filter((task) => task.status === "queued").length;
           const selected = queue.id === selectedId;
           return (
-            <Box key={queue.id} justifyContent="space-between">
-              <Text bold={selected} color={selected ? "cyan" : undefined} wrap="truncate-end">
-                {selected ? "›" : " "} {sanitizeTerminalText(queue.name)}
-              </Text>
-              <Text dimColor={!selected}>
-                {activeCount}/{queue.concurrency} <Text color="blue">+{queuedCount}</Text>
-              </Text>
+            <Box key={queue.id} flexDirection="column">
+              <Box justifyContent="space-between">
+                <Text bold={selected} color={selected ? "cyan" : undefined} wrap="truncate-end">
+                  {selected ? "›" : " "} {sanitizeTerminalText(queue.name)}
+                </Text>
+                <Text dimColor={!selected}>
+                  {activeCount}/{queue.concurrency} <Text color="blue">+{queuedCount}</Text>
+                </Text>
+              </Box>
+              {showRepositories ? (
+                <Text dimColor wrap="truncate-end">
+                  {sanitizeTerminalText(queue.repoPath)}
+                </Text>
+              ) : null}
             </Box>
           );
         })
@@ -229,12 +957,14 @@ function QueuePane({
 
 function TaskPane({
   tasks,
+  filter,
   selectedId,
   active,
   height,
   width,
 }: {
   tasks: Task[];
+  filter: TaskStatusFilter;
   selectedId?: string;
   active: boolean;
   height?: number | string;
@@ -242,27 +972,29 @@ function TaskPane({
 }) {
   const selectedIndex = tasks.findIndex((task) => task.id === selectedId);
   const rowCapacity =
-    typeof height === "number" ? Math.max(1, Math.floor((height - 3) / 3)) : tasks.length;
+    typeof height === "number" ? Math.max(1, Math.floor((height - 3) / 2)) : tasks.length;
   const visible = windowItems(tasks, selectedIndex, rowCapacity);
   const position = selectedIndex >= 0 ? `  ${selectedIndex + 1}/${tasks.length}` : "";
 
   return (
     <Panel
-      title={`TASKS  ${tasks.length}${position}`}
+      title={`TASKS  ${tasks.length}${filter === "all" ? "" : ` · ${filter.toUpperCase()}`}${position}`}
       active={active}
       height={height}
       width={width}
     >
       {tasks.length === 0 ? (
         <Box flexGrow={1} flexDirection="column" justifyContent="center">
-          <Text bold>Queue is clear</Text>
-          <Text dimColor>Press a to add the first task.</Text>
+          <Text bold>{filter === "all" ? "Queue is clear" : `No ${filter} tasks`}</Text>
+          <Text dimColor>
+            {filter === "all" ? "Press a to add the first task." : "Press f to change the filter."}
+          </Text>
         </Box>
       ) : (
         visible.items.map((task) => {
           const selected = task.id === selectedId;
           return (
-            <Box key={task.id} flexDirection="column" marginBottom={1}>
+            <Box key={task.id} flexDirection="column" flexShrink={0}>
               <Box>
                 <Text color={selected ? "cyan" : undefined}>{selected ? "› " : "  "}</Text>
                 <StatusBadge status={task.status} />
@@ -279,26 +1011,368 @@ function TaskPane({
   );
 }
 
+const ACTIVITY_COLOR: Record<ActivityTone, string | undefined> = {
+  default: undefined,
+  active: "cyan",
+  muted: "gray",
+  success: "green",
+  warning: "yellow",
+  error: "red",
+};
+
+function ActivityRow({ entry }: { entry: ActivityEntry }) {
+  const color = ACTIVITY_COLOR[entry.tone];
+  return (
+    <Box flexDirection="column">
+      <Box>
+        <Text color={color}>{entry.marker} </Text>
+        <Text
+          bold={entry.emphasis}
+          color={color}
+          dimColor={entry.tone === "muted"}
+          wrap="truncate-end"
+        >
+          {entry.title}
+        </Text>
+      </Box>
+      {entry.details.map((detail, index) => (
+        <Box key={`${entry.key}-detail-${detail}`} marginLeft={2}>
+          <Text dimColor>{index === 0 ? "└ " : "  "}</Text>
+          <Text
+            color={entry.tone === "error" || entry.tone === "warning" ? color : undefined}
+            dimColor={entry.tone !== "error" && entry.tone !== "warning"}
+            wrap="truncate-end"
+          >
+            {detail}
+          </Text>
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
 function DetailsPane({
   task,
+  queue,
+  run,
   events,
+  approvals,
+  delivery,
+  deliveryError,
   active,
   height,
+  width,
 }: {
   task?: Task;
+  queue?: Queue;
+  run?: Run;
   events: TaskEvent[];
+  approvals: TaskApproval[];
+  delivery?: UiQueueDelivery;
+  deliveryError?: string;
   active: boolean;
   height?: number | string;
+  width?: number | string;
 }) {
-  const eventLimit = typeof height === "number" ? Math.max(2, height - 12) : 8;
-  const visibleEvents = events.slice(-eventLimit);
+  const activeRun =
+    run && ["starting", "running", "cancelling"].includes(run.status) ? run : undefined;
+  const activity = activityEntries(
+    activeRun
+      ? events.filter(
+          (event) =>
+            !(
+              event.runId === activeRun.id &&
+              event.kind === "workflow.phase" &&
+              event.payload.phase === activeRun.phase &&
+              event.payload.state === "started"
+            ),
+        )
+      : events,
+  );
+  const workflow = activeRun?.taskSnapshot?.workflow;
+  const activeModel =
+    activeRun?.phase === "plan"
+      ? (workflow?.planModel ?? queue?.planModel)
+      : (workflow?.implementModel ?? queue?.implementModel);
+  const activeStageFinished = activeRun
+    ? events.some(
+        (event) =>
+          event.runId === activeRun.id &&
+          event.kind === "workflow.phase" &&
+          event.payload.phase === activeRun.phase &&
+          (event.payload.state === "completed" || event.payload.state === "failed"),
+      )
+    : false;
+  const activeStage: ActivityEntry | undefined =
+    activeRun && !activeStageFinished
+      ? {
+          key: `active-${activeRun.id}-${activeRun.phase}`,
+          marker: "›",
+          title: `${activeRun.phase === "plan" ? "Planning" : "Implementing"} with ${
+            activeRun.provider === "claude" ? "Claude Code" : "Codex"
+          }${activeModel?.trim() ? ` · ${sanitizeTerminalText(activeModel.trim())}` : ""}`,
+          details: [],
+          tone: "active",
+          emphasis: true,
+        }
+      : undefined;
+  const verificationResults = task
+    ? task.verificationResults.length > 0
+      ? task.verificationResults
+      : (run?.verificationResults ?? [])
+    : [];
+  const changedFiles = task
+    ? task.changedFiles.length > 0
+      ? task.changedFiles
+      : (run?.changedFiles ?? [])
+    : [];
+  const verificationCounts = verificationResults.reduce(
+    (counts, result) => {
+      counts[result.status] += 1;
+      return counts;
+    },
+    { pending: 0, passed: 0, failed: 0, skipped: 0 },
+  );
+  const latestVerification = verificationResults.at(-1);
+  const blockerState =
+    task && task.blockedBy.length > 0
+      ? task.blockedBy
+          .map((taskId) => {
+            const dependency = run?.dependencySnapshot.find(
+              (candidate) => candidate.taskId === taskId,
+            );
+            return dependency
+              ? `${taskId} ${workflowLabel(dependency.deliveryStatus)} @ ${dependency.resultCommitSha}`
+              : taskId;
+          })
+          .join(", ")
+      : "none";
+  const taskInputTokens = task ? task.inputTokens || run?.inputTokens || 0 : 0;
+  const taskOutputTokens = task ? task.outputTokens || run?.outputTokens || 0 : 0;
+  const taskCost = task ? task.costUsd || run?.costUsd || 0 : 0;
+  const pendingCheckpoints = approvals.filter((approval) => approval.status === "pending");
+  const approvalSummary =
+    pendingCheckpoints.length > 0
+      ? `${pendingCheckpoints.length} pending · ${pendingCheckpoints
+          .map((approval) => approval.checkpoint)
+          .join(", ")}`
+      : approvals.length > 0
+        ? `${approvals.filter((approval) => approval.status === "approved").length} approved · ${
+            approvals.filter((approval) => approval.status === "rejected").length
+          } rejected`
+        : "none requested";
+  const deliveryOperations = [...(delivery?.operations ?? [])].sort((left, right) =>
+    right.createdAt.localeCompare(left.createdAt),
+  );
+  const latestDeliveryOperation = task
+    ? deliveryOperations.find((operation) => operation.taskId === task.id)
+    : deliveryOperations[0];
+  const deliveryOperationSummary = latestDeliveryOperation
+    ? `${workflowLabel(latestDeliveryOperation.kind)} ${workflowLabel(
+        latestDeliveryOperation.status,
+      )} · ${latestDeliveryOperation.id}${
+        latestDeliveryOperation.candidateSha ? ` · ${latestDeliveryOperation.candidateSha}` : ""
+      }${
+        latestDeliveryOperation.conflictFiles.length > 0
+          ? ` · conflicts ${latestDeliveryOperation.conflictFiles.join(", ")}`
+          : ""
+      }${latestDeliveryOperation.error ? ` · ${latestDeliveryOperation.error}` : ""}`
+    : "none recorded";
+  const laneSummary = delivery?.lane
+    ? `${delivery.lane.trainRef} · generation ${delivery.lane.generation} · ${delivery.lane.targetBaseSha} → ${delivery.lane.headSha}`
+    : "not created";
+  const failureSummary =
+    task && (task.failureClass || task.failureReason || task.retryDisposition || run?.error)
+      ? [
+          task.failureClass ? workflowLabel(task.failureClass) : undefined,
+          task.retryDisposition ? `next ${workflowLabel(task.retryDisposition)}` : undefined,
+          task.failureReason ?? run?.error,
+        ]
+          .filter((value): value is string => Boolean(value))
+          .join(" · ")
+      : undefined;
+  const operationalRows = task
+    ? [
+        {
+          label: "Phase",
+          value: `${workflowLabel(task.currentPhase)} · delivery ${workflowLabel(task.deliveryStatus)}`,
+          tone:
+            task.failureClass !== undefined
+              ? "red"
+              : task.deliveryStatus === "landed"
+                ? "green"
+                : "cyan",
+        },
+        {
+          label: "Approval",
+          value: approvalSummary,
+          tone: pendingCheckpoints.length > 0 ? "yellow" : undefined,
+        },
+        {
+          label: "Lane",
+          value: laneSummary,
+        },
+        {
+          label: "Delivery op",
+          value: deliveryOperationSummary,
+          tone:
+            latestDeliveryOperation?.status === "failed" ||
+            latestDeliveryOperation?.status === "conflicted"
+              ? "red"
+              : latestDeliveryOperation?.status === "succeeded"
+                ? "green"
+                : undefined,
+        },
+        ...(deliveryError
+          ? [{ label: "Delivery error", value: deliveryError, tone: "red" as const }]
+          : []),
+        ...(failureSummary
+          ? [{ label: "Failure", value: failureSummary, tone: "red" as const }]
+          : []),
+        ...(task.integrationConflictFiles.length > 0
+          ? [
+              {
+                label: "Conflicts",
+                value: listSummary(task.integrationConflictFiles),
+                tone: "red" as const,
+              },
+            ]
+          : []),
+        {
+          label: "Source",
+          value: `base ${run?.baseSha ?? task.createdBaseSha ?? "not recorded"} · branch ${
+            run?.branchName ?? task.integrationBranch ?? "not created"
+          }`,
+        },
+        {
+          label: "Result",
+          value: `${task.resultCommitSha ?? run?.resultCommitSha ?? "not recorded"} · integrated ${
+            task.integratedSha ?? "no"
+          } · landed ${task.landedSha ?? "no"}`,
+        },
+        {
+          label: "Blockers",
+          value: `${blockerState}${task.blockedReason ? ` · ${task.blockedReason}` : ""}`,
+        },
+        {
+          label: "Changed",
+          value:
+            changedFiles.length > 0
+              ? `${changedFiles.length} · ${listSummary(changedFiles)}`
+              : "0 files recorded",
+        },
+        {
+          label: "Verification",
+          value:
+            verificationResults.length > 0
+              ? `${verificationCounts.passed} passed · ${verificationCounts.failed} failed · ${verificationCounts.pending} pending · ${verificationCounts.skipped} skipped`
+              : `${task.verifyCommands.length} configured · no results`,
+          tone:
+            verificationCounts.failed > 0
+              ? "red"
+              : verificationCounts.passed > 0
+                ? "green"
+                : undefined,
+        },
+        ...(latestVerification
+          ? [
+              {
+                label: "Latest gate",
+                value: `${workflowLabel(latestVerification.status)} · ${
+                  latestVerification.name ??
+                  latestVerification.command ??
+                  workflowLabel(latestVerification.kind)
+                }${latestVerification.summary ? ` · ${latestVerification.summary}` : ""}`,
+                tone: latestVerification.status === "failed" ? "red" : undefined,
+              },
+            ]
+          : []),
+        {
+          label: "Resources",
+          value: `${formatElapsed(run, task)} · ${taskInputTokens.toLocaleString("en-US")} in / ${taskOutputTokens.toLocaleString("en-US")} out · ${formatCost(taskCost)}`,
+        },
+      ]
+    : [];
+  const operationalLimit = typeof height === "number" ? Math.max(4, Math.min(14, height - 14)) : 14;
+  const visibleOperationalRows = operationalRows.slice(0, operationalLimit);
+  const activityRowLimit =
+    (typeof height === "number" ? Math.max(2, height - 7 - visibleOperationalRows.length) : 8) -
+    (activeStage ? 1 : 0);
+  const visibleActivity = visibleActivityEntries(activity, activityRowLimit);
 
   return (
-    <Panel title="DETAILS / LIVE LOG" active={active} height={height} flexGrow={1}>
+    <Panel title="DETAILS / LIVE LOG" active={active} height={height} width={width}>
       {!task ? (
         <Box flexGrow={1} flexDirection="column" justifyContent="center">
-          <Text bold>No task selected</Text>
-          <Text dimColor>Choose a queue and task to inspect its run.</Text>
+          {queue ? (
+            <>
+              <Text bold>{sanitizeTerminalText(queue.name)}</Text>
+              <Text dimColor wrap="truncate-end">
+                {sanitizeTerminalText(queue.repoPath)}
+              </Text>
+              <Text>Base: {sanitizeTerminalText(queue.baseRef)}</Text>
+              <Text>Provider: {queue.defaultProvider}</Text>
+              <Text bold color="cyan">
+                PLAN
+              </Text>
+              <Text wrap="truncate-end">
+                Model: {sanitizeTerminalText(queueModelLabel(queue, queue.planModel))}
+              </Text>
+              <Text dimColor wrap="truncate-end">
+                Instructions: {queueInstructionSummary(queue.planInstructions)}
+              </Text>
+              <Text bold color="green">
+                IMPLEMENTATION
+              </Text>
+              <Text wrap="truncate-end">
+                Model: {sanitizeTerminalText(queueModelLabel(queue, queue.implementModel))}
+              </Text>
+              <Text dimColor wrap="truncate-end">
+                Instructions: {queueInstructionSummary(queue.implementInstructions)}
+              </Text>
+              <Text>
+                Concurrency: {queue.concurrency} · max attempts: {queue.maxAttempts}
+              </Text>
+              <Text wrap="truncate-end">
+                Verify:{" "}
+                {queue.verifyCommands.length > 0
+                  ? sanitizeTerminalText(queue.verifyCommands.join("; "))
+                  : "none"}
+              </Text>
+              <Text>Auto-commit: {queue.autoCommit ? "on" : "off"}</Text>
+              <Text wrap="truncate-end">
+                Allowed paths: {listSummary(queue.allowedPaths, "unrestricted")}
+              </Text>
+              <Text wrap="truncate-end">Denied paths: {listSummary(queue.deniedPaths)}</Text>
+              <Text>Changed-file limit: {queue.maxChangedFiles ?? "unlimited"}</Text>
+              <Text wrap="truncate-end">Approvals: {listSummary(queue.approvalCheckpoints)}</Text>
+              <Text wrap="truncate-end">
+                Drift: {workflowLabel(queue.baseDriftPolicy)} · landing:{" "}
+                {workflowLabel(queue.landStrategy)} · auto-land {queue.autoLand ? "on" : "off"}
+              </Text>
+              <Text wrap="truncate-end">
+                File concurrency: {workflowLabel(queue.fileConcurrency)}
+              </Text>
+              <Text wrap="truncate-end">
+                Integration lane: {delivery?.lane?.id ?? "not created"}
+              </Text>
+              <Text wrap="truncate-end">Train: {sanitizeTerminalText(laneSummary)}</Text>
+              <Text wrap="truncate-end">
+                Latest delivery: {sanitizeTerminalText(deliveryOperationSummary)}
+              </Text>
+              {deliveryError ? (
+                <Text color="red" wrap="truncate-end">
+                  Delivery state unavailable: {sanitizeTerminalText(deliveryError)}
+                </Text>
+              ) : null}
+              <Text dimColor>Select a task to inspect its live activity.</Text>
+            </>
+          ) : (
+            <>
+              <Text bold>No task selected</Text>
+              <Text dimColor>Choose a queue and task to inspect its run.</Text>
+            </>
+          )}
         </Box>
       ) : (
         <Box flexDirection="column" flexGrow={1} overflow="hidden">
@@ -312,32 +1386,37 @@ function DetailsPane({
             </Text>
           </Box>
           <Text dimColor wrap="truncate-end">
+            Objective: {sanitizeTerminalText(task.objective || task.title)}
+          </Text>
+          <Text dimColor wrap="truncate-end">
+            Instructions:{" "}
             {task.instructions
               ? sanitizeTerminalText(task.instructions)
               : "No additional instructions."}
           </Text>
-          <Box marginTop={1} borderTop borderColor="gray" flexDirection="column" flexGrow={1}>
-            <Text bold color="gray">
-              LIVE ACTIVITY
+          <Box flexDirection="column" marginTop={1}>
+            <Text bold color="magenta">
+              ENGINEERING STATE
             </Text>
-            {visibleEvents.length === 0 ? (
+            {visibleOperationalRows.map((row) => (
+              <Text key={row.label} color={row.tone} wrap="truncate-end">
+                <Text bold dimColor={!row.tone}>
+                  {row.label}:{" "}
+                </Text>
+                {sanitizeTerminalText(row.value)}
+              </Text>
+            ))}
+          </Box>
+          <Box marginTop={1} flexDirection="column" flexGrow={1} overflow="hidden">
+            {activeStage ? <ActivityRow entry={activeStage} /> : null}
+            {visibleActivity.length === 0 && !activeStage ? (
               <Text dimColor>
                 {isTaskTerminal(task.status)
                   ? "No recorded activity for this task."
                   : "Waiting for agent activity…"}
               </Text>
             ) : (
-              visibleEvents.map((event) => (
-                <Box key={event.id}>
-                  <Text color="gray">{String(event.id).padStart(3, "0")} </Text>
-                  <Text
-                    color={event.kind === "diagnostic" ? "yellow" : undefined}
-                    wrap="truncate-end"
-                  >
-                    {eventText(event)}
-                  </Text>
-                </Box>
-              ))
+              visibleActivity.map((entry) => <ActivityRow key={entry.key} entry={entry} />)
             )}
           </Box>
         </Box>
@@ -346,52 +1425,65 @@ function DetailsPane({
   );
 }
 
-function Footer({ notice, narrow, task }: { notice?: string; narrow: boolean; task?: Task }) {
+function Footer({
+  notice,
+  narrow,
+  task,
+  focus,
+  queue,
+  canToggle,
+}: {
+  notice?: string;
+  narrow: boolean;
+  task?: Task;
+  focus: FocusPane;
+  queue?: Queue;
+  canToggle: boolean;
+}) {
   return (
     <Box height={2} paddingX={1} flexDirection="column">
       <Text wrap="truncate-end">
         <Text bold color="cyan">
-          tab
+          :
         </Text>{" "}
-        focus{" "}
-        <Text bold color="cyan">
-          ↑↓
+        actions{"  "}
+        <Text bold color="green">
+          n
         </Text>{" "}
-        select{"  "}
+        queue{"  "}
         <Text bold color="green">
           a
         </Text>{" "}
-        add{" "}
-        {task && canCancelTask(task.status) ? (
+        task{"  "}
+        <Text bold color="cyan">
+          e
+        </Text>{" "}
+        edit {focus === "queues" ? "queue" : "task"}
+        {"  "}
+        <Text bold color="yellow">
+          x
+        </Text>{" "}
+        delete {focus === "queues" ? "queue" : "task"}
+        {"  "}
+        {canToggle ? (
           <>
-            <Text bold color="yellow">
-              c
-            </Text>{" "}
-            cancel{"  "}
+            <Text bold>g</Text> local/all{"  "}
           </>
         ) : null}
-        {task && canRetryTask(task.status) ? (
-          <>
-            <Text bold color="magenta">
-              r
-            </Text>{" "}
-            retry{"  "}
-          </>
-        ) : null}
-        {task && canCompleteTaskManually(task.status) ? (
-          <>
-            <Text bold color="green">
-              d
-            </Text>{" "}
-            done{"  "}
-          </>
-        ) : null}
+        <Text bold>?</Text> help{"  "}
         <Text bold>q</Text> quit
       </Text>
       {notice ? (
         <Text color="yellow">{sanitizeTerminalText(notice)}</Text>
+      ) : task ? (
+        <Text dimColor wrap="truncate-end">
+          p approvals · i integrate · L land · c cancel · r retry · s resume · d done · v attempts
+        </Text>
       ) : !narrow ? (
-        <Text dimColor>Agent output refreshes automatically.</Text>
+        <Text dimColor>
+          {queue ? `${sanitizeTerminalText(queue.name)} selected · L land · ` : ""}1-3/tab focus ·
+          ↑↓/jk select · [ ] size · z zoom · R refresh
+        </Text>
       ) : null}
     </Box>
   );
@@ -414,46 +1506,331 @@ function LoadingScreen({ columns, rows }: { columns: number; rows: number }) {
   );
 }
 
+interface FormField {
+  label: string;
+  value: string;
+  focused?: boolean;
+  focusable?: boolean;
+  multiline?: boolean;
+  textInput?: boolean;
+}
+
+interface FormScreenProps {
+  columns: number;
+  rows: number;
+  title: string;
+  subtitle: string;
+  fields: FormField[];
+  error?: string;
+  footer: string;
+}
+
+const formFieldHeight = (field: FormField): number => (field.multiline ? 6 : 4);
+
+const formGraphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+const splitFormGraphemes = (value: string): string[] =>
+  Array.from(formGraphemes.segment(value), ({ segment }) => segment);
+
+const takeFormTail = (value: string, width: number): string => {
+  const tail: string[] = [];
+  let used = 0;
+  for (const grapheme of splitFormGraphemes(value).reverse()) {
+    const graphemeWidth = stringWidth(grapheme);
+    if (used + graphemeWidth > width) break;
+    tail.push(grapheme);
+    used += graphemeWidth;
+  }
+  return tail.reverse().join("");
+};
+
+const wrapFormValue = (value: string, width: number): string[] => {
+  const lines: string[] = [];
+  for (const logicalLine of value.split("\n")) {
+    const graphemes = splitFormGraphemes(logicalLine);
+    if (graphemes.length === 0) {
+      lines.push("");
+      continue;
+    }
+
+    let line = "";
+    let used = 0;
+    for (const grapheme of graphemes) {
+      const graphemeWidth = stringWidth(grapheme);
+      if (line && used + graphemeWidth > width) {
+        lines.push(line);
+        line = "";
+        used = 0;
+      }
+      line += grapheme;
+      used += graphemeWidth;
+    }
+    if (line) lines.push(line);
+  }
+  return lines;
+};
+
+const focusedFormValue = (value: string, width: number, height: number): string => {
+  const wrapped = wrapFormValue(value, width);
+  const clipped = wrapped.length > height;
+  const visible = wrapped.slice(-height);
+  if (visible.length === 0) visible.push("");
+
+  const marker = "…";
+  const cursor = "▏";
+  const markerWidth = stringWidth(marker);
+  const cursorWidth = stringWidth(cursor);
+  if (clipped && visible.length === 1) {
+    const contentWidth = Math.max(0, width - markerWidth - cursorWidth);
+    return `${marker}${takeFormTail(visible[0] ?? "", contentWidth)}${cursor}`;
+  }
+
+  if (clipped) {
+    const contentWidth = Math.max(0, width - markerWidth);
+    visible[0] = `${marker}${takeFormTail(visible[0] ?? "", contentWidth)}`;
+  }
+
+  const lastIndex = visible.length - 1;
+  const contentWidth = Math.max(0, width - cursorWidth);
+  visible[lastIndex] = `${takeFormTail(visible[lastIndex] ?? "", contentWidth)}${cursor}`;
+  return visible.join("\n");
+};
+
+const attemptWorkflowLines = (run: Run, width: number): string[] => {
+  const lines: string[] = [];
+  const workflow = run.taskSnapshot?.workflow;
+  const addSection = (label: string, value: string | undefined, fallback: string) => {
+    lines.push(label);
+    lines.push(
+      ...wrapFormValue(sanitizeTerminalText(value ?? "").trim() || fallback, Math.max(1, width)),
+    );
+    lines.push("");
+  };
+
+  addSection(
+    "PLANNING INSTRUCTIONS",
+    workflow?.planInstructions,
+    "No planning instructions were captured for this attempt.",
+  );
+  addSection(
+    "IMPLEMENTATION INSTRUCTIONS",
+    workflow?.implementInstructions,
+    "No implementation instructions were captured for this attempt.",
+  );
+  addSection(
+    "PLANNER HANDOFF",
+    run.planOutput,
+    "No planner handoff was recorded for this attempt.",
+  );
+  if (lines.at(-1) === "") lines.pop();
+  return lines;
+};
+
+const visibleFormFields = (
+  fields: FormField[],
+  focusedIndex: number,
+  capacity: number,
+): { fields: FormField[]; start: number; end: number } => {
+  if (fields.length === 0) return { fields: [], start: 0, end: 0 };
+
+  const focus = Math.max(0, Math.min(fields.length - 1, focusedIndex));
+  let start = focus;
+  let end = focus + 1;
+  let used = formFieldHeight(fields[focus] as FormField);
+  let preferAfter = true;
+
+  while (start > 0 || end < fields.length) {
+    const before = start > 0 ? fields[start - 1] : undefined;
+    const after = end < fields.length ? fields[end] : undefined;
+    const beforeFits = before !== undefined && used + formFieldHeight(before) <= capacity;
+    const afterFits = after !== undefined && used + formFieldHeight(after) <= capacity;
+
+    if (!beforeFits && !afterFits) break;
+    if ((preferAfter && afterFits) || !beforeFits) {
+      used += formFieldHeight(after as FormField);
+      end += 1;
+    } else {
+      start -= 1;
+      used += formFieldHeight(before as FormField);
+    }
+    preferAfter = !preferAfter;
+  }
+
+  return { fields: fields.slice(start, end), start, end };
+};
+
+function FormScreen({ columns, rows, title, subtitle, fields, error, footer }: FormScreenProps) {
+  const focusedIndex = Math.max(
+    0,
+    fields.findIndex((field) => field.focused),
+  );
+  const focusableFields = fields.filter((field) => field.focusable !== false);
+  const focusedPosition = Math.max(
+    0,
+    focusableFields.findIndex((field) => field.focused),
+  );
+  const chromeHeight = 4 + (error ? 1 : 0);
+  const viewportHeight = Math.max(
+    formFieldHeight(fields[focusedIndex] as FormField),
+    rows - chromeHeight,
+  );
+  const visible = visibleFormFields(fields, focusedIndex, viewportHeight);
+  const hiddenAbove = visible.start;
+  const hiddenBelow = fields.length - visible.end;
+  const formWidth = Math.max(1, Math.min(columns - 2, 96));
+  const horizontalPadding = columns >= 50 ? 2 : 1;
+  const fieldTextWidth = Math.max(1, formWidth - horizontalPadding * 2 - 4);
+
+  return (
+    <Box width={columns} height={rows} alignItems="center" overflow="hidden">
+      <Box
+        width={formWidth}
+        height={rows}
+        paddingX={horizontalPadding}
+        flexDirection="column"
+        overflow="hidden"
+      >
+        <Box justifyContent="space-between">
+          <Text bold color="cyan">
+            {title}
+          </Text>
+          <Text dimColor>
+            FIELD {focusedPosition + 1}/{focusableFields.length}
+          </Text>
+        </Box>
+        <Text dimColor wrap="truncate-end">
+          {subtitle}
+        </Text>
+        <Text dimColor wrap="truncate-end">
+          Showing {visible.start + 1}–{visible.end} of {fields.length} rows
+          {hiddenAbove > 0 ? ` · ↑ ${hiddenAbove} hidden` : ""}
+          {hiddenBelow > 0 ? ` · ↓ ${hiddenBelow} hidden` : ""}
+        </Text>
+        <Box height={viewportHeight} flexDirection="column" overflow="hidden">
+          {visible.fields.map((field) => {
+            const value = sanitizeTerminalText(field.value);
+            const displayValue =
+              field.focused && field.textInput
+                ? focusedFormValue(value, fieldTextWidth, field.multiline ? 3 : 1)
+                : value || " ";
+            return (
+              <Box key={field.label} flexDirection="column">
+                <Text bold color={field.focused ? "cyan" : "gray"} wrap="truncate-end">
+                  {field.label}
+                </Text>
+                <Box
+                  height={field.multiline ? 5 : 3}
+                  borderStyle="round"
+                  borderColor={field.focused ? "cyan" : "gray"}
+                  paddingX={1}
+                  overflow="hidden"
+                >
+                  <Text wrap={field.multiline ? "wrap" : "truncate-end"}>{displayValue}</Text>
+                </Box>
+              </Box>
+            );
+          })}
+        </Box>
+        {error ? (
+          <Text color="red" wrap="truncate-end">
+            {sanitizeTerminalText(error)}
+          </Text>
+        ) : null}
+        <Text dimColor wrap="truncate-end">
+          {footer}
+        </Text>
+      </Box>
+    </Box>
+  );
+}
+
 export function AgentqApp({
   controller,
   dimensions,
   pollIntervalMs = 1_000,
+  scopeLabel,
   onExit,
 }: AgentqAppProps) {
   const windowSize = useWindowSize();
-  const { exit } = useApp();
-  const columns = Math.max(40, dimensions?.columns ?? windowSize.columns);
-  const rows = Math.max(16, dimensions?.rows ?? windowSize.rows);
+  const { exit, suspendTerminal } = useApp();
+  const columns = dimensions?.columns ?? windowSize.columns;
+  const rows = dimensions?.rows ?? windowSize.rows;
   const [snapshot, setSnapshot] = useState<Snapshot>({ queues: [], tasks: [] });
+  const [context, setContext] = useState<UiContext>();
   const [snapshotVersion, setSnapshotVersion] = useState(0);
   const [events, setEvents] = useState<TaskEvent[]>([]);
+  const [liveRun, setLiveRun] = useState<Run>();
+  const [approvals, setApprovals] = useState<TaskApproval[]>([]);
+  const [approvalIndex, setApprovalIndex] = useState(0);
+  const [approvalDraft, setApprovalDraft] = useState<ApprovalDraft>();
+  const [delivery, setDelivery] = useState<UiQueueDelivery>();
+  const [deliveryError, setDeliveryError] = useState<string>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [notice, setNotice] = useState<string>();
   const [focus, setFocus] = useState<FocusPane>("queues");
+  const [weights, setWeights] = useState<PaneWeights>(DEFAULT_PANE_WEIGHTS);
+  const [zoomedPane, setZoomedPane] = useState<FocusPane>();
   const [mode, setMode] = useState<ScreenMode>("dashboard");
   const [selectedQueueId, setSelectedQueueId] = useState<string>();
   const [selectedTaskId, setSelectedTaskId] = useState<string>();
+  const [taskFilter, setTaskFilter] = useState<TaskStatusFilter>("all");
   const [draft, setDraft] = useState<AddDraft>();
+  const [editDraft, setEditDraft] = useState<EditDraft>();
+  const [queueDraft, setQueueDraft] = useState<QueueDraft>();
+  const [confirmation, setConfirmation] = useState<Confirmation>();
+  const [runs, setRuns] = useState<Run[]>([]);
+  const [attemptIndex, setAttemptIndex] = useState(0);
+  const [attemptDetailOpen, setAttemptDetailOpen] = useState(false);
+  const [attemptDetailOffset, setAttemptDetailOffset] = useState(0);
+  const [doctorChecks, setDoctorChecks] = useState<UiDoctorCheck[]>([]);
+  const [integrationResults, setIntegrationResults] = useState<IntegrationResult[]>([]);
+  const [actionIndex, setActionIndex] = useState(0);
   const [actionPending, setActionPending] = useState(false);
   const mounted = useRef(true);
+  const refreshSequence = useRef(0);
+  const eventRefreshSequence = useRef(0);
+  const deliveryRefreshSequence = useRef(0);
+  const actionPendingRef = useRef(false);
+
+  const beginAction = useCallback(() => {
+    if (actionPendingRef.current) return false;
+    actionPendingRef.current = true;
+    setActionPending(true);
+    return true;
+  }, []);
+
+  const finishAction = useCallback(() => {
+    actionPendingRef.current = false;
+    if (mounted.current) setActionPending(false);
+  }, []);
 
   const refresh = useCallback(async () => {
+    const sequence = ++refreshSequence.current;
     try {
-      const [queues, tasks] = await Promise.all([controller.listQueues(), controller.listTasks()]);
-      if (!mounted.current) return;
+      const [queues, tasks, nextContext] = await Promise.all([
+        controller.listQueues(),
+        controller.listTasks(),
+        Promise.resolve(controller.uiContext()),
+      ]);
+      if (!mounted.current || sequence !== refreshSequence.current) return;
       setSnapshot({ queues, tasks });
+      setContext(nextContext);
       setSnapshotVersion((version) => version + 1);
       setSelectedQueueId((current) =>
         current && queues.some((queue) => queue.id === current) ? current : queues[0]?.id,
       );
       setError(undefined);
+      return true;
     } catch (cause) {
-      if (mounted.current) setError(messageFrom(cause));
+      if (mounted.current && sequence === refreshSequence.current) setError(messageFrom(cause));
+      return false;
     } finally {
-      if (mounted.current) setLoading(false);
+      if (mounted.current && sequence === refreshSequence.current) setLoading(false);
     }
   }, [controller]);
+
+  const displayScope = context?.label ?? scopeLabel;
 
   useEffect(() => {
     mounted.current = true;
@@ -470,10 +1847,18 @@ export function AgentqApp({
     };
   }, [controller, pollIntervalMs, refresh]);
 
-  const visibleTasks = useMemo(
+  const queueTasks = useMemo(
     () => snapshot.tasks.filter((task) => task.queueId === selectedQueueId),
     [selectedQueueId, snapshot.tasks],
   );
+  const visibleTasks = useMemo(
+    () => queueTasks.filter((task) => taskFilter === "all" || task.status === taskFilter),
+    [queueTasks, taskFilter],
+  );
+  const selectedQueue = snapshot.queues.find((queue) => queue.id === selectedQueueId);
+  const integrationRepositoryPath = context?.all
+    ? selectedQueue?.repoPath
+    : (context?.repositoryPath ?? selectedQueue?.repoPath);
 
   useEffect(() => {
     setSelectedTaskId((current) =>
@@ -482,28 +1867,85 @@ export function AgentqApp({
   }, [visibleTasks]);
 
   const selectedTask = visibleTasks.find((task) => task.id === selectedTaskId);
+  const selectedTaskApprovals = useMemo(
+    () => approvals.filter((approval) => approval.taskId === selectedTaskId),
+    [approvals, selectedTaskId],
+  );
+  const selectedApproval = selectedTaskApprovals[approvalIndex];
+  const pendingApproval = selectedTaskApprovals.find((approval) => approval.status === "pending");
+  const selectedDelivery = delivery?.queue.id === selectedQueueId ? delivery : undefined;
+  const canLandSelectedQueue = Boolean(
+    selectedDelivery?.lane &&
+      selectedDelivery.tasks.some((task) => task.deliveryStatus === "integrated"),
+  );
 
   const refreshEvents = useCallback(async () => {
+    const sequence = ++eventRefreshSequence.current;
     if (!selectedTaskId) {
       setEvents([]);
+      setLiveRun(undefined);
+      setApprovals([]);
       return;
     }
     try {
-      const nextEvents = await controller.listEvents(selectedTaskId, { limit: 200 });
-      if (mounted.current) setEvents(nextEvents);
+      const [nextEvents, taskRuns, nextApprovals] = await Promise.all([
+        controller.listEvents(selectedTaskId, { limit: 200 }),
+        controller.listRuns(selectedTaskId).catch(() => []),
+        controller.listTaskApprovals(selectedTaskId),
+      ]);
+      if (mounted.current && sequence === eventRefreshSequence.current) {
+        setEvents(nextEvents);
+        setApprovals(nextApprovals);
+        setApprovalIndex((current) => Math.max(0, Math.min(nextApprovals.length - 1, current)));
+        setLiveRun(
+          taskRuns.find((candidate) => candidate.id === selectedTask?.currentRunId) ??
+            taskRuns.find((candidate) =>
+              ["starting", "running", "cancelling"].includes(candidate.status),
+            ) ??
+            taskRuns[0],
+        );
+      }
     } catch (cause) {
-      if (mounted.current) setNotice(`Logs unavailable: ${messageFrom(cause)}`);
+      if (mounted.current && sequence === eventRefreshSequence.current) {
+        setNotice(`Task details unavailable: ${messageFrom(cause)}`);
+      }
     }
-  }, [controller, selectedTaskId]);
+  }, [controller, selectedTask, selectedTaskId]);
 
   useEffect(() => {
     if (snapshotVersion > 0) void refreshEvents();
   }, [refreshEvents, snapshotVersion]);
 
+  const refreshDelivery = useCallback(async () => {
+    const sequence = ++deliveryRefreshSequence.current;
+    if (!selectedQueueId) {
+      setDelivery(undefined);
+      setDeliveryError(undefined);
+      return;
+    }
+    setDeliveryError(undefined);
+    try {
+      const nextDelivery = await controller.getQueueDelivery(selectedQueueId);
+      if (!mounted.current || sequence !== deliveryRefreshSequence.current) return;
+      setDelivery(nextDelivery);
+      setDeliveryError(undefined);
+    } catch (cause) {
+      if (!mounted.current || sequence !== deliveryRefreshSequence.current) return;
+      setDelivery(undefined);
+      setDeliveryError(messageFrom(cause));
+    }
+  }, [controller, selectedQueueId]);
+
+  useEffect(() => {
+    if (snapshotVersion > 0) void refreshDelivery();
+  }, [refreshDelivery, snapshotVersion]);
+
   const cycleFocus = useCallback((delta: number) => {
     setFocus((current) => {
       const index = FOCUS_ORDER.indexOf(current);
-      return FOCUS_ORDER[nextIndex(index, FOCUS_ORDER.length, delta)] ?? "queues";
+      const next = FOCUS_ORDER[nextIndex(index, FOCUS_ORDER.length, delta)] ?? "queues";
+      setZoomedPane((zoomed) => (zoomed ? next : zoomed));
+      return next;
     });
   }, []);
 
@@ -527,16 +1969,30 @@ export function AgentqApp({
       setNotice("Create a queue before adding a task.");
       return;
     }
-    const queueIndex = Math.max(
-      0,
-      snapshot.queues.findIndex((queue) => queue.id === selectedQueueId),
-    );
-    const provider = snapshot.queues[queueIndex]?.defaultProvider ?? "codex";
+    const queue =
+      snapshot.queues.find((candidate) => candidate.id === selectedQueueId) ?? snapshot.queues[0];
+    if (!queue) return;
+    const provider = queue.defaultProvider;
     setDraft({
-      queueIndex,
+      queueId: queue.id,
       providerIndex: Math.max(0, PROVIDERS.indexOf(provider)),
+      priority: "0",
       title: "",
       instructions: "",
+      acceptanceCriteria: "",
+      objective: "",
+      invariants: "",
+      handoffRequirements: "",
+      blockedBy: "",
+      expectedPaths: "",
+      allowedPaths: "",
+      deniedPaths: "",
+      maxChangedFiles: "",
+      verifyCommands: "",
+      approvalCheckpoints: "",
+      baseDriftPolicyIndex: selectedOptionIndex(BASE_DRIFT_POLICIES, queue.baseDriftPolicy),
+      landStrategyIndex: selectedOptionIndex(LAND_STRATEGIES, queue.landStrategy),
+      idempotencyKey: "",
       field: 0,
     });
     setMode("add");
@@ -545,21 +2001,68 @@ export function AgentqApp({
 
   const submitAdd = useCallback(async () => {
     if (!draft || actionPending) return;
-    const queue = snapshot.queues[draft.queueIndex];
+    const queue = snapshot.queues.find((candidate) => candidate.id === draft.queueId);
     const provider = PROVIDERS[draft.providerIndex];
-    if (!queue || !provider) return;
+    if (!queue) {
+      setDraft((current) =>
+        current
+          ? {
+              ...current,
+              error:
+                "Selected queue is no longer available. Choose another queue with the arrow keys.",
+            }
+          : current,
+      );
+      return;
+    }
+    if (!provider) return;
     if (!draft.title.trim()) {
       setDraft((current) => (current ? { ...current, error: "Title is required." } : current));
       return;
     }
+    if (!/^-?\d+$/u.test(draft.priority.trim())) {
+      setDraft((current) =>
+        current ? { ...current, error: "Priority must be a whole number." } : current,
+      );
+      return;
+    }
+    const priority = Number(draft.priority);
+    if (!Number.isSafeInteger(priority)) {
+      setDraft((current) =>
+        current ? { ...current, error: "Priority is outside the safe integer range." } : current,
+      );
+      return;
+    }
+    let maxChangedFiles: number | undefined;
+    try {
+      maxChangedFiles = optionalPositiveIntegerFrom(draft.maxChangedFiles, "Maximum changed files");
+    } catch (cause) {
+      setDraft((current) => (current ? { ...current, error: messageFrom(cause) } : current));
+      return;
+    }
 
-    setActionPending(true);
+    if (!beginAction()) return;
     try {
       const added = await controller.addTask({
-        queue: queue.name,
+        queue: queue.id,
         provider,
         title: draft.title.trim(),
         instructions: draft.instructions.trim() || undefined,
+        acceptanceCriteria: parseAcceptanceCriteria(draft.acceptanceCriteria),
+        objective: draft.objective.trim() || undefined,
+        invariants: parseList(draft.invariants),
+        handoffRequirements: parseList(draft.handoffRequirements),
+        blockedBy: parseList(draft.blockedBy),
+        expectedPaths: parseList(draft.expectedPaths),
+        allowedPaths: parseList(draft.allowedPaths),
+        deniedPaths: parseList(draft.deniedPaths),
+        ...(maxChangedFiles === undefined ? {} : { maxChangedFiles }),
+        verifyCommands: parseCommands(draft.verifyCommands),
+        approvalCheckpoints: parseList(draft.approvalCheckpoints),
+        baseDriftPolicy: selectedOption(BASE_DRIFT_POLICIES, draft.baseDriftPolicyIndex, "replan"),
+        landStrategy: selectedOption(LAND_STRATEGIES, draft.landStrategyIndex, "none"),
+        priority,
+        idempotencyKey: draft.idempotencyKey.trim() || undefined,
         sourceKind: "manual",
       });
       setMode("dashboard");
@@ -574,45 +2077,1382 @@ export function AgentqApp({
         current ? { ...current, error: `Could not add task: ${messageFrom(cause)}` } : current,
       );
     } finally {
-      setActionPending(false);
+      finishAction();
     }
-  }, [actionPending, controller, draft, refresh, snapshot.queues]);
+  }, [actionPending, beginAction, controller, draft, finishAction, refresh, snapshot.queues]);
+
+  const startEdit = useCallback(() => {
+    if (!selectedTask) {
+      setNotice("Select a task before editing.");
+      return;
+    }
+    if (!isTaskEditable(selectedTask)) {
+      setNotice(
+        `Task ${selectedTask.id} is ${selectedTask.status} and locked. Edit is available for queued, failed, interrupted, or cancelled tasks.`,
+      );
+      return;
+    }
+
+    setEditDraft({
+      taskId: selectedTask.id,
+      expectedUpdatedAt: selectedTask.updatedAt,
+      providerIndex: Math.max(0, PROVIDERS.indexOf(selectedTask.provider)),
+      priority: String(selectedTask.priority),
+      title: selectedTask.title,
+      instructions: selectedTask.instructions,
+      acceptanceCriteria: selectedTask.acceptanceCriteria.join("; "),
+      objective: selectedTask.objective,
+      invariants: selectedTask.invariants.join("; "),
+      handoffRequirements: selectedTask.handoffRequirements.join("; "),
+      blockedBy: selectedTask.blockedBy.join("; "),
+      expectedPaths: selectedTask.expectedPaths.join("; "),
+      allowedPaths: selectedTask.allowedPaths.join("; "),
+      deniedPaths: selectedTask.deniedPaths.join("; "),
+      maxChangedFiles:
+        selectedTask.maxChangedFiles === undefined ? "" : String(selectedTask.maxChangedFiles),
+      verifyCommands: selectedTask.verifyCommands.join("; "),
+      approvalCheckpoints: selectedTask.approvalCheckpoints.join("; "),
+      baseDriftPolicyIndex: selectedOptionIndex(BASE_DRIFT_POLICIES, selectedTask.baseDriftPolicy),
+      landStrategyIndex: selectedOptionIndex(LAND_STRATEGIES, selectedTask.landStrategy),
+      idempotencyKey: "",
+      field: 0,
+    });
+    setMode("edit");
+    setNotice(undefined);
+  }, [selectedTask]);
+
+  const submitEdit = useCallback(async () => {
+    if (!editDraft || actionPending) return;
+    const provider = PROVIDERS[editDraft.providerIndex];
+    if (!provider) return;
+
+    const title = editDraft.title.trim();
+    if (!title) {
+      setEditDraft((current) => (current ? { ...current, error: "Title is required." } : current));
+      return;
+    }
+    if (!/^-?\d+$/u.test(editDraft.priority.trim())) {
+      setEditDraft((current) =>
+        current ? { ...current, error: "Priority must be a whole number." } : current,
+      );
+      return;
+    }
+    const priority = Number(editDraft.priority);
+    if (!Number.isSafeInteger(priority)) {
+      setEditDraft((current) =>
+        current ? { ...current, error: "Priority is outside the safe integer range." } : current,
+      );
+      return;
+    }
+    let maxChangedFiles: number | undefined;
+    try {
+      maxChangedFiles = optionalPositiveIntegerFrom(
+        editDraft.maxChangedFiles,
+        "Maximum changed files",
+      );
+    } catch (cause) {
+      setEditDraft((current) => (current ? { ...current, error: messageFrom(cause) } : current));
+      return;
+    }
+
+    const patch: UiTaskPatch = {
+      title,
+      instructions: editDraft.instructions.trim(),
+      acceptanceCriteria: parseAcceptanceCriteria(editDraft.acceptanceCriteria),
+      objective: editDraft.objective.trim() || title,
+      invariants: parseList(editDraft.invariants),
+      handoffRequirements: parseList(editDraft.handoffRequirements),
+      blockedBy: parseList(editDraft.blockedBy),
+      expectedPaths: parseList(editDraft.expectedPaths),
+      allowedPaths: parseList(editDraft.allowedPaths),
+      deniedPaths: parseList(editDraft.deniedPaths),
+      maxChangedFiles: maxChangedFiles ?? null,
+      verifyCommands: parseCommands(editDraft.verifyCommands),
+      approvalCheckpoints: parseList(editDraft.approvalCheckpoints),
+      baseDriftPolicy: selectedOption(
+        BASE_DRIFT_POLICIES,
+        editDraft.baseDriftPolicyIndex,
+        "replan",
+      ),
+      landStrategy: selectedOption(LAND_STRATEGIES, editDraft.landStrategyIndex, "none"),
+      provider,
+      priority,
+    };
+
+    if (!beginAction()) return;
+    try {
+      const updated = await controller.editTask(
+        editDraft.taskId,
+        patch,
+        editDraft.expectedUpdatedAt,
+      );
+      setSnapshot((current) => ({
+        ...current,
+        tasks: current.tasks.map((task) => (task.id === updated.id ? updated : task)),
+      }));
+      setMode("dashboard");
+      setEditDraft(undefined);
+      setNotice(`Updated ${updated.id}.`);
+    } catch (cause) {
+      setEditDraft((current) =>
+        current ? { ...current, error: `Could not edit task: ${messageFrom(cause)}` } : current,
+      );
+    } finally {
+      finishAction();
+    }
+  }, [actionPending, beginAction, controller, editDraft, finishAction]);
+
+  const startCreateQueue = useCallback(() => {
+    setQueueDraft({
+      kind: "create",
+      name: "",
+      repoPath: context?.repositoryPath ?? process.cwd(),
+      baseRef: "",
+      providerIndex: 0,
+      planModel: "",
+      planInstructions: "",
+      implementModel: "",
+      implementInstructions: "",
+      concurrency: "2",
+      maxAttempts: "2",
+      verifyCommands: "",
+      autoCommit: true,
+      allowedPaths: "",
+      deniedPaths: "",
+      maxChangedFiles: "",
+      approvalCheckpoints: "",
+      baseDriftPolicyIndex: selectedOptionIndex(BASE_DRIFT_POLICIES, "replan"),
+      landStrategyIndex: selectedOptionIndex(LAND_STRATEGIES, "none"),
+      autoLand: false,
+      fileConcurrencyIndex: selectedOptionIndex(FILE_CONCURRENCY_MODES, "off"),
+      field: 0,
+    });
+    setMode("queue-form");
+    setNotice(undefined);
+  }, [context?.repositoryPath]);
+
+  const startEditQueue = useCallback(() => {
+    if (!selectedQueue) {
+      setNotice("Select a queue before editing.");
+      return;
+    }
+    setQueueDraft({
+      kind: "edit",
+      queueId: selectedQueue.id,
+      name: selectedQueue.name,
+      repoPath: selectedQueue.repoPath,
+      baseRef: selectedQueue.baseRef,
+      providerIndex: Math.max(0, PROVIDERS.indexOf(selectedQueue.defaultProvider)),
+      planModel: selectedQueue.planModel,
+      planInstructions: selectedQueue.planInstructions,
+      implementModel: selectedQueue.implementModel,
+      implementInstructions: selectedQueue.implementInstructions,
+      concurrency: String(selectedQueue.concurrency),
+      maxAttempts: String(selectedQueue.maxAttempts),
+      verifyCommands: selectedQueue.verifyCommands.join("; "),
+      autoCommit: selectedQueue.autoCommit,
+      allowedPaths: selectedQueue.allowedPaths.join("; "),
+      deniedPaths: selectedQueue.deniedPaths.join("; "),
+      maxChangedFiles:
+        selectedQueue.maxChangedFiles === undefined ? "" : String(selectedQueue.maxChangedFiles),
+      approvalCheckpoints: selectedQueue.approvalCheckpoints.join("; "),
+      baseDriftPolicyIndex: selectedOptionIndex(BASE_DRIFT_POLICIES, selectedQueue.baseDriftPolicy),
+      landStrategyIndex: selectedOptionIndex(LAND_STRATEGIES, selectedQueue.landStrategy),
+      autoLand: selectedQueue.autoLand,
+      fileConcurrencyIndex: selectedOptionIndex(
+        FILE_CONCURRENCY_MODES,
+        selectedQueue.fileConcurrency,
+      ),
+      field: 0,
+    });
+    setMode("queue-form");
+    setNotice(undefined);
+  }, [selectedQueue]);
+
+  const submitQueue = useCallback(async () => {
+    if (!queueDraft || actionPending) return;
+    const provider = PROVIDERS[queueDraft.providerIndex];
+    if (!provider) return;
+
+    const name = queueDraft.name.trim();
+    const repoPath = queueDraft.repoPath.trim();
+    const baseRef = queueDraft.baseRef.trim();
+    let started = false;
+    try {
+      if (!name) throw new Error("Queue name is required.");
+      if (queueDraft.kind === "create" && !repoPath) {
+        throw new Error("Repository path is required.");
+      }
+      if (queueDraft.kind === "edit" && !baseRef) throw new Error("Base ref is required.");
+      const concurrency = positiveIntegerFrom(queueDraft.concurrency, "Concurrency");
+      const maxAttempts = positiveIntegerFrom(queueDraft.maxAttempts, "Max attempts");
+      const maxChangedFiles = optionalPositiveIntegerFrom(
+        queueDraft.maxChangedFiles,
+        "Maximum changed files",
+      );
+      const verifyCommands = parseCommands(queueDraft.verifyCommands);
+      const allowedPaths = parseList(queueDraft.allowedPaths);
+      const deniedPaths = parseList(queueDraft.deniedPaths);
+      const approvalCheckpoints = parseList(queueDraft.approvalCheckpoints);
+      const baseDriftPolicy = selectedOption(
+        BASE_DRIFT_POLICIES,
+        queueDraft.baseDriftPolicyIndex,
+        "replan",
+      );
+      const landStrategy = selectedOption(LAND_STRATEGIES, queueDraft.landStrategyIndex, "none");
+      const fileConcurrency = selectedOption(
+        FILE_CONCURRENCY_MODES,
+        queueDraft.fileConcurrencyIndex,
+        "off",
+      );
+      if (!beginAction()) return;
+      started = true;
+
+      if (queueDraft.kind === "create") {
+        const created = await controller.createQueue({
+          name,
+          repoPath,
+          ...(baseRef ? { baseRef } : {}),
+          defaultProvider: provider,
+          planModel: queueDraft.planModel.trim(),
+          planInstructions: queueDraft.planInstructions.trim(),
+          implementModel: queueDraft.implementModel.trim(),
+          implementInstructions: queueDraft.implementInstructions.trim(),
+          concurrency,
+          maxAttempts,
+          verifyCommands,
+          autoCommit: queueDraft.autoCommit,
+          allowedPaths,
+          deniedPaths,
+          ...(maxChangedFiles === undefined ? {} : { maxChangedFiles }),
+          approvalCheckpoints,
+          baseDriftPolicy,
+          landStrategy,
+          autoLand: queueDraft.autoLand,
+          fileConcurrency,
+        });
+        setSelectedQueueId(created.id);
+        setFocus("queues");
+        setNotice(`Created queue ${created.name}. Settings are snapshotted by future claims.`);
+      } else {
+        if (!queueDraft.queueId) throw new Error("The selected queue is no longer available.");
+        const patch: UiQueuePatch = {
+          name,
+          baseRef,
+          defaultProvider: provider,
+          planModel: queueDraft.planModel.trim(),
+          planInstructions: queueDraft.planInstructions.trim(),
+          implementModel: queueDraft.implementModel.trim(),
+          implementInstructions: queueDraft.implementInstructions.trim(),
+          concurrency,
+          maxAttempts,
+          verifyCommands,
+          autoCommit: queueDraft.autoCommit,
+          allowedPaths,
+          deniedPaths,
+          maxChangedFiles: maxChangedFiles ?? null,
+          approvalCheckpoints,
+          baseDriftPolicy,
+          landStrategy,
+          autoLand: queueDraft.autoLand,
+          fileConcurrency,
+        };
+        const updated = await controller.updateQueue(queueDraft.queueId, patch);
+        setSelectedQueueId(updated.id);
+        setNotice(
+          `Updated queue ${updated.name}. Changes apply to future claims; active attempts keep their snapshot.`,
+        );
+      }
+      setQueueDraft(undefined);
+      setMode("dashboard");
+      await refresh();
+    } catch (cause) {
+      setQueueDraft((current) =>
+        current ? { ...current, error: `Could not save queue: ${messageFrom(cause)}` } : current,
+      );
+    } finally {
+      if (started) finishAction();
+    }
+  }, [actionPending, beginAction, controller, finishAction, queueDraft, refresh]);
 
   const runAction = useCallback(
-    async (action: "cancel" | "retry" | "done") => {
-      if (!selectedTask || actionPending) return;
-      setActionPending(true);
+    async (action: "cancel" | "retry" | "resume" | "done", task = selectedTask) => {
+      if (!task || actionPending || !beginAction()) return;
+      let outcome: string;
       try {
-        if (action === "cancel") await controller.cancelTask(selectedTask.id);
-        if (action === "retry") await controller.retryTask(selectedTask.id);
-        if (action === "done") await controller.completeManualTask(selectedTask.id);
+        if (action === "cancel") await controller.cancelTask(task.id);
+        if (action === "retry") await controller.retryTask(task.id);
+        if (action === "resume") await controller.resumeTask(task.id);
+        if (action === "done") await controller.completeManualTask(task.id);
         setMode("dashboard");
-        setNotice(
-          action === "cancel"
-            ? `Cancellation requested for ${selectedTask.id}.`
-            : action === "retry"
-              ? `Retry queued for ${selectedTask.id}.`
-              : `Marked ${selectedTask.id} complete.`,
-        );
         await refresh();
+        outcome =
+          action === "cancel"
+            ? `Cancellation requested for ${task.id}.`
+            : action === "retry"
+              ? `Retry queued for ${task.id}.`
+              : action === "resume"
+                ? `Resume queued for ${task.id}.`
+                : `Marked ${task.id} complete.`;
       } catch (cause) {
         setMode("dashboard");
-        setNotice(`${action} failed: ${messageFrom(cause)}`);
+        outcome = `${action} failed: ${messageFrom(cause)}`;
       } finally {
-        setActionPending(false);
+        finishAction();
       }
+      if (mounted.current) setNotice(outcome);
     },
-    [actionPending, controller, refresh, selectedTask],
+    [actionPending, beginAction, controller, finishAction, refresh, selectedTask],
   );
 
+  const openAttempts = useCallback(async () => {
+    if (!selectedTask || actionPending) {
+      if (!selectedTask) setNotice("Select a task to view attempts.");
+      return;
+    }
+    if (!beginAction()) return;
+    try {
+      const nextRuns = await controller.listRuns(selectedTask.id);
+      setRuns(nextRuns);
+      setAttemptIndex(0);
+      setAttemptDetailOpen(false);
+      setAttemptDetailOffset(0);
+      setMode("attempts");
+      setNotice(undefined);
+    } catch (cause) {
+      setMode("dashboard");
+      setNotice(`Could not load attempts: ${messageFrom(cause)}`);
+    } finally {
+      finishAction();
+    }
+  }, [actionPending, beginAction, controller, finishAction, selectedTask]);
+
+  const openApprovals = useCallback(() => {
+    if (!selectedTask) {
+      setNotice("Select a task to inspect approvals.");
+      return;
+    }
+    const firstPending = selectedTaskApprovals.findIndex(
+      (approval) => approval.status === "pending",
+    );
+    setApprovalIndex(firstPending >= 0 ? firstPending : 0);
+    setMode("approvals");
+    setNotice(undefined);
+  }, [selectedTask, selectedTaskApprovals]);
+
+  const startApprovalDecision = useCallback(
+    (decision: ApprovalDraft["decision"], approval?: TaskApproval) => {
+      const target = approval ?? selectedApproval ?? pendingApproval;
+      if (!target) {
+        setNotice("This task has no approval checkpoints.");
+        return;
+      }
+      if (target.status !== "pending") {
+        setNotice(
+          `${target.checkpoint} is already ${target.status}; only pending checkpoints can be decided.`,
+        );
+        return;
+      }
+      setApprovalDraft({
+        taskId: target.taskId,
+        checkpoint: target.checkpoint,
+        decision,
+        actor: "",
+        note: "",
+        field: 0,
+      });
+      setMode("approval-form");
+      setNotice(undefined);
+    },
+    [pendingApproval, selectedApproval],
+  );
+
+  const submitApprovalDecision = useCallback(async () => {
+    if (!approvalDraft || actionPending || !beginAction()) return;
+    const pending = approvalDraft;
+    try {
+      const input = {
+        ...(pending.actor.trim() ? { actor: pending.actor.trim() } : {}),
+        ...(pending.note.trim() ? { note: pending.note.trim() } : {}),
+      };
+      if (pending.decision === "approve") {
+        await controller.approveTaskCheckpoint(pending.taskId, pending.checkpoint, input);
+      } else {
+        await controller.rejectTaskCheckpoint(pending.taskId, pending.checkpoint, input);
+      }
+      setApprovalDraft(undefined);
+      setMode("approvals");
+      setNotice(
+        `${pending.decision === "approve" ? "Approved" : "Rejected"} ${pending.checkpoint}.`,
+      );
+      await refresh();
+      await refreshEvents();
+    } catch (cause) {
+      setApprovalDraft((current) =>
+        current
+          ? {
+              ...current,
+              error: `Could not ${pending.decision} checkpoint: ${messageFrom(cause)}`,
+            }
+          : current,
+      );
+    } finally {
+      finishAction();
+    }
+  }, [actionPending, approvalDraft, beginAction, controller, finishAction, refresh, refreshEvents]);
+
+  const openDoctor = useCallback(async () => {
+    if (actionPending || !beginAction()) return;
+    setMode("doctor");
+    setDoctorChecks([]);
+    try {
+      setDoctorChecks(await controller.doctor());
+      setNotice(undefined);
+    } catch (cause) {
+      setMode("dashboard");
+      setNotice(`Doctor failed: ${messageFrom(cause)}`);
+    } finally {
+      finishAction();
+    }
+  }, [actionPending, beginAction, controller, finishAction]);
+
+  const toggleRepositoryScope = useCallback(async () => {
+    if (actionPending) return;
+    if (!context?.canToggle) {
+      setMode("dashboard");
+      setNotice("Repository scope cannot be changed from this location.");
+      return;
+    }
+    const all = !context.all;
+    if (!beginAction()) return;
+    try {
+      await Promise.resolve(controller.setAllRepositories(all));
+      setSelectedQueueId(undefined);
+      setSelectedTaskId(undefined);
+      setMode("dashboard");
+      await refresh();
+      setNotice(all ? "Showing all repositories." : "Showing the current repository.");
+    } catch (cause) {
+      setMode("dashboard");
+      setNotice(`Could not change repository scope: ${messageFrom(cause)}`);
+    } finally {
+      finishAction();
+    }
+  }, [actionPending, beginAction, context, controller, finishAction, refresh]);
+
+  const runProviderLogin = useCallback(
+    async (provider: Provider) => {
+      if (actionPending || !beginAction()) return;
+      setMode("dashboard");
+      setNotice(`Opening ${provider === "codex" ? "Codex" : "Claude Code"} login…`);
+      try {
+        await suspendTerminal(async () => {
+          await controller.loginProvider(provider);
+        });
+        const label = provider === "codex" ? "Codex" : "Claude Code";
+        try {
+          const checks = await controller.doctor();
+          setDoctorChecks(checks);
+          setMode("doctor");
+          setNotice(`${label} login finished.`);
+        } catch (cause) {
+          setMode("dashboard");
+          setNotice(
+            `${label} login finished, but provider status refresh failed: ${messageFrom(cause)}`,
+          );
+        }
+      } catch (cause) {
+        setMode("dashboard");
+        setNotice(`${provider} login failed: ${messageFrom(cause)}`);
+      } finally {
+        finishAction();
+      }
+    },
+    [actionPending, beginAction, controller, finishAction, suspendTerminal],
+  );
+
+  const runIntegration = useCallback(
+    async (target: IntegrationTarget, confirmedRepoPath?: string) => {
+      if (actionPending) return;
+      const repoPath = confirmedRepoPath ?? integrationRepositoryPath;
+      if (!repoPath) {
+        setMode("dashboard");
+        setNotice("Select a repository queue before installing agent instructions.");
+        return;
+      }
+      if (!beginAction()) return;
+      try {
+        const results = await controller.installIntegration(target, repoPath);
+        setIntegrationResults(results);
+        setMode("integration-results");
+        setNotice(undefined);
+      } catch (cause) {
+        setMode("dashboard");
+        setNotice(`Integration failed: ${messageFrom(cause)}`);
+      } finally {
+        finishAction();
+      }
+    },
+    [actionPending, beginAction, controller, finishAction, integrationRepositoryPath],
+  );
+
+  const runConfirmation = useCallback(async () => {
+    if (!confirmation || actionPending) return;
+    const pending = confirmation;
+    setConfirmation(undefined);
+    if (pending.kind === "cancel" || pending.kind === "retry") {
+      setMode("dashboard");
+      await runAction(pending.kind, pending.task);
+      return;
+    }
+    if (pending.kind === "integration") {
+      await runIntegration(pending.target, pending.repoPath);
+      return;
+    }
+
+    if (!beginAction()) return;
+    try {
+      if (pending.kind === "integrate-task") {
+        const outcome = await controller.integrateTask(pending.task.id);
+        setMode("dashboard");
+        if (outcome.status === "integrated") {
+          setNotice(`Integrated ${pending.task.title} at ${outcome.integratedSha}.`);
+        } else if (outcome.status === "already-integrated") {
+          setNotice(`${pending.task.title} is already integrated.`);
+        } else if (outcome.status === "conflict") {
+          setNotice(
+            `Integration conflict: ${outcome.conflictPaths.join(", ") || "unknown paths"}.`,
+          );
+        } else if (outcome.status === "verification-failed") {
+          setNotice(`Integration verification failed: ${workflowLabel(outcome.failureClass)}.`);
+        } else {
+          setNotice(`Integration is contended: ${outcome.message}`);
+        }
+        await refresh();
+        await refreshDelivery();
+      } else if (pending.kind === "land-queue") {
+        const outcome = await controller.landQueue(pending.queue.id);
+        setMode("dashboard");
+        setNotice(
+          outcome.status === "already-landed"
+            ? `${pending.queue.name} is already landed.`
+            : `Landed ${pending.queue.name} at ${outcome.landedSha}.`,
+        );
+        await refresh();
+        await refreshDelivery();
+      } else if (pending.kind === "delete-queue") {
+        await controller.deleteQueue(pending.queue.id);
+        setSelectedQueueId(undefined);
+        setMode("dashboard");
+        setNotice(`Deleted queue ${pending.queue.name}.`);
+        await refresh();
+      } else if (pending.kind === "delete-task") {
+        await controller.deleteTask(pending.task.id);
+        setSelectedTaskId(undefined);
+        setMode("dashboard");
+        setNotice(`Deleted task ${pending.task.title}.`);
+        await refresh();
+      } else if (pending.kind === "clean") {
+        const result = await controller.cleanTask(pending.task.id, { force: pending.force });
+        setMode("dashboard");
+        setNotice(`Removed worktree ${result.removedWorktree}.`);
+        await refresh();
+      }
+    } catch (cause) {
+      setMode("dashboard");
+      if (errorCodeFrom(cause) === "TASK_APPROVAL_REQUIRED") {
+        setNotice(`${messageFrom(cause)} · press p to review pending approvals.`);
+        await refresh();
+        await refreshEvents();
+        await refreshDelivery();
+      } else {
+        setNotice(`${pending.kind} failed: ${messageFrom(cause)}`);
+      }
+    } finally {
+      finishAction();
+    }
+  }, [
+    actionPending,
+    beginAction,
+    confirmation,
+    controller,
+    finishAction,
+    refresh,
+    refreshDelivery,
+    refreshEvents,
+    runAction,
+    runIntegration,
+  ]);
+
+  const cycleTaskFilter = useCallback(() => {
+    setTaskFilter((current) => {
+      const next =
+        TASK_FILTERS[nextIndex(TASK_FILTERS.indexOf(current), TASK_FILTERS.length, 1)] ?? "all";
+      setNotice(next === "all" ? "Showing tasks in every status." : `Showing ${next} tasks.`);
+      return next;
+    });
+  }, []);
+
+  const actionItems = useMemo<ActionItem[]>(() => {
+    const taskSelected = selectedTask !== undefined;
+    const queueSelected = selectedQueue !== undefined;
+    const editable = selectedTask ? isTaskEditable(selectedTask) : false;
+    const deletable = Boolean(
+      selectedTask && !isTaskActive(selectedTask.status) && !selectedTask.currentRunId,
+    );
+    const integrationAvailable = Boolean(integrationRepositoryPath);
+    return [
+      {
+        id: "create-queue",
+        label: "Create queue",
+        detail: "Connect another Git repository queue",
+        available: true,
+      },
+      {
+        id: "edit-queue",
+        label: "Edit selected queue",
+        detail: "Planning and implementation models, guidance, and limits",
+        available: queueSelected,
+      },
+      {
+        id: "delete-queue",
+        label: "Delete selected queue",
+        detail: "Delete the queue and all inactive tasks and history",
+        available: queueSelected,
+      },
+      { id: "add-task", label: "Add task", detail: "Queue manual work", available: queueSelected },
+      {
+        id: "edit-task",
+        label: "Edit selected task",
+        detail: "Change the next attempt specification",
+        available: editable,
+      },
+      {
+        id: "delete-task",
+        label: "Delete selected task",
+        detail: "Delete the task, attempts, events, and logs",
+        available: deletable,
+      },
+      {
+        id: "cancel-task",
+        label: "Cancel selected task",
+        detail: "Request a graceful agent stop",
+        available: Boolean(selectedTask && canCancelTask(selectedTask.status)),
+      },
+      {
+        id: "retry-task",
+        label: "Retry selected task",
+        detail: "Start a fresh attempt and worktree",
+        available: Boolean(selectedTask && canRetryTask(selectedTask.status)),
+      },
+      {
+        id: "resume-task",
+        label: "Resume selected task",
+        detail: "Continue its latest retained planning or implementation stage",
+        available: Boolean(selectedTask && canRetryTask(selectedTask.status)),
+      },
+      {
+        id: "complete-task",
+        label: "Complete selected task",
+        detail: "Mark non-running work done manually",
+        available: Boolean(selectedTask && canCompleteTaskManually(selectedTask.status)),
+      },
+      {
+        id: "attempts",
+        label: "View attempts",
+        detail: "Inspect run history and snapshots",
+        available: taskSelected,
+      },
+      {
+        id: "clean-task",
+        label: "Clean retained worktree",
+        detail: "Choose safe or force removal",
+        available: Boolean(selectedTask && isTaskTerminal(selectedTask.status)),
+      },
+      {
+        id: "filter-status",
+        label: `Task filter: ${taskFilter}`,
+        detail: "Cycle the dashboard status filter",
+        available: true,
+      },
+      {
+        id: "doctor",
+        label: "Doctor & providers",
+        detail: "Check Git and agent health",
+        available: true,
+      },
+      {
+        id: "login-codex",
+        label: "Log in to Codex",
+        detail: "Open the real Codex login flow",
+        available: true,
+      },
+      {
+        id: "login-claude",
+        label: "Log in to Claude Code",
+        detail: "Open the real Claude login flow",
+        available: true,
+      },
+      {
+        id: "integrate-codex",
+        label: "Integrate Codex",
+        detail: "Install repository agent instructions",
+        available: integrationAvailable,
+      },
+      {
+        id: "integrate-claude",
+        label: "Integrate Claude Code",
+        detail: "Install repository agent instructions",
+        available: integrationAvailable,
+      },
+      {
+        id: "integrate-all",
+        label: "Integrate both providers",
+        detail: "Install both instruction formats",
+        available: integrationAvailable,
+      },
+      {
+        id: "toggle-scope",
+        label: context?.all ? "Show current repository" : "Show all repositories",
+        detail: "Toggle dashboard queue scope",
+        available: context?.canToggle ?? false,
+      },
+      {
+        id: "refresh",
+        label: "Refresh dashboard",
+        detail: "Reload queues, tasks, and logs",
+        available: true,
+      },
+      { id: "help", label: "Keyboard help", detail: "Show direct shortcuts", available: true },
+      {
+        id: "quit",
+        label: "Quit AgentQ",
+        detail: "Stop the foreground supervisor safely and requeue interrupted work",
+        available: true,
+      },
+      {
+        id: "view-approvals",
+        label: "View task approvals",
+        detail: taskSelected
+          ? `${selectedTaskApprovals.filter((approval) => approval.status === "pending").length} pending · ${selectedTaskApprovals.length} total`
+          : "Select a task to inspect checkpoint decisions",
+        available: taskSelected,
+      },
+      {
+        id: "approve-checkpoint",
+        label: "Approve current checkpoint",
+        detail: pendingApproval
+          ? `${pendingApproval.checkpoint} · opens a confirmed decision form`
+          : "The selected task has no pending checkpoint",
+        available: pendingApproval !== undefined,
+      },
+      {
+        id: "reject-checkpoint",
+        label: "Reject current checkpoint",
+        detail: pendingApproval
+          ? `${pendingApproval.checkpoint} · opens a confirmed decision form`
+          : "The selected task has no pending checkpoint",
+        available: pendingApproval !== undefined,
+      },
+      {
+        id: "integrate-result",
+        label: "Integrate selected task result",
+        detail: canIntegrateTaskResult(selectedTask)
+          ? `${selectedTask.resultCommitSha} · merge into the queue train after confirmation`
+          : "Requires a selected verified result that is ready to integrate",
+        available: canIntegrateTaskResult(selectedTask),
+      },
+      {
+        id: "land-queue",
+        label: "Land selected queue",
+        detail: canLandSelectedQueue
+          ? `${selectedDelivery?.lane?.trainRef} → ${selectedQueue?.baseRef}`
+          : "Requires an integration lane with at least one integrated task",
+        available: canLandSelectedQueue,
+      },
+    ];
+  }, [
+    canLandSelectedQueue,
+    context,
+    integrationRepositoryPath,
+    pendingApproval,
+    selectedDelivery,
+    selectedQueue,
+    selectedTask,
+    selectedTaskApprovals,
+    taskFilter,
+  ]);
+
+  const performAction = useCallback(
+    (item: ActionItem) => {
+      if (!item.available) {
+        setNotice(`${item.label} is unavailable for the current selection.`);
+        return;
+      }
+      switch (item.id) {
+        case "create-queue":
+          startCreateQueue();
+          break;
+        case "edit-queue":
+          startEditQueue();
+          break;
+        case "delete-queue":
+          if (selectedQueue) {
+            setConfirmation({ kind: "delete-queue", queue: selectedQueue });
+            setMode("confirm");
+          }
+          break;
+        case "add-task":
+          startAdd();
+          break;
+        case "edit-task":
+          startEdit();
+          break;
+        case "delete-task":
+          if (selectedTask) {
+            setConfirmation({ kind: "delete-task", task: selectedTask });
+            setMode("confirm");
+          }
+          break;
+        case "cancel-task":
+          if (selectedTask) {
+            setConfirmation({ kind: "cancel", task: selectedTask });
+            setMode("confirm");
+          }
+          break;
+        case "retry-task":
+          if (selectedTask) {
+            setConfirmation({ kind: "retry", task: selectedTask });
+            setMode("confirm");
+          }
+          break;
+        case "resume-task":
+          setMode("dashboard");
+          void runAction("resume");
+          break;
+        case "complete-task":
+          setMode("dashboard");
+          void runAction("done");
+          break;
+        case "attempts":
+          void openAttempts();
+          break;
+        case "clean-task":
+          if (selectedTask) {
+            setConfirmation({ kind: "clean", task: selectedTask, force: false });
+            setMode("confirm");
+          }
+          break;
+        case "filter-status":
+          setMode("dashboard");
+          cycleTaskFilter();
+          break;
+        case "doctor":
+          void openDoctor();
+          break;
+        case "login-codex":
+          void runProviderLogin("codex");
+          break;
+        case "login-claude":
+          void runProviderLogin("claude");
+          break;
+        case "integrate-codex":
+        case "integrate-claude":
+        case "integrate-all": {
+          const target: IntegrationTarget =
+            item.id === "integrate-codex"
+              ? "codex"
+              : item.id === "integrate-claude"
+                ? "claude"
+                : "all";
+          if (integrationRepositoryPath) {
+            setConfirmation({ kind: "integration", target, repoPath: integrationRepositoryPath });
+            setMode("confirm");
+          }
+          break;
+        }
+        case "toggle-scope":
+          void toggleRepositoryScope();
+          break;
+        case "refresh":
+          setMode("dashboard");
+          void refresh().then((ok) => {
+            if (mounted.current) setNotice(ok ? "Dashboard refreshed." : undefined);
+          });
+          break;
+        case "help":
+          setMode("help");
+          break;
+        case "quit":
+          if (onExit) onExit();
+          else exit();
+          break;
+        case "view-approvals":
+          openApprovals();
+          break;
+        case "approve-checkpoint":
+          startApprovalDecision("approve", pendingApproval);
+          break;
+        case "reject-checkpoint":
+          startApprovalDecision("reject", pendingApproval);
+          break;
+        case "integrate-result":
+          if (selectedTask) {
+            setConfirmation({ kind: "integrate-task", task: selectedTask });
+            setMode("confirm");
+          }
+          break;
+        case "land-queue":
+          if (selectedQueue) {
+            setConfirmation({ kind: "land-queue", queue: selectedQueue });
+            setMode("confirm");
+          }
+          break;
+      }
+    },
+    [
+      exit,
+      cycleTaskFilter,
+      integrationRepositoryPath,
+      onExit,
+      openApprovals,
+      openAttempts,
+      openDoctor,
+      pendingApproval,
+      refresh,
+      runAction,
+      runProviderLogin,
+      selectedQueue,
+      selectedTask,
+      startAdd,
+      startCreateQueue,
+      startEdit,
+      startEditQueue,
+      startApprovalDecision,
+      toggleRepositoryScope,
+    ],
+  );
+
+  const safeAttemptIndex = Math.max(0, Math.min(runs.length - 1, attemptIndex));
+  const selectedAttempt = runs[safeAttemptIndex];
+  const attemptPanelWidth = Math.max(1, Math.min(columns - 2, 96));
+  const attemptHorizontalPadding = columns >= 50 ? 2 : 1;
+  const attemptContentWidth = Math.max(1, attemptPanelWidth - attemptHorizontalPadding * 2 - 2);
+  const attemptDetailCapacity = Math.max(1, rows - 9);
+  const attemptDetailLines = selectedAttempt
+    ? attemptWorkflowLines(selectedAttempt, attemptContentWidth)
+    : [];
+  const attemptDetailMaxOffset = Math.max(0, attemptDetailLines.length - attemptDetailCapacity);
+
   useInput((input, key) => {
-    if (mode === "confirm-cancel" || mode === "confirm-retry") {
-      if (key.escape || input === "n") {
+    if (mode === "help") {
+      if (key.escape || input === "?") setMode("dashboard");
+      return;
+    }
+
+    if (mode === "integration-results") {
+      if (key.escape || key.return) setMode("dashboard");
+      return;
+    }
+
+    if (mode === "approval-form" && approvalDraft) {
+      if (key.escape) {
+        setApprovalDraft(undefined);
+        setMode("approvals");
+        return;
+      }
+      if (key.ctrl && input === "s") {
+        void submitApprovalDecision();
+        return;
+      }
+      if (key.tab) {
+        setApprovalDraft((current) =>
+          current
+            ? { ...current, field: nextIndex(current.field, 2, key.shift ? -1 : 1) as 0 | 1 }
+            : current,
+        );
+        return;
+      }
+      if (key.ctrl && input === "n" && approvalDraft.field === 1) {
+        setApprovalDraft((current) =>
+          current ? { ...current, note: `${current.note}\n`, error: undefined } : current,
+        );
+        return;
+      }
+      if (key.return) {
+        if (approvalDraft.field === 0) {
+          setApprovalDraft((current) => (current ? { ...current, field: 1 } : current));
+        } else {
+          void submitApprovalDecision();
+        }
+        return;
+      }
+      if ((key.ctrl && input === "u") || key.backspace || key.delete) {
+        setApprovalDraft((current) => {
+          if (!current) return current;
+          const field = current.field === 0 ? "actor" : "note";
+          return {
+            ...current,
+            [field]: key.ctrl ? "" : current[field].slice(0, -1),
+            error: undefined,
+          };
+        });
+        return;
+      }
+      if (!key.ctrl && !key.meta && input) {
+        setApprovalDraft((current) => {
+          if (!current) return current;
+          const field = current.field === 0 ? "actor" : "note";
+          return { ...current, [field]: current[field] + input, error: undefined };
+        });
+      }
+      return;
+    }
+
+    if (mode === "approvals") {
+      if (key.escape || input === "p") {
         setMode("dashboard");
         return;
       }
-      if (key.return || input === "y") {
-        void runAction(mode === "confirm-cancel" ? "cancel" : "retry");
+      if (key.upArrow || input === "k") {
+        setApprovalIndex((current) => nextIndex(current, selectedTaskApprovals.length, -1));
+        return;
+      }
+      if (key.downArrow || input === "j") {
+        setApprovalIndex((current) => nextIndex(current, selectedTaskApprovals.length, 1));
+        return;
+      }
+      if (input === "a" || key.return) {
+        startApprovalDecision("approve", selectedApproval);
+        return;
+      }
+      if (input === "r") {
+        startApprovalDecision("reject", selectedApproval);
+        return;
+      }
+      if (input === "R") void refreshEvents();
+      return;
+    }
+
+    if (mode === "attempts") {
+      if (attemptDetailOpen) {
+        if (input === "v") {
+          setAttemptDetailOpen(false);
+          setAttemptDetailOffset(0);
+          setMode("dashboard");
+          return;
+        }
+        if (key.escape) {
+          setAttemptDetailOpen(false);
+          setAttemptDetailOffset(0);
+          return;
+        }
+        if (key.upArrow || input === "k") {
+          setAttemptDetailOffset((current) => Math.max(0, current - 1));
+          return;
+        }
+        if (key.downArrow || input === "j") {
+          setAttemptDetailOffset((current) => Math.min(attemptDetailMaxOffset, current + 1));
+        }
+        return;
+      }
+      if (key.escape || input === "v") {
+        setMode("dashboard");
+        return;
+      }
+      if (key.upArrow || input === "k") {
+        setAttemptIndex((current) => nextIndex(current, runs.length, -1));
+        setAttemptDetailOffset(0);
+        return;
+      }
+      if (key.downArrow || input === "j") {
+        setAttemptIndex((current) => nextIndex(current, runs.length, 1));
+        setAttemptDetailOffset(0);
+        return;
+      }
+      if (key.return && selectedAttempt) {
+        setAttemptDetailOpen(true);
+        setAttemptDetailOffset(0);
+      }
+      return;
+    }
+
+    if (mode === "doctor") {
+      if (key.escape) {
+        setMode("dashboard");
+        return;
+      }
+      if (input === "R") void openDoctor();
+      if (input === "c") void runProviderLogin("codex");
+      if (input === "l") void runProviderLogin("claude");
+      return;
+    }
+
+    if (mode === "actions") {
+      if (key.escape || input === ":") {
+        setMode("dashboard");
+        return;
+      }
+      if (key.upArrow || input === "k") {
+        setActionIndex((current) => nextIndex(current, actionItems.length, -1));
+        return;
+      }
+      if (key.downArrow || input === "j") {
+        setActionIndex((current) => nextIndex(current, actionItems.length, 1));
+        return;
+      }
+      if (key.return) {
+        const item = actionItems[actionIndex];
+        if (item) performAction(item);
+      }
+      return;
+    }
+
+    if (mode === "confirm" && confirmation) {
+      if (key.escape || input === "n") {
+        setConfirmation(undefined);
+        setMode("dashboard");
+        return;
+      }
+      if (
+        confirmation.kind === "clean" &&
+        (input === "f" || key.leftArrow || key.rightArrow || key.upArrow || key.downArrow)
+      ) {
+        setConfirmation((current) =>
+          current?.kind === "clean" ? { ...current, force: !current.force } : current,
+        );
+        return;
+      }
+      if (key.return || input === "y") void runConfirmation();
+      return;
+    }
+
+    if (mode === "queue-form" && queueDraft) {
+      if (key.escape) {
+        setMode("dashboard");
+        setQueueDraft(undefined);
+        return;
+      }
+      if (key.ctrl && input === "s") {
+        void submitQueue();
+        return;
+      }
+      const controls = queueFormControls(queueDraft.kind);
+      const focusedControl = controls.find(
+        (control) => "focusIndex" in control && control.focusIndex === queueDraft.field,
+      );
+      const fieldCount = controls.filter((control) => "focusIndex" in control).length;
+      if (key.tab) {
+        setQueueDraft((current) =>
+          current
+            ? { ...current, field: nextIndex(current.field, fieldCount, key.shift ? -1 : 1) }
+            : current,
+        );
+        return;
+      }
+      if (
+        focusedControl?.kind === "provider" &&
+        (key.leftArrow || key.upArrow || key.rightArrow || key.downArrow)
+      ) {
+        const delta = key.leftArrow || key.upArrow ? -1 : 1;
+        setQueueDraft((current) => {
+          if (!current) return current;
+          const providerIndex = nextIndex(current.providerIndex, PROVIDERS.length, delta);
+          return {
+            ...current,
+            providerIndex,
+            ...(providerIndex === current.providerIndex
+              ? {}
+              : { planModel: "", implementModel: "" }),
+            error: undefined,
+          };
+        });
+        return;
+      }
+      if (
+        focusedControl?.kind === "selector" &&
+        (key.leftArrow || key.upArrow || key.rightArrow || key.downArrow)
+      ) {
+        const delta = key.leftArrow || key.upArrow ? -1 : 1;
+        setQueueDraft((current) =>
+          current
+            ? {
+                ...current,
+                [focusedControl.key]: nextIndex(
+                  current[focusedControl.key],
+                  focusedControl.options.length,
+                  delta,
+                ),
+                error: undefined,
+              }
+            : current,
+        );
+        return;
+      }
+      if (
+        focusedControl?.kind === "toggle" &&
+        (input === " " || key.leftArrow || key.upArrow || key.rightArrow || key.downArrow)
+      ) {
+        setQueueDraft((current) =>
+          current
+            ? {
+                ...current,
+                [focusedControl.key]: !current[focusedControl.key],
+                error: undefined,
+              }
+            : current,
+        );
+        return;
+      }
+      if (key.return) {
+        if (queueDraft.field < fieldCount - 1) {
+          setQueueDraft((current) =>
+            current ? { ...current, field: current.field + 1 } : current,
+          );
+        } else {
+          void submitQueue();
+        }
+        return;
+      }
+
+      const textField = focusedControl?.kind === "text" ? focusedControl.key : undefined;
+      if (
+        textField &&
+        focusedControl?.kind === "text" &&
+        focusedControl.multiline &&
+        key.ctrl &&
+        input === "n"
+      ) {
+        setQueueDraft((current) =>
+          current
+            ? { ...current, [textField]: `${current[textField]}\n`, error: undefined }
+            : current,
+        );
+        return;
+      }
+      if (textField && ((key.ctrl && input === "u") || key.backspace || key.delete)) {
+        setQueueDraft((current) => {
+          if (!current) return current;
+          const value = current[textField];
+          return {
+            ...current,
+            [textField]: key.ctrl ? "" : value.slice(0, -1),
+            error: undefined,
+          };
+        });
+        return;
+      }
+      if (textField && !key.ctrl && !key.meta && input) {
+        setQueueDraft((current) =>
+          current
+            ? { ...current, [textField]: current[textField] + input, error: undefined }
+            : current,
+        );
+      }
+      return;
+    }
+
+    if (mode === "edit" && editDraft) {
+      if (key.escape) {
+        setMode("dashboard");
+        setEditDraft(undefined);
+        return;
+      }
+      if (key.ctrl && input === "s") {
+        void submitEdit();
+        return;
+      }
+      const controls = EDIT_TASK_CONTROLS;
+      const focusedControl = controls.find((control) => control.focusIndex === editDraft.field);
+      const fieldCount = controls.length;
+      if (key.tab) {
+        setEditDraft((current) =>
+          current
+            ? {
+                ...current,
+                field: nextIndex(current.field, fieldCount, key.shift ? -1 : 1),
+              }
+            : current,
+        );
+        return;
+      }
+      if (
+        focusedControl?.kind === "provider" &&
+        (key.leftArrow || key.upArrow || key.rightArrow || key.downArrow)
+      ) {
+        const delta = key.leftArrow || key.upArrow ? -1 : 1;
+        setEditDraft((current) =>
+          current
+            ? {
+                ...current,
+                providerIndex: nextIndex(current.providerIndex, PROVIDERS.length, delta),
+                error: undefined,
+              }
+            : current,
+        );
+        return;
+      }
+      if (
+        focusedControl?.kind === "selector" &&
+        (key.leftArrow || key.upArrow || key.rightArrow || key.downArrow)
+      ) {
+        const delta = key.leftArrow || key.upArrow ? -1 : 1;
+        setEditDraft((current) =>
+          current
+            ? {
+                ...current,
+                [focusedControl.key]: nextIndex(
+                  current[focusedControl.key],
+                  focusedControl.options.length,
+                  delta,
+                ),
+                error: undefined,
+              }
+            : current,
+        );
+        return;
+      }
+      if (key.return) {
+        if (editDraft.field < fieldCount - 1) {
+          setEditDraft((current) => (current ? { ...current, field: current.field + 1 } : current));
+        } else {
+          void submitEdit();
+        }
+        return;
+      }
+
+      if (
+        focusedControl?.kind === "text" &&
+        focusedControl.multiline &&
+        key.ctrl &&
+        input === "n"
+      ) {
+        const textField = focusedControl.key;
+        setEditDraft((current) =>
+          current
+            ? { ...current, [textField]: `${current[textField]}\n`, error: undefined }
+            : current,
+        );
+        return;
+      }
+      const textField = focusedControl?.kind === "text" ? focusedControl.key : undefined;
+      if (textField && ((key.ctrl && input === "u") || key.backspace || key.delete)) {
+        setEditDraft((current) => {
+          if (!current) return current;
+          return {
+            ...current,
+            [textField]: key.ctrl ? "" : current[textField].slice(0, -1),
+            error: undefined,
+          };
+        });
+        return;
+      }
+      if (textField && !key.ctrl && !key.meta && input) {
+        setEditDraft((current) =>
+          current
+            ? { ...current, [textField]: current[textField] + input, error: undefined }
+            : current,
+        );
       }
       return;
     }
@@ -627,25 +3467,43 @@ export function AgentqApp({
         void submitAdd();
         return;
       }
+      const controls = ADD_TASK_CONTROLS;
+      const focusedControl = controls.find((control) => control.focusIndex === draft.field);
+      const fieldCount = controls.length;
       if (key.tab) {
         setDraft((current) =>
           current
             ? {
                 ...current,
-                field: nextIndex(current.field, 4, key.shift ? -1 : 1) as AddDraft["field"],
+                field: nextIndex(current.field, fieldCount, key.shift ? -1 : 1),
               }
             : current,
         );
         return;
       }
-      if ((key.leftArrow || key.upArrow || key.rightArrow || key.downArrow) && draft.field < 2) {
+      if (
+        (focusedControl?.kind === "queue" || focusedControl?.kind === "provider") &&
+        (key.leftArrow || key.upArrow || key.rightArrow || key.downArrow)
+      ) {
         const delta = key.leftArrow || key.upArrow ? -1 : 1;
         setDraft((current) => {
           if (!current) return current;
-          if (current.field === 0) {
+          if (focusedControl.kind === "queue") {
+            const currentIndex = snapshot.queues.findIndex((queue) => queue.id === current.queueId);
+            const nextQueue =
+              currentIndex < 0
+                ? snapshot.queues[delta < 0 ? snapshot.queues.length - 1 : 0]
+                : snapshot.queues[nextIndex(currentIndex, snapshot.queues.length, delta)];
+            if (!nextQueue) {
+              return {
+                ...current,
+                error: "Selected queue is no longer available.",
+              };
+            }
             return {
               ...current,
-              queueIndex: nextIndex(current.queueIndex, snapshot.queues.length, delta),
+              queueId: nextQueue.id,
+              error: undefined,
             };
           }
           return {
@@ -655,30 +3513,67 @@ export function AgentqApp({
         });
         return;
       }
+      if (
+        focusedControl?.kind === "selector" &&
+        (key.leftArrow || key.upArrow || key.rightArrow || key.downArrow)
+      ) {
+        const delta = key.leftArrow || key.upArrow ? -1 : 1;
+        setDraft((current) =>
+          current
+            ? {
+                ...current,
+                [focusedControl.key]: nextIndex(
+                  current[focusedControl.key],
+                  focusedControl.options.length,
+                  delta,
+                ),
+                error: undefined,
+              }
+            : current,
+        );
+        return;
+      }
       if (key.return) {
-        if (draft.field < 3) {
-          setDraft((current) =>
-            current ? { ...current, field: (current.field + 1) as AddDraft["field"] } : current,
-          );
+        if (draft.field < fieldCount - 1) {
+          setDraft((current) => (current ? { ...current, field: current.field + 1 } : current));
         } else {
           void submitAdd();
         }
         return;
       }
-      if (key.backspace || key.delete) {
+
+      if (
+        focusedControl?.kind === "text" &&
+        focusedControl.multiline &&
+        key.ctrl &&
+        input === "n"
+      ) {
+        const textField = focusedControl.key;
+        setDraft((current) =>
+          current
+            ? { ...current, [textField]: `${current[textField]}\n`, error: undefined }
+            : current,
+        );
+        return;
+      }
+      const textField = focusedControl?.kind === "text" ? focusedControl.key : undefined;
+      if (textField && ((key.ctrl && input === "u") || key.backspace || key.delete)) {
         setDraft((current) => {
-          if (!current || current.field < 2) return current;
-          const keyName = current.field === 2 ? "title" : "instructions";
-          return { ...current, [keyName]: current[keyName].slice(0, -1), error: undefined };
+          if (!current) return current;
+          return {
+            ...current,
+            [textField]: key.ctrl ? "" : current[textField].slice(0, -1),
+            error: undefined,
+          };
         });
         return;
       }
-      if (!key.ctrl && !key.meta && input && draft.field >= 2) {
-        setDraft((current) => {
-          if (!current) return current;
-          const keyName = current.field === 2 ? "title" : "instructions";
-          return { ...current, [keyName]: current[keyName] + input, error: undefined };
-        });
+      if (textField && !key.ctrl && !key.meta && input) {
+        setDraft((current) =>
+          current
+            ? { ...current, [textField]: current[textField] + input, error: undefined }
+            : current,
+        );
       }
       return;
     }
@@ -703,15 +3598,136 @@ export function AgentqApp({
       moveSelection(1);
       return;
     }
-    if (input === "a") startAdd();
+    if (input === "1" || input === "2" || input === "3") {
+      const next = FOCUS_ORDER[Number(input) - 1] ?? "queues";
+      setFocus(next);
+      setZoomedPane((zoomed) => (zoomed ? next : zoomed));
+      return;
+    }
+    if (input === "j") {
+      moveSelection(1);
+      return;
+    }
+    if (input === "k") {
+      moveSelection(-1);
+      return;
+    }
+    if (input === "[" || input === "]") {
+      const enlarged = input === "]";
+      setWeights((current) =>
+        resizePaneWeights(current, focus, enlarged ? PANE_RESIZE_STEP : -PANE_RESIZE_STEP),
+      );
+      setNotice(`${focus} pane ${enlarged ? "enlarged" : "reduced"}.`);
+      return;
+    }
+    if (input === "0") {
+      setWeights({ ...DEFAULT_PANE_WEIGHTS });
+      setNotice("Layout reset.");
+      return;
+    }
+    if (input === "z") {
+      const next = zoomedPane === focus ? undefined : focus;
+      setZoomedPane(next);
+      setNotice(next ? `${focus} pane zoomed.` : "Pane zoom cleared.");
+      return;
+    }
+    if (input === ":") {
+      setActionIndex(0);
+      setMode("actions");
+      setNotice(undefined);
+      return;
+    }
+    if (input === "n") {
+      startCreateQueue();
+      return;
+    }
+    if (input === "a") {
+      startAdd();
+      return;
+    }
+    if (input === "e") {
+      if (focus === "queues") startEditQueue();
+      else startEdit();
+      return;
+    }
+    if (input === "?") {
+      setMode("help");
+      return;
+    }
+    if (input === "p") {
+      openApprovals();
+      return;
+    }
+    if (input === "i") {
+      if (canIntegrateTaskResult(selectedTask)) {
+        setConfirmation({ kind: "integrate-task", task: selectedTask });
+        setMode("confirm");
+      } else {
+        setNotice("Integration requires a selected verified result that is ready to integrate.");
+      }
+      return;
+    }
+    if (input === "L") {
+      if (selectedQueue && canLandSelectedQueue) {
+        setConfirmation({ kind: "land-queue", queue: selectedQueue });
+        setMode("confirm");
+      } else {
+        setNotice("Landing requires an integration lane with an integrated task.");
+      }
+      return;
+    }
     if (input === "c" && selectedTask && canCancelTask(selectedTask.status)) {
-      setMode("confirm-cancel");
+      setConfirmation({ kind: "cancel", task: selectedTask });
+      setMode("confirm");
+      return;
     }
     if (input === "r" && selectedTask && canRetryTask(selectedTask.status)) {
-      setMode("confirm-retry");
+      setConfirmation({ kind: "retry", task: selectedTask });
+      setMode("confirm");
+      return;
+    }
+    if (input === "s" && selectedTask && canRetryTask(selectedTask.status)) {
+      void runAction("resume");
+      return;
     }
     if (input === "d" && selectedTask && canCompleteTaskManually(selectedTask.status)) {
       void runAction("done");
+      return;
+    }
+    if (input === "v" && selectedTask) {
+      void openAttempts();
+      return;
+    }
+    if (input === "x") {
+      if (focus === "queues" && selectedQueue) {
+        setConfirmation({ kind: "delete-queue", queue: selectedQueue });
+        setMode("confirm");
+      } else if (selectedTask && !isTaskActive(selectedTask.status) && !selectedTask.currentRunId) {
+        setConfirmation({ kind: "delete-task", task: selectedTask });
+        setMode("confirm");
+      } else if (selectedTask) {
+        setNotice("Cancel active work before deleting this task.");
+      } else {
+        setNotice("Select a queue or task to delete.");
+      }
+      return;
+    }
+    if (input === "X") {
+      if (selectedTask && isTaskTerminal(selectedTask.status)) {
+        setConfirmation({ kind: "clean", task: selectedTask, force: false });
+        setMode("confirm");
+      } else {
+        setNotice("Cancel or finish the task before cleaning its worktree.");
+      }
+      return;
+    }
+    if (input === "f") {
+      cycleTaskFilter();
+      return;
+    }
+    if (input === "g") {
+      void toggleRepositoryScope();
+      return;
     }
     if (input === "R") void refresh();
     if (input === "q") {
@@ -740,92 +3756,700 @@ export function AgentqApp({
     );
   }
 
-  if (mode === "add" && draft) {
-    const queue = snapshot.queues[draft.queueIndex];
-    const provider = PROVIDERS[draft.providerIndex];
-    const compactForm = columns < 60 || rows < 24;
-    const field = (index: number, label: string, value: string) => {
-      if (compactForm) {
-        return (
-          <Text key={label} color={draft.field === index ? "cyan" : undefined} wrap="truncate-end">
-            {draft.field === index ? "●" : "○"} {label.padEnd(13)}{" "}
-            {sanitizeTerminalText(value) || (draft.field === index ? "▏" : "—")}
-          </Text>
-        );
-      }
-
-      return (
-        <Box key={label} flexDirection="column" marginBottom={1}>
-          <Text bold color={draft.field === index ? "cyan" : "gray"}>
-            {draft.field === index ? "●" : "○"} {label}
-          </Text>
-          <Box
-            borderStyle="round"
-            borderColor={draft.field === index ? "cyan" : "gray"}
-            paddingX={1}
-          >
-            <Text wrap="truncate-end">
-              {sanitizeTerminalText(value) || (draft.field === index ? "▏" : "—")}
-            </Text>
-          </Box>
-        </Box>
-      );
-    };
-
+  if (mode === "help") {
     return (
-      <Box width={columns} height={rows} flexDirection="column">
-        <Header tasks={snapshot.tasks} focus={focus} narrow={columns < 72} />
+      <Box
+        width={columns}
+        height={rows}
+        flexDirection="column"
+        alignItems="center"
+        justifyContent="center"
+        overflow="hidden"
+      >
+        <Box
+          width={Math.max(1, Math.min(columns - 2, 76))}
+          borderStyle="double"
+          borderColor="cyan"
+          paddingX={columns >= 50 ? 2 : 1}
+          flexDirection="column"
+        >
+          <Text bold color="cyan">
+            KEYBOARD HELP
+          </Text>
+          <Text dimColor>
+            Context: {focus} {displayScope ? `· ${sanitizeTerminalText(displayScope)}` : ""}
+          </Text>
+          <Text>
+            <Text bold>1 / 2 / 3</Text> focus queues / tasks / details
+          </Text>
+          <Text>
+            <Text bold>tab / ← →</Text> cycle focus · <Text bold>↑ ↓ / j / k</Text> select
+          </Text>
+          <Text>
+            <Text bold>n</Text> new queue · <Text bold>a</Text> add task · <Text bold>e</Text>{" "}
+            contextual edit · <Text bold>x</Text> delete queue / task · <Text bold>X</Text> clean
+          </Text>
+          <Text>
+            <Text bold>c</Text> cancel · <Text bold>r</Text> retry · <Text bold>s</Text> resume ·{" "}
+            <Text bold>d</Text> done · <Text bold>v</Text> attempts
+          </Text>
+          <Text>
+            <Text bold>[ / ]</Text> resize focused pane · <Text bold>0</Text> reset ·{" "}
+            <Text bold>z</Text> zoom · <Text bold>f</Text> status filter
+          </Text>
+          <Text>
+            <Text bold>:</Text> action center · <Text bold>g</Text> local / all ·{" "}
+            <Text bold>R</Text> refresh · <Text bold>q</Text> quit · <Text bold>? / esc</Text> close
+          </Text>
+          <Text>
+            <Text bold>p</Text> approvals · <Text bold>i</Text> integrate verified result ·{" "}
+            <Text bold>L</Text> land selected queue
+          </Text>
+          <Text dimColor>
+            Forms: tab fields · ctrl+n newline · ctrl+u clear · ctrl+s save · esc cancel
+          </Text>
+        </Box>
+      </Box>
+    );
+  }
+
+  if (mode === "approval-form" && approvalDraft) {
+    return (
+      <FormScreen
+        columns={columns}
+        rows={rows}
+        title={`${approvalDraft.decision === "approve" ? "APPROVE" : "REJECT"} CHECKPOINT?`}
+        subtitle={`${approvalDraft.checkpoint} · task ${approvalDraft.taskId} · this records a durable human decision.`}
+        fields={[
+          {
+            label: "Actor",
+            value: approvalDraft.actor || "optional",
+            focused: approvalDraft.field === 0,
+            textInput: true,
+          },
+          {
+            label: "Decision note",
+            value: approvalDraft.note || "optional",
+            focused: approvalDraft.field === 1,
+            multiline: true,
+            textInput: true,
+          },
+        ]}
+        error={approvalDraft.error}
+        footer="ctrl+s confirm decision · ctrl+n newline · esc back · tab fields · ctrl+u clear"
+      />
+    );
+  }
+
+  if (mode === "approvals") {
+    const capacity = Math.max(1, Math.floor((rows - 9) / 3));
+    const visible = windowItems(selectedTaskApprovals, approvalIndex, capacity);
+    return (
+      <Box width={columns} height={rows} flexDirection="column" overflow="hidden">
+        <Header
+          tasks={snapshot.tasks}
+          focus={focus}
+          narrow={columns < 72}
+          scopeLabel={displayScope}
+        />
         <Box flexGrow={1} alignItems="center" overflow="hidden">
           <Box
-            width={Math.min(columns - 2, 76)}
+            width={Math.max(1, Math.min(columns - 2, 96))}
+            height={Math.max(1, rows - 4)}
             borderStyle="double"
-            borderColor="cyan"
-            paddingX={compactForm ? 1 : 2}
+            borderColor="magenta"
+            paddingX={columns >= 50 ? 2 : 1}
             flexDirection="column"
+            overflow="hidden"
           >
-            <Text bold color="cyan">
-              ADD TASK
+            <Text bold color="magenta" wrap="truncate-end">
+              TASK APPROVALS · {sanitizeTerminalText(selectedTask?.title ?? "task unavailable")}
             </Text>
-            <Text dimColor>Choose the queue and provider, then describe the outcome.</Text>
-            {field(0, "Queue", queue?.name ?? "No queue")}
-            {field(1, "Provider", provider ?? "No provider")}
-            {field(2, "Title", draft.title)}
-            {field(3, "Instructions", draft.instructions)}
-            {draft.error ? <Text color="red">{sanitizeTerminalText(draft.error)}</Text> : null}
-            <Text dimColor>
-              tab next · arrows choose · enter advance/submit · ctrl+s submit · esc cancel
-            </Text>
+            {selectedTaskApprovals.length === 0 ? (
+              <Text dimColor>No checkpoint decisions have been requested for this task.</Text>
+            ) : null}
+            {visible.items.map((approval, offset) => {
+              const index = visible.start + offset;
+              const selected = index === approvalIndex;
+              const color =
+                approval.status === "approved"
+                  ? "green"
+                  : approval.status === "rejected"
+                    ? "red"
+                    : "yellow";
+              return (
+                <Box key={approval.checkpoint} flexDirection="column" marginBottom={1}>
+                  <Text bold={selected} color={selected ? "magenta" : color} wrap="truncate-end">
+                    {selected ? "› " : "  "}[{workflowLabel(approval.status)}]{" "}
+                    {sanitizeTerminalText(approval.checkpoint)}
+                  </Text>
+                  <Text dimColor wrap="truncate-end">
+                    requested {sanitizeTerminalText(approval.requestedAt)}
+                    {approval.runId ? ` · run ${sanitizeTerminalText(approval.runId)}` : ""}
+                    {approval.actor ? ` · ${sanitizeTerminalText(approval.actor)}` : ""}
+                  </Text>
+                  {approval.note ? (
+                    <Text dimColor wrap="truncate-end">
+                      {sanitizeTerminalText(approval.note)}
+                    </Text>
+                  ) : null}
+                </Box>
+              );
+            })}
+            {notice ? (
+              <Text color="yellow" wrap="truncate-end">
+                {sanitizeTerminalText(notice)}
+              </Text>
+            ) : null}
+            <Box marginTop={1} borderTop borderColor="gray">
+              <Text dimColor>
+                ↑↓ / j k select · a / enter approve · r reject · R refresh · p / esc back
+              </Text>
+            </Box>
           </Box>
         </Box>
       </Box>
     );
   }
 
-  if ((mode === "confirm-cancel" || mode === "confirm-retry") && selectedTask) {
-    const cancelling = mode === "confirm-cancel";
+  if (mode === "actions") {
+    const rowCapacity = Math.max(3, rows - 9);
+    const visible = windowItems(actionItems, actionIndex, rowCapacity);
+    const selected = actionItems[actionIndex];
+    return (
+      <Box width={columns} height={rows} flexDirection="column" overflow="hidden">
+        <Header
+          tasks={snapshot.tasks}
+          focus={focus}
+          narrow={columns < 72}
+          scopeLabel={displayScope}
+        />
+        <Box flexGrow={1} alignItems="center" overflow="hidden">
+          <Box
+            width={Math.max(1, Math.min(columns - 2, 82))}
+            height={Math.max(1, rows - 4)}
+            borderStyle="double"
+            borderColor="cyan"
+            paddingX={columns >= 50 ? 2 : 1}
+            flexDirection="column"
+            overflow="hidden"
+          >
+            <Box justifyContent="space-between">
+              <Text bold color="cyan">
+                ACTION CENTER
+              </Text>
+              <Text dimColor>
+                {actionIndex + 1}/{actionItems.length}
+              </Text>
+            </Box>
+            {visible.items.map((item, offset) => {
+              const index = visible.start + offset;
+              const active = index === actionIndex;
+              return (
+                <Text
+                  key={item.id}
+                  bold={active}
+                  color={!item.available ? "gray" : active ? "cyan" : undefined}
+                  wrap="truncate-end"
+                >
+                  {active ? "›" : " "} {item.available ? " " : "×"} {item.label}
+                </Text>
+              );
+            })}
+            <Box marginTop={1} borderTop borderColor="gray" flexDirection="column">
+              <Text bold>{sanitizeTerminalText(selected?.label ?? "")}</Text>
+              <Text dimColor wrap="truncate-end">
+                {sanitizeTerminalText(selected?.detail ?? "")}
+              </Text>
+              {notice ? (
+                <Text color="yellow" wrap="truncate-end">
+                  {sanitizeTerminalText(notice)}
+                </Text>
+              ) : null}
+              <Text dimColor>↑↓ / j k select · enter run · : / esc close</Text>
+            </Box>
+          </Box>
+        </Box>
+      </Box>
+    );
+  }
+
+  if (mode === "queue-form" && queueDraft) {
+    const provider = PROVIDERS[queueDraft.providerIndex] ?? "codex";
+    const fields: FormField[] = queueFormControls(queueDraft.kind).map((control) => {
+      if (control.kind === "readonly") {
+        return {
+          label: control.label,
+          value: queueDraft[control.key],
+          focusable: false,
+        };
+      }
+      if (control.kind === "provider") {
+        return {
+          label: control.label,
+          value: provider,
+          focused: queueDraft.field === control.focusIndex,
+        };
+      }
+      if (control.kind === "toggle") {
+        return {
+          label: control.label,
+          value: queueDraft[control.key] ? "on" : "off",
+          focused: queueDraft.field === control.focusIndex,
+        };
+      }
+      if (control.kind === "selector") {
+        return {
+          label: control.label,
+          value: control.options[queueDraft[control.key]] ?? "unavailable",
+          focused: queueDraft.field === control.focusIndex,
+        };
+      }
+      return {
+        label: control.label,
+        value: queueDraft[control.key] || control.placeholder || "",
+        focused: queueDraft.field === control.focusIndex,
+        multiline: control.multiline,
+        textInput: true,
+      };
+    });
+    return (
+      <FormScreen
+        columns={columns}
+        rows={rows}
+        title={queueDraft.kind === "create" ? "CREATE QUEUE" : "EDIT QUEUE"}
+        subtitle={
+          queueDraft.kind === "create"
+            ? "Connect a Git repository to a durable parallel queue."
+            : "Repository (read-only); update this queue's execution policy."
+        }
+        fields={fields}
+        error={queueDraft.error}
+        footer="ctrl+s save · ctrl+n newline · esc cancel · ←→ change · tab fields · ctrl+u clear"
+      />
+    );
+  }
+
+  if (mode === "attempts" && selectedTask) {
+    if (attemptDetailOpen && selectedAttempt) {
+      const safeOffset = Math.min(attemptDetailOffset, attemptDetailMaxOffset);
+      const visibleLines = attemptDetailLines.slice(safeOffset, safeOffset + attemptDetailCapacity);
+      const workflow = selectedAttempt.taskSnapshot?.workflow;
+      return (
+        <Box width={columns} height={rows} flexDirection="column" overflow="hidden">
+          <Header
+            tasks={snapshot.tasks}
+            focus={focus}
+            narrow={columns < 72}
+            scopeLabel={displayScope}
+          />
+          <Box flexGrow={1} alignItems="center" overflow="hidden">
+            <Box
+              width={attemptPanelWidth}
+              height={Math.max(1, rows - 4)}
+              borderStyle="double"
+              borderColor="magenta"
+              paddingX={attemptHorizontalPadding}
+              flexDirection="column"
+              overflow="hidden"
+            >
+              <Text bold color="magenta" wrap="truncate-end">
+                ATTEMPT DETAIL · #{selectedAttempt.attemptNo}
+              </Text>
+              <Text dimColor wrap="truncate-end">
+                {selectedAttempt.status.toUpperCase()} · {selectedAttempt.provider} ·{" "}
+                {selectedAttempt.phase} · plan{" "}
+                {sanitizeTerminalText(workflow?.planModel || `${selectedAttempt.provider} default`)}{" "}
+                → implement{" "}
+                {sanitizeTerminalText(
+                  workflow?.implementModel || `${selectedAttempt.provider} default`,
+                )}
+              </Text>
+              <Box height={attemptDetailCapacity} flexDirection="column" overflow="hidden">
+                {visibleLines.map((line, index) => (
+                  // The workflow snapshot is immutable; its absolute line number is a stable key.
+                  // biome-ignore lint/suspicious/noArrayIndexKey: static viewport over immutable text
+                  <Text key={`${safeOffset + index}-${line}`} wrap="truncate-end">
+                    {line || " "}
+                  </Text>
+                ))}
+              </Box>
+              <Text dimColor wrap="truncate-end">
+                Lines {safeOffset + 1}–
+                {Math.min(attemptDetailLines.length, safeOffset + attemptDetailCapacity)} of{" "}
+                {attemptDetailLines.length} · ↑↓/jk scroll · esc attempts · v dashboard
+              </Text>
+            </Box>
+          </Box>
+        </Box>
+      );
+    }
+
+    const capacity = Math.max(1, Math.floor((rows - 9) / 5));
+    const visible = windowItems(runs, safeAttemptIndex, capacity);
+    return (
+      <Box width={columns} height={rows} flexDirection="column" overflow="hidden">
+        <Header
+          tasks={snapshot.tasks}
+          focus={focus}
+          narrow={columns < 72}
+          scopeLabel={displayScope}
+        />
+        <Box flexGrow={1} alignItems="center" overflow="hidden">
+          <Box
+            width={attemptPanelWidth}
+            height={Math.max(1, rows - 4)}
+            borderStyle="double"
+            borderColor="magenta"
+            paddingX={attemptHorizontalPadding}
+            flexDirection="column"
+            overflow="hidden"
+          >
+            <Text bold color="magenta">
+              ATTEMPTS · {sanitizeTerminalText(selectedTask.title)}
+            </Text>
+            {runs.length > 0 ? (
+              <Text dimColor>
+                SELECTED {safeAttemptIndex + 1}/{runs.length} · ↑↓/jk select · enter details
+              </Text>
+            ) : null}
+            {runs.length === 0 ? <Text dimColor>No attempts have started.</Text> : null}
+            {visible.items.map((run, offset) => {
+              const index = visible.start + offset;
+              const selected = index === safeAttemptIndex;
+              return (
+                <Box key={run.id} flexDirection="column" marginBottom={1}>
+                  <Text>
+                    <Text color={selected ? "magenta" : undefined}>{selected ? "› " : "  "}</Text>
+                    <Text
+                      bold={selected}
+                      color={
+                        run.status === "succeeded"
+                          ? "green"
+                          : run.status === "failed"
+                            ? "red"
+                            : "cyan"
+                      }
+                    >
+                      #{run.attemptNo} {run.status.toUpperCase()}
+                    </Text>
+                    <Text dimColor>
+                      {" "}
+                      · {run.provider} · {run.phase} · {run.id}
+                    </Text>
+                  </Text>
+                  <Text dimColor wrap="truncate-end">
+                    {sanitizeTerminalText(runSummary(run))}
+                  </Text>
+                  <Text dimColor wrap="truncate-end">
+                    {run.taskSnapshot
+                      ? `Spec: ${sanitizeTerminalText(run.taskSnapshot.title)} · ${run.taskSnapshot.provider} · priority ${run.taskSnapshot.priority}`
+                      : "Spec snapshot unavailable (legacy attempt)"}
+                  </Text>
+                  {run.taskSnapshot?.workflow ? (
+                    <Text dimColor wrap="truncate-end">
+                      Models: plan{" "}
+                      {sanitizeTerminalText(
+                        run.taskSnapshot.workflow.planModel || `${run.provider} default`,
+                      )}{" "}
+                      → implement{" "}
+                      {sanitizeTerminalText(
+                        run.taskSnapshot.workflow.implementModel || `${run.provider} default`,
+                      )}
+                    </Text>
+                  ) : null}
+                </Box>
+              );
+            })}
+            <Text dimColor>↑↓ / j k select · enter details · v / esc back</Text>
+          </Box>
+        </Box>
+      </Box>
+    );
+  }
+
+  if (mode === "doctor") {
+    const capacity = Math.max(1, Math.floor((rows - 9) / 2));
+    const visibleChecks = doctorChecks.slice(0, capacity);
+    return (
+      <Box width={columns} height={rows} flexDirection="column" overflow="hidden">
+        <Header
+          tasks={snapshot.tasks}
+          focus={focus}
+          narrow={columns < 72}
+          scopeLabel={displayScope}
+        />
+        <Box flexGrow={1} alignItems="center" overflow="hidden">
+          <Box
+            width={Math.max(1, Math.min(columns - 2, 96))}
+            height={Math.max(1, rows - 4)}
+            borderStyle="double"
+            borderColor="cyan"
+            paddingX={columns >= 50 ? 2 : 1}
+            flexDirection="column"
+            overflow="hidden"
+          >
+            <Text bold color="cyan">
+              DOCTOR / PROVIDERS
+            </Text>
+            {doctorChecks.length === 0 ? <Text dimColor>Running checks…</Text> : null}
+            {visibleChecks.map((check) => (
+              <Box key={check.name} flexDirection="column">
+                <Text color={check.ok ? "green" : "red"} wrap="truncate-end">
+                  {check.ok ? "✓" : "✗"} {sanitizeTerminalText(check.name)} ·{" "}
+                  {sanitizeTerminalText(check.detail)}
+                </Text>
+                {check.remediation ? (
+                  <Text dimColor wrap="truncate-end">
+                    {" "}
+                    {sanitizeTerminalText(check.remediation)}
+                  </Text>
+                ) : null}
+              </Box>
+            ))}
+            {doctorChecks.length > visibleChecks.length ? (
+              <Text dimColor>
+                … {doctorChecks.length - visibleChecks.length} checks hidden at this size
+              </Text>
+            ) : null}
+            {notice ? <Text color="yellow">{sanitizeTerminalText(notice)}</Text> : null}
+            <Box marginTop={1} borderTop borderColor="gray">
+              <Text dimColor>c login Codex · l login Claude Code · R rerun · esc back</Text>
+            </Box>
+          </Box>
+        </Box>
+      </Box>
+    );
+  }
+
+  if (mode === "integration-results") {
+    return (
+      <Box width={columns} height={rows} flexDirection="column" overflow="hidden">
+        <Header
+          tasks={snapshot.tasks}
+          focus={focus}
+          narrow={columns < 72}
+          scopeLabel={displayScope}
+        />
+        <Box flexGrow={1} alignItems="center" justifyContent="center" overflow="hidden">
+          <Box
+            width={Math.max(1, Math.min(columns - 4, 88))}
+            borderStyle="double"
+            borderColor="green"
+            paddingX={columns >= 50 ? 2 : 1}
+            paddingY={1}
+            flexDirection="column"
+          >
+            <Text bold color="green">
+              INTEGRATION COMPLETE
+            </Text>
+            {integrationResults.map((result) => (
+              <Text key={result.file} wrap="truncate-end">
+                <Text color={result.action === "unchanged" ? "gray" : "green"}>
+                  {result.action === "created" ? "+" : result.action === "updated" ? "~" : "="}
+                </Text>{" "}
+                {sanitizeTerminalText(result.file)} · {result.action}
+              </Text>
+            ))}
+            <Text dimColor>enter / esc return to dashboard</Text>
+          </Box>
+        </Box>
+      </Box>
+    );
+  }
+
+  if (mode === "edit" && editDraft) {
+    const fields: FormField[] = EDIT_TASK_CONTROLS.map((control) => {
+      if (control.kind === "provider") {
+        return {
+          label: control.label,
+          value: PROVIDERS[editDraft.providerIndex] ?? "No provider",
+          focused: editDraft.field === control.focusIndex,
+        };
+      }
+      if (control.kind === "selector") {
+        return {
+          label: control.label,
+          value: control.options[editDraft[control.key]] ?? "unavailable",
+          focused: editDraft.field === control.focusIndex,
+        };
+      }
+      if (control.kind === "text") {
+        return {
+          label: control.label,
+          value: editDraft[control.key] || control.placeholder || "",
+          focused: editDraft.field === control.focusIndex,
+          multiline: control.multiline,
+          textInput: true,
+        };
+      }
+      return {
+        label: control.label,
+        value: "Unavailable while editing",
+        focused: editDraft.field === control.focusIndex,
+      };
+    });
+    return (
+      <FormScreen
+        columns={columns}
+        rows={rows}
+        title="EDIT TASK"
+        subtitle="Changes apply to the next attempt and keep existing run history."
+        fields={fields}
+        error={editDraft.error}
+        footer="ctrl+s save · ctrl+n newline · esc cancel · ←→ change · tab fields · ctrl+u clear"
+      />
+    );
+  }
+
+  if (mode === "add" && draft) {
+    const queue = snapshot.queues.find((candidate) => candidate.id === draft.queueId);
+    const provider = PROVIDERS[draft.providerIndex];
+    const fields: FormField[] = ADD_TASK_CONTROLS.map((control) => {
+      if (control.kind === "queue") {
+        return {
+          label: control.label,
+          value: queue?.name ?? "Queue unavailable (removed)",
+          focused: draft.field === control.focusIndex,
+        };
+      }
+      if (control.kind === "provider") {
+        return {
+          label: control.label,
+          value: provider ?? "No provider",
+          focused: draft.field === control.focusIndex,
+        };
+      }
+      if (control.kind === "selector") {
+        return {
+          label: control.label,
+          value: control.options[draft[control.key]] ?? "unavailable",
+          focused: draft.field === control.focusIndex,
+        };
+      }
+      return {
+        label: control.label,
+        value: draft[control.key] || control.placeholder || "",
+        focused: draft.field === control.focusIndex,
+        multiline: control.multiline,
+        textInput: true,
+      };
+    });
+    return (
+      <FormScreen
+        columns={columns}
+        rows={rows}
+        title="ADD TASK"
+        subtitle="Choose the queue and provider, then describe the outcome."
+        fields={fields}
+        error={draft.error}
+        footer="ctrl+s submit · esc cancel · ←→ choose"
+      />
+    );
+  }
+
+  if (mode === "confirm" && confirmation) {
+    const title =
+      confirmation.kind === "cancel"
+        ? "CANCEL TASK?"
+        : confirmation.kind === "retry"
+          ? "RETRY TASK?"
+          : confirmation.kind === "delete-queue"
+            ? "DELETE QUEUE?"
+            : confirmation.kind === "delete-task"
+              ? "DELETE TASK?"
+              : confirmation.kind === "clean"
+                ? "CLEAN WORKTREE?"
+                : confirmation.kind === "integration"
+                  ? "INSTALL INTEGRATION?"
+                  : confirmation.kind === "integrate-task"
+                    ? "INTEGRATE TASK RESULT?"
+                    : "LAND QUEUE?";
+    const subject =
+      confirmation.kind === "delete-queue" || confirmation.kind === "land-queue"
+        ? confirmation.queue.name
+        : confirmation.kind === "integration"
+          ? confirmation.target === "all"
+            ? "Codex + Claude Code"
+            : confirmation.target === "codex"
+              ? "Codex"
+              : "Claude Code"
+          : confirmation.task.title;
+    const description =
+      confirmation.kind === "cancel"
+        ? "The agent process will receive a graceful stop request."
+        : confirmation.kind === "retry"
+          ? "A fresh isolated attempt and provider session will be queued."
+          : confirmation.kind === "delete-queue"
+            ? "Permanently deletes this queue and all inactive tasks, attempts, events, and logs. Active work or retained worktrees block deletion."
+            : confirmation.kind === "delete-task"
+              ? "Permanently deletes this task, its attempts, events, and logs. Active work or retained worktrees block deletion."
+              : confirmation.kind === "clean"
+                ? confirmation.force
+                  ? "Force removal discards uncommitted work in the retained worktree."
+                  : "Safe removal stops if the retained worktree has uncommitted changes."
+                : confirmation.kind === "integration"
+                  ? "Repository instructions will be installed in:"
+                  : confirmation.kind === "integrate-task"
+                    ? "The verified result will be merged into the queue integration train. Verification and scope gates are enforced again."
+                    : `The integration train will update ${confirmation.queue.baseRef}. This changes the queue's target branch.`;
+    const destructive =
+      confirmation.kind === "cancel" ||
+      confirmation.kind === "delete-queue" ||
+      confirmation.kind === "delete-task" ||
+      confirmation.kind === "land-queue" ||
+      (confirmation.kind === "clean" && confirmation.force);
     return (
       <Box width={columns} height={rows} flexDirection="column">
-        <Header tasks={snapshot.tasks} focus={focus} narrow={columns < 72} />
+        <Header
+          tasks={snapshot.tasks}
+          focus={focus}
+          narrow={columns < 72}
+          scopeLabel={displayScope}
+        />
         <Box flexGrow={1} alignItems="center" justifyContent="center">
           <Box
-            width={Math.min(columns - 4, 64)}
+            width={Math.max(1, Math.min(columns - 4, 64))}
             borderStyle="double"
-            borderColor={cancelling ? "yellow" : "magenta"}
+            borderColor={destructive ? "yellow" : "magenta"}
             paddingX={2}
             paddingY={1}
             flexDirection="column"
           >
-            <Text bold color={cancelling ? "yellow" : "magenta"}>
-              {cancelling ? "CANCEL TASK?" : "RETRY TASK?"}
+            <Text bold color={destructive ? "yellow" : "magenta"}>
+              {title}
             </Text>
-            <Text wrap="truncate-end">{sanitizeTerminalText(selectedTask.title)}</Text>
-            <Text dimColor>
-              {cancelling
-                ? "The agent process will receive a graceful stop request."
-                : "A new isolated attempt will be queued for this task."}
+            <Text wrap="truncate-end">{sanitizeTerminalText(subject)}</Text>
+            <Text dimColor wrap="truncate-end">
+              {sanitizeTerminalText(description)}
             </Text>
+            {confirmation.kind === "integration" ? (
+              <Text color="cyan" wrap="truncate-end">
+                {sanitizeTerminalText(confirmation.repoPath)}
+              </Text>
+            ) : null}
+            {confirmation.kind === "integrate-task" ? (
+              <Text color="cyan" wrap="truncate-end">
+                Result: {sanitizeTerminalText(confirmation.task.resultCommitSha ?? "not recorded")}
+              </Text>
+            ) : null}
+            {confirmation.kind === "land-queue" ? (
+              <Text color="cyan" wrap="truncate-end">
+                {sanitizeTerminalText(selectedDelivery?.lane?.trainRef ?? "integration train")} →{" "}
+                {sanitizeTerminalText(confirmation.queue.baseRef)}
+              </Text>
+            ) : null}
+            {confirmation.kind === "clean" ? (
+              <Text>
+                Removal mode:{" "}
+                <Text bold color={confirmation.force ? "red" : "green"}>
+                  {confirmation.force ? "FORCE" : "SAFE"}
+                </Text>{" "}
+                <Text dimColor>(f / arrows toggle)</Text>
+              </Text>
+            ) : null}
             <Text>
-              <Text bold>y / enter</Text> confirm <Text bold>n / esc</Text> keep task
+              <Text bold>y / enter</Text> confirm <Text bold>n / esc</Text> go back
             </Text>
           </Box>
         </Box>
@@ -835,7 +4459,17 @@ export function AgentqApp({
 
   const narrow = columns < 72;
   const wide = columns >= 110;
-  const bodyHeight = Math.max(10, rows - 5);
+  const bodyHeight = Math.max(1, rows - 5);
+  const widths = paneWidths(columns, weights);
+  const singlePane = narrow || zoomedPane !== undefined;
+  const mediumQueueWidth = Math.max(16, Math.min(columns - 24, widths.queues));
+  const stackMinimum = Math.min(6, Math.max(1, Math.floor(bodyHeight / 3)));
+  const taskShare = weights.tasks / (weights.tasks + weights.details);
+  const mediumTaskHeight = Math.max(
+    stackMinimum,
+    Math.min(bodyHeight - stackMinimum, Math.floor(bodyHeight * taskShare)),
+  );
+  const mediumDetailsHeight = Math.max(1, bodyHeight - mediumTaskHeight);
   const queuePane = (
     <QueuePane
       queues={snapshot.queues}
@@ -843,31 +4477,46 @@ export function AgentqApp({
       selectedId={selectedQueueId}
       active={focus === "queues"}
       height={bodyHeight}
-      width={narrow ? "100%" : 25}
+      width={singlePane ? "100%" : wide ? widths.queues : mediumQueueWidth}
+      scopeLabel={displayScope}
+      showRepositories={context?.all ?? false}
     />
   );
   const taskPane = (
     <TaskPane
       tasks={visibleTasks}
+      filter={taskFilter}
       selectedId={selectedTaskId}
       active={focus === "tasks"}
-      height={narrow || wide ? bodyHeight : Math.max(8, Math.floor(bodyHeight * 0.45))}
-      width={narrow ? "100%" : wide ? 39 : undefined}
+      height={singlePane || wide ? bodyHeight : mediumTaskHeight}
+      width={singlePane ? "100%" : wide ? widths.tasks : undefined}
     />
   );
   const detailsPane = (
     <DetailsPane
       task={selectedTask}
+      queue={selectedQueue}
+      run={liveRun?.taskId === selectedTask?.id ? liveRun : undefined}
       events={events}
+      approvals={selectedTaskApprovals}
+      delivery={selectedDelivery}
+      deliveryError={deliveryError}
       active={focus === "details"}
-      height={narrow ? bodyHeight : wide ? "100%" : undefined}
+      height={singlePane || wide ? bodyHeight : mediumDetailsHeight}
+      width={singlePane ? "100%" : wide ? widths.details : undefined}
     />
   );
+  const focusedPane =
+    zoomedPane === "queues" ? queuePane : zoomedPane === "tasks" ? taskPane : detailsPane;
 
   return (
     <Box width={columns} height={rows} flexDirection="column" overflow="hidden">
-      <Header tasks={snapshot.tasks} focus={focus} narrow={narrow} />
-      {narrow ? (
+      <Header tasks={snapshot.tasks} focus={focus} narrow={narrow} scopeLabel={displayScope} />
+      {zoomedPane ? (
+        <Box height={bodyHeight} overflow="hidden">
+          {focusedPane}
+        </Box>
+      ) : narrow ? (
         <Box height={bodyHeight} overflow="hidden">
           {focus === "queues" ? queuePane : focus === "tasks" ? taskPane : detailsPane}
         </Box>
@@ -886,7 +4535,14 @@ export function AgentqApp({
           </Box>
         </Box>
       )}
-      <Footer notice={notice ?? error} narrow={narrow} task={selectedTask} />
+      <Footer
+        notice={notice ?? error}
+        narrow={narrow}
+        task={selectedTask}
+        focus={focus}
+        queue={selectedQueue}
+        canToggle={context?.canToggle ?? false}
+      />
     </Box>
   );
 }

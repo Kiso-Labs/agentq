@@ -1,12 +1,15 @@
 import { chmod, mkdir } from "node:fs/promises";
+import { build } from "esbuild";
 
 await mkdir("dist", { recursive: true });
 
-const result = await Bun.build({
-  entrypoints: ["src/cli.tsx"],
-  outdir: "dist",
-  naming: "agentq",
-  target: "bun",
+await build({
+  entryPoints: ["src/cli.tsx"],
+  outfile: "dist/agentq",
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node24.15",
   packages: "external",
   minify: false,
   sourcemap: "linked",
@@ -14,10 +17,5 @@ const result = await Bun.build({
     AGENTQ_VERSION: JSON.stringify(process.env.npm_package_version ?? "0.1.0"),
   },
 });
-
-if (!result.success) {
-  for (const log of result.logs) console.error(log);
-  process.exit(1);
-}
 
 await chmod("dist/agentq", 0o755);

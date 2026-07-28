@@ -1,4 +1,3 @@
-import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +8,7 @@ import {
   CodexExecutor,
   CodexStreamParser,
 } from "../src/executors/index.ts";
+import { afterEach, describe, expect, test } from "./support/test.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -31,13 +31,25 @@ function makeInput(cwd: string, overrides: Partial<ExecutorRunInput> = {}): Exec
   const queue: Queue = {
     id: "queue-1",
     name: "bugs",
+    repoKey: cwd,
     repoPath: cwd,
     baseRef: "main",
     defaultProvider: "codex",
+    planModel: "",
+    planInstructions: "",
+    implementModel: "",
+    implementInstructions: "",
     concurrency: 2,
     maxAttempts: 2,
     verifyCommands: [],
     autoCommit: false,
+    allowedPaths: [],
+    deniedPaths: [],
+    approvalCheckpoints: [],
+    baseDriftPolicy: "replan",
+    landStrategy: "none",
+    autoLand: false,
+    fileConcurrency: "off",
     createdAt: now,
     updatedAt: now,
   };
@@ -47,9 +59,28 @@ function makeInput(cwd: string, overrides: Partial<ExecutorRunInput> = {}): Exec
     title: "Fix the bug",
     instructions: "Fix it",
     acceptanceCriteria: [],
+    objective: "Fix it",
+    invariants: [],
+    handoffRequirements: [],
+    blockedBy: [],
+    expectedPaths: [],
+    allowedPaths: [],
+    deniedPaths: [],
+    verifyCommands: [],
+    approvalCheckpoints: [],
+    baseDriftPolicy: "replan",
+    landStrategy: "none",
     provider: "codex",
     priority: 0,
     status: "starting",
+    currentPhase: "implement",
+    deliveryStatus: "not_started",
+    changedFiles: [],
+    verificationResults: [],
+    integrationConflictFiles: [],
+    inputTokens: 0,
+    outputTokens: 0,
+    costUsd: 0,
     sourceKind: "manual",
     attemptCount: 1,
     createdAt: now,
@@ -62,6 +93,7 @@ function makeInput(cwd: string, overrides: Partial<ExecutorRunInput> = {}): Exec
     queue,
     cwd,
     prompt: "Fix the bug and test it.",
+    phase: "implement",
     signal: new AbortController().signal,
     env: {},
     ...overrides,
@@ -91,15 +123,19 @@ describe("CodexStreamParser", () => {
     expect(events).toContainEqual({ type: "session", sessionId: "019abc" });
     expect(events).toContainEqual({
       type: "tool",
+      toolId: "item_0",
       name: "command",
       state: "started",
       detail: "bun test",
     });
     expect(events).toContainEqual({
       type: "tool",
+      toolId: "item_0",
       name: "command",
       state: "completed",
       detail: "bun test",
+      output: "pass",
+      exitCode: 0,
     });
     expect(events).toContainEqual({ type: "assistant", text: "Fixed the bug." });
     expect(events).toContainEqual({ type: "usage", inputTokens: 120, outputTokens: 30 });
@@ -160,15 +196,18 @@ describe("ClaudeStreamParser", () => {
     expect(events).toContainEqual({ type: "assistant", text: "I will inspect it." });
     expect(events).toContainEqual({
       type: "tool",
+      toolId: "tool-1",
       name: "Bash",
       state: "started",
       detail: '{"command":"bun test"}',
     });
     expect(events).toContainEqual({
       type: "tool",
+      toolId: "tool-1",
       name: "Bash",
       state: "completed",
       detail: "all tests passed",
+      output: "all tests passed",
     });
     expect(events).toContainEqual({
       type: "usage",
@@ -197,7 +236,7 @@ describe("ClaudeStreamParser", () => {
   });
 });
 
-async function fakeProviderBinary(directory: string): Promise<string> {
+async function fakeProviderScript(directory: string): Promise<string> {
   const script = join(directory, "fake-provider.ts");
   await writeFile(
     script,
@@ -251,12 +290,17 @@ async function npmCommandShim(directory: string, target: string): Promise<string
   return shim;
 }
 
+async function fakeProviderBinary(directory: string): Promise<string> {
+  const target = await fakeProviderScript(directory);
+  return process.platform === "win32" ? npmCommandShim(directory, target) : target;
+}
+
 describe("CLI executors", () => {
   test.skipIf(process.platform !== "win32")(
     "launches npm .cmd provider shims without treating arguments as shell input",
     async () => {
       const directory = await temporaryDirectory();
-      const target = await fakeProviderBinary(directory);
+      const target = await fakeProviderScript(directory);
       const binary = await npmCommandShim(directory, target);
       const capture = join(directory, "capture.json");
       const injectedFile = join(directory, "command-injection.txt");
@@ -313,6 +357,8 @@ describe("CLI executors", () => {
 
     const execution = await executor.start(
       makeInput(directory, {
+        phase: "implement",
+        model: "gpt-builder",
         env: {
           AGENTQ_CAPTURE: capture,
           AGENTQ_FAKE_PROVIDER: "codex",
@@ -323,7 +369,7 @@ describe("CLI executors", () => {
     const [events, result] = await Promise.all([collect(execution.events), execution.completion]);
     const invocation = JSON.parse(await Bun.file(capture).text());
 
-    expect(invocation).toEqual({
+    expect(invocation).toMatchObject({
       args: [
         "exec",
         "--json",
@@ -331,13 +377,15 @@ describe("CLI executors", () => {
         directory,
         "--sandbox",
         "workspace-write",
+        "--model",
+        "gpt-builder",
         "--add-dir",
         intake,
         "-",
       ],
       input: "Fix the bug and test it.",
-      cwd: await realpath(directory),
     });
+    expect(await realpath(invocation.cwd)).toBe(await realpath(directory));
     expect(events).toContainEqual({ type: "session", sessionId: "codex-session" });
     expect(events).toContainEqual({
       type: "diagnostic",
@@ -352,6 +400,38 @@ describe("CLI executors", () => {
     });
   });
 
+  test("Codex runs the custom planner read-only with its configured model and no intake", async () => {
+    const directory = await temporaryDirectory();
+    const binary = await fakeProviderBinary(directory);
+    const capture = join(directory, "plan-capture.json");
+    const executor = new CodexExecutor({ binary });
+    const execution = await executor.start(
+      makeInput(directory, {
+        phase: "plan",
+        model: "gpt-planner",
+        env: {
+          AGENTQ_CAPTURE: capture,
+          AGENTQ_FAKE_PROVIDER: "codex",
+          AGENTQ_INTAKE_DIR: join(directory, "must-not-be-exposed"),
+        },
+      }),
+    );
+    await Promise.all([collect(execution.events), execution.completion]);
+
+    const invocation = JSON.parse(await Bun.file(capture).text());
+    expect(invocation.args).toEqual([
+      "exec",
+      "--json",
+      "-C",
+      directory,
+      "--sandbox",
+      "read-only",
+      "--model",
+      "gpt-planner",
+      "-",
+    ]);
+  });
+
   test("Claude resumes with safe autonomous flags and stdin", async () => {
     const directory = await temporaryDirectory();
     const binary = await fakeProviderBinary(directory);
@@ -359,6 +439,8 @@ describe("CLI executors", () => {
     const executor = new ClaudeExecutor({ binary });
     const execution = await executor.start(
       makeInput(directory, {
+        phase: "implement",
+        model: "claude-builder",
         resumeSessionId: "existing-session",
         env: { AGENTQ_CAPTURE: capture, AGENTQ_FAKE_PROVIDER: "claude" },
       }),
@@ -371,8 +453,12 @@ describe("CLI executors", () => {
       "--output-format",
       "stream-json",
       "--verbose",
+      "--model",
+      "claude-builder",
       "--permission-mode",
       "acceptEdits",
+      "--tools",
+      "Bash,Edit,Write,Read,Glob,Grep",
       "--allowedTools",
       "Bash,Edit,Write,Read,Glob,Grep",
       "--resume",
@@ -385,6 +471,35 @@ describe("CLI executors", () => {
       sessionId: "claude-session",
       summary: "Claude done",
     });
+  });
+
+  test("Claude runs a custom planner with only read tools and its configured model", async () => {
+    const directory = await temporaryDirectory();
+    const binary = await fakeProviderBinary(directory);
+    const capture = join(directory, "claude-plan-capture.json");
+    const executor = new ClaudeExecutor({ binary });
+    const execution = await executor.start(
+      makeInput(directory, {
+        phase: "plan",
+        model: "claude-planner",
+        env: { AGENTQ_CAPTURE: capture, AGENTQ_FAKE_PROVIDER: "claude" },
+      }),
+    );
+    await Promise.all([collect(execution.events), execution.completion]);
+
+    const invocation = JSON.parse(await Bun.file(capture).text());
+    expect(invocation.args).toEqual([
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--model",
+      "claude-planner",
+      "--tools",
+      "Read,Glob,Grep",
+      "--allowedTools",
+      "Read,Glob,Grep",
+    ]);
   });
 
   test("fails instead of inventing success when a provider omits its terminal event", async () => {

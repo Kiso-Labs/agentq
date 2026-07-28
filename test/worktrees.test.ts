@@ -1,4 +1,3 @@
-import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,18 +6,27 @@ import type { AgentQPaths, Queue, Task } from "../src/core/types.ts";
 import { runCommand } from "../src/git/command.ts";
 import { withRepoLock } from "../src/git/repo-lock.ts";
 import { WorktreeManager } from "../src/git/worktrees.ts";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "./support/test.ts";
 
 const roots: string[] = [];
 
+// Git worktree setup is noticeably slower on Windows CI. Keep the timeout local
+// to this integration-test file so a healthy Git process is not killed midway.
+setDefaultTimeout(15_000);
+
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await Promise.all(
+    roots
+      .splice(0)
+      .map((root) => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })),
+  );
 });
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "agentq-worktree-"));
   roots.push(root);
   const repo = join(root, "repo");
-  await Bun.$`mkdir -p ${repo}`.quiet();
+  await mkdir(repo, { recursive: true });
   await runCommand("git", ["init", "-b", "main", repo]);
   await writeFile(join(repo, "README.md"), "hello\n");
   await runCommand("git", ["-C", repo, "add", "README.md"]);
@@ -53,15 +61,15 @@ function lockWorker(
 ) {
   return Bun.spawn({
     cmd: [
-      Bun.which("bun") ?? "bun",
-      join(import.meta.dir, "fixtures", "repo-lock-worker.ts"),
+      process.execPath,
+      join(import.meta.dirname, "fixtures", "repo-lock-worker.ts"),
       locksDir,
       repoPath,
       enteredPath,
       releasePath,
       String(staleMs),
     ],
-    cwd: join(import.meta.dir, ".."),
+    cwd: join(import.meta.dirname, ".."),
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -88,13 +96,25 @@ describe("WorktreeManager", () => {
     const queue: Queue = {
       id: "queue_1",
       name: "Bugs",
+      repoKey: repo,
       repoPath: repo,
       baseRef: "main",
       defaultProvider: "codex",
+      planModel: "",
+      planInstructions: "",
+      implementModel: "",
+      implementInstructions: "",
       concurrency: 2,
       maxAttempts: 2,
       verifyCommands: [],
       autoCommit: true,
+      allowedPaths: [],
+      deniedPaths: [],
+      approvalCheckpoints: [],
+      baseDriftPolicy: "replan",
+      landStrategy: "none",
+      autoLand: false,
+      fileConcurrency: "off",
       createdAt: now,
       updatedAt: now,
     };
@@ -104,9 +124,28 @@ describe("WorktreeManager", () => {
       title: "Update greeting",
       instructions: "change it",
       acceptanceCriteria: [],
+      objective: "change it",
+      invariants: [],
+      handoffRequirements: [],
+      blockedBy: [],
+      expectedPaths: [],
+      allowedPaths: [],
+      deniedPaths: [],
+      verifyCommands: [],
+      approvalCheckpoints: [],
+      baseDriftPolicy: "replan",
+      landStrategy: "none",
       provider: "codex",
       priority: 0,
       status: "queued",
+      currentPhase: "queued",
+      deliveryStatus: "not_started",
+      changedFiles: [],
+      verificationResults: [],
+      integrationConflictFiles: [],
+      inputTokens: 0,
+      outputTokens: 0,
+      costUsd: 0,
       sourceKind: "manual",
       attemptCount: 0,
       createdAt: now,
@@ -116,7 +155,13 @@ describe("WorktreeManager", () => {
     const prepared = await manager.prepare(queue, task, 1);
     expect(prepared.worktreePath).not.toBe(repo);
     expect(prepared.branchName).toContain("agentq/bugs/");
+    await expect(
+      manager.assertUnchanged(prepared.worktreePath, prepared.baseSha),
+    ).resolves.toBeUndefined();
     await writeFile(join(prepared.worktreePath, "README.md"), "changed\n");
+    await expect(
+      manager.assertUnchanged(prepared.worktreePath, prepared.baseSha),
+    ).rejects.toMatchObject({ code: "PLANNER_MODIFIED_WORKTREE" });
     const sha = await manager.commitChanges(prepared.worktreePath, task);
     expect(sha).toHaveLength(40);
     expect(await readFile(join(repo, "README.md"), "utf8")).toBe("hello\n");
@@ -131,13 +176,25 @@ describe("WorktreeManager", () => {
     const queue = (id: string, name: string, repoPath: string): Queue => ({
       id,
       name,
+      repoKey: repoPath,
       repoPath,
       baseRef: "main",
       defaultProvider: "codex",
+      planModel: "",
+      planInstructions: "",
+      implementModel: "",
+      implementInstructions: "",
       concurrency: 2,
       maxAttempts: 2,
       verifyCommands: [],
       autoCommit: true,
+      allowedPaths: [],
+      deniedPaths: [],
+      approvalCheckpoints: [],
+      baseDriftPolicy: "replan",
+      landStrategy: "none",
+      autoLand: false,
+      fileConcurrency: "off",
       createdAt: now,
       updatedAt: now,
     });
@@ -147,9 +204,28 @@ describe("WorktreeManager", () => {
       title: id,
       instructions: "",
       acceptanceCriteria: [],
+      objective: id,
+      invariants: [],
+      handoffRequirements: [],
+      blockedBy: [],
+      expectedPaths: [],
+      allowedPaths: [],
+      deniedPaths: [],
+      verifyCommands: [],
+      approvalCheckpoints: [],
+      baseDriftPolicy: "replan",
+      landStrategy: "none",
       provider: "codex",
       priority: 0,
       status: "queued",
+      currentPhase: "queued",
+      deliveryStatus: "not_started",
+      changedFiles: [],
+      verificationResults: [],
+      integrationConflictFiles: [],
+      inputTokens: 0,
+      outputTokens: 0,
+      costUsd: 0,
       sourceKind: "manual",
       attemptCount: 0,
       createdAt: now,
@@ -174,13 +250,25 @@ describe("WorktreeManager", () => {
     const queue: Queue = {
       id: "queue_abcdef123456",
       name: "修复",
+      repoKey: repo,
       repoPath: repo,
       baseRef: "main",
       defaultProvider: "codex",
+      planModel: "",
+      planInstructions: "",
+      implementModel: "",
+      implementInstructions: "",
       concurrency: 1,
       maxAttempts: 1,
       verifyCommands: [],
       autoCommit: true,
+      allowedPaths: [],
+      deniedPaths: [],
+      approvalCheckpoints: [],
+      baseDriftPolicy: "replan",
+      landStrategy: "none",
+      autoLand: false,
+      fileConcurrency: "off",
       createdAt: now,
       updatedAt: now,
     };
@@ -190,9 +278,28 @@ describe("WorktreeManager", () => {
       title: "修复登录",
       instructions: "",
       acceptanceCriteria: [],
+      objective: "修复登录",
+      invariants: [],
+      handoffRequirements: [],
+      blockedBy: [],
+      expectedPaths: [],
+      allowedPaths: [],
+      deniedPaths: [],
+      verifyCommands: [],
+      approvalCheckpoints: [],
+      baseDriftPolicy: "replan",
+      landStrategy: "none",
       provider: "codex",
       priority: 0,
       status: "queued",
+      currentPhase: "queued",
+      deliveryStatus: "not_started",
+      changedFiles: [],
+      verificationResults: [],
+      integrationConflictFiles: [],
+      inputTokens: 0,
+      outputTokens: 0,
+      costUsd: 0,
       sourceKind: "manual",
       attemptCount: 0,
       createdAt: now,
@@ -210,13 +317,25 @@ describe("WorktreeManager", () => {
     const queue: Queue = {
       id: "queue_identity",
       name: "identity",
+      repoKey: repo,
       repoPath: repo,
       baseRef: "main",
       defaultProvider: "codex",
+      planModel: "",
+      planInstructions: "",
+      implementModel: "",
+      implementInstructions: "",
       concurrency: 1,
       maxAttempts: 1,
       verifyCommands: [],
       autoCommit: true,
+      allowedPaths: [],
+      deniedPaths: [],
+      approvalCheckpoints: [],
+      baseDriftPolicy: "replan",
+      landStrategy: "none",
+      autoLand: false,
+      fileConcurrency: "off",
       createdAt: now,
       updatedAt: now,
     };
@@ -226,9 +345,28 @@ describe("WorktreeManager", () => {
       title: "Identity",
       instructions: "",
       acceptanceCriteria: [],
+      objective: "Identity",
+      invariants: [],
+      handoffRequirements: [],
+      blockedBy: [],
+      expectedPaths: [],
+      allowedPaths: [],
+      deniedPaths: [],
+      verifyCommands: [],
+      approvalCheckpoints: [],
+      baseDriftPolicy: "replan",
+      landStrategy: "none",
       provider: "codex",
       priority: 0,
       status: "queued",
+      currentPhase: "queued",
+      deliveryStatus: "not_started",
+      changedFiles: [],
+      verificationResults: [],
+      integrationConflictFiles: [],
+      inputTokens: 0,
+      outputTokens: 0,
+      costUsd: 0,
       sourceKind: "manual",
       attemptCount: 0,
       createdAt: now,

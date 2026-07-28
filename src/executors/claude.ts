@@ -14,6 +14,7 @@ import {
 } from "./stream-parser.ts";
 
 const DEFAULT_ALLOWED_TOOLS = ["Bash", "Edit", "Write", "Read", "Glob", "Grep"];
+const PLANNING_TOOLS = ["Read", "Glob", "Grep"];
 
 export interface ClaudeExecutorOptions extends CliExecutorOptions {
   allowedTools?: string[];
@@ -60,12 +61,14 @@ export class ClaudeStreamParser implements StreamParser {
           const id = asString(block.id);
           const name = asString(block.name) ?? "tool";
           if (id) this.tools.set(id, name);
-          events.push({
+          const toolEvent: Extract<ExecutorEvent, { type: "tool" }> = {
             type: "tool",
             name,
             state: "started",
             detail: compactDetail(block.input),
-          });
+          };
+          if (id) toolEvent.toolId = id;
+          events.push(toolEvent);
         }
       }
       return events;
@@ -77,12 +80,18 @@ export class ClaudeStreamParser implements StreamParser {
         if (block?.type !== "tool_result") continue;
         const toolId = asString(block.tool_use_id);
         const name = (toolId && this.tools.get(toolId)) || "tool";
-        events.push({
+        const detail = compactDetail(block.content);
+        const toolEvent: Extract<ExecutorEvent, { type: "tool" }> = {
           type: "tool",
           name,
           state: block.is_error === true ? "failed" : "completed",
-          detail: compactDetail(block.content),
-        });
+        };
+        if (toolId) toolEvent.toolId = toolId;
+        if (detail) {
+          toolEvent.detail = detail;
+          toolEvent.output = detail;
+        }
+        events.push(toolEvent);
         if (toolId) this.tools.delete(toolId);
       }
       return events;
@@ -149,16 +158,14 @@ export class ClaudeExecutor extends CliExecutor {
   }
 
   protected arguments(input: ExecutorRunInput): string[] {
-    const args = [
-      "-p",
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--permission-mode",
-      "acceptEdits",
-      "--allowedTools",
-      this.allowedTools.join(","),
-    ];
+    const args = ["-p", "--output-format", "stream-json", "--verbose"];
+    const model = input.model?.trim();
+    if (model) args.push("--model", model);
+    const tools = input.phase === "plan" ? PLANNING_TOOLS : this.allowedTools;
+    if (input.phase === "implement") args.push("--permission-mode", "acceptEdits");
+    // --allowedTools controls permission prompts; --tools is what actually
+    // constrains which tools Claude Code can invoke.
+    args.push("--tools", tools.join(","), "--allowedTools", tools.join(","));
     if (input.resumeSessionId) args.push("--resume", input.resumeSessionId);
     return args;
   }

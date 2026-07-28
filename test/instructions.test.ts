@@ -1,8 +1,8 @@
-import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { installIntegration } from "../src/integrations/instructions.ts";
+import { afterEach, expect, test } from "./support/test.ts";
 
 const roots: string[] = [];
 afterEach(async () => {

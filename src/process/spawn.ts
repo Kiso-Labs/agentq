@@ -1,10 +1,11 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, constants, mkdirSync, readFileSync } from "node:fs";
-import { open, unlink } from "node:fs/promises";
+import { link, open, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Readable, Writable } from "node:stream";
+import type { Readable } from "node:stream";
+import { sleep } from "../core/runtime.ts";
 
 export interface SpawnProcessOptions {
   command: string;
@@ -56,15 +57,18 @@ interface IdentityLease {
 }
 
 const IDENTITY_HEARTBEAT_MS = 250;
+const IDENTITY_STARTUP_TIMEOUT_MS = process.platform === "win32" ? 10_000 : 3_000;
 
 const LAUNCHER_SOURCE = String.raw`
-import { chmodSync, closeSync, read, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, ftruncateSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 
 const token = process.argv[1];
 const payload = process.argv[2];
 const identityPath = process.argv[3];
-if (!token || !payload || !identityPath) process.exit(78);
+const gatePath = process.argv[4];
+if (!token || !payload || !identityPath || !gatePath) process.exit(78);
+const supervisorPid = process.ppid;
 
 function processStartMarker(pid) {
   try {
@@ -95,29 +99,72 @@ let launched = false;
 let heartbeat;
 let providerChild;
 let identityFailed = false;
+let windowsIdentityHandle;
 
 if (process.platform !== "win32") {
   // The supervisor signals the whole process group. Keep the launcher alive
-  // long enough to reap the provider and clean its identity lease.
-  process.on("SIGTERM", () => {});
+  // long enough to reap a launched provider, but exit immediately if setup is
+  // cancelled while still waiting at the release gate.
+  process.on("SIGTERM", () => {
+    if (!launched) {
+      cleanup();
+      process.exit(143);
+    }
+  });
 }
 
 function writeIdentity() {
-  const temporary = identityPath + "." + process.pid + ".tmp";
-  writeFileSync(temporary, JSON.stringify({
+  const serialized = JSON.stringify({
     pid: process.pid,
     token,
     startMarker,
     sequence: ++sequence,
     updatedAt: Date.now(),
-  }), { encoding: "utf8", mode: 0o600 });
+  });
+  if (process.platform === "win32") {
+    if (windowsIdentityHandle === undefined) {
+      windowsIdentityHandle = openSync(identityPath, "wx+", 0o600);
+      chmodSync(identityPath, 0o600);
+    }
+    const contents = Buffer.from(serialized, "utf8");
+    ftruncateSync(windowsIdentityHandle, 0);
+    let offset = 0;
+    while (offset < contents.length) {
+      const written = writeSync(
+        windowsIdentityHandle,
+        contents,
+        offset,
+        contents.length - offset,
+        offset,
+      );
+      if (written <= 0) throw new Error("Could not refresh the process identity lease");
+      offset += written;
+    }
+    // Reading the path back detects deletion or replacement while the retained
+    // handle prevents heartbeat updates from reopening an attacker-controlled path.
+    if (readFileSync(identityPath, "utf8") !== serialized) {
+      throw new Error("Process identity lease path changed during refresh");
+    }
+    return;
+  }
+  const temporary = identityPath + "." + process.pid + ".tmp";
+  writeFileSync(temporary, serialized, { encoding: "utf8", mode: 0o600 });
   chmodSync(temporary, 0o600);
   renameSync(temporary, identityPath);
 }
 
 function cleanup() {
   if (heartbeat) clearInterval(heartbeat);
-  try { unlinkSync(identityPath); } catch {}
+  if (windowsIdentityHandle !== undefined) {
+    try { closeSync(windowsIdentityHandle); } catch {}
+    windowsIdentityHandle = undefined;
+  }
+  // The supervisor verifies ownership before removing a Windows lease. Avoid
+  // unlinking a pathname here after a detected delete/replace race.
+  if (process.platform !== "win32") {
+    try { unlinkSync(identityPath); } catch {}
+  }
+  try { unlinkSync(gatePath); } catch {}
 }
 
 function failBeforeLaunch(error) {
@@ -127,11 +174,20 @@ function failBeforeLaunch(error) {
   identityFailed = true;
   if (process.platform === "win32") {
     const killer = spawn("taskkill", ["/PID", String(process.pid), "/T", "/F"], {
-      detached: true,
+      detached: false,
       stdio: "ignore",
       windowsHide: true,
     });
-    killer.unref();
+    let exiting = false;
+    const forceExit = () => {
+      if (exiting) return;
+      exiting = true;
+      try { providerChild?.kill("SIGKILL"); } catch {}
+      process.exit(79);
+    };
+    killer.once("error", forceExit);
+    killer.once("close", forceExit);
+    setTimeout(forceExit, 1000);
     return;
   }
   try { process.kill(-process.pid, "SIGTERM"); }
@@ -145,18 +201,17 @@ function failBeforeLaunch(error) {
 try {
   writeIdentity();
   heartbeat = setInterval(() => {
+    if (process.platform === "win32" && process.ppid !== supervisorPid) {
+      failBeforeLaunch(new Error("Supervisor exited while the provider was running"));
+      return;
+    }
     try { writeIdentity(); } catch (error) { failBeforeLaunch(error); }
   }, ${IDENTITY_HEARTBEAT_MS});
-  writeSync(4, JSON.stringify({ startMarker }) + "\n");
-  closeSync(4);
 } catch (error) {
   failBeforeLaunch(error);
 }
 
-const gate = Buffer.alloc(1);
-read(3, gate, 0, 1, null, (error, bytesRead) => {
-  try { closeSync(3); } catch {}
-  if (error || bytesRead !== 1 || gate[0] !== 0x47) return failBeforeLaunch(error);
+function launchProvider() {
   launched = true;
 
   let invocation;
@@ -170,7 +225,7 @@ read(3, gate, 0, 1, null, (error, bytesRead) => {
   if (process.platform !== "win32") {
     if (heartbeat) clearInterval(heartbeat);
     const sidecarSource = [
-      'import { chmodSync, closeSync, renameSync, writeFileSync, writeSync } from "node:fs";',
+      'import { chmodSync, renameSync, writeFileSync } from "node:fs";',
       'const targetPid = Number(process.argv[1]);',
       'const token = process.argv[2];',
       'const startMarker = process.argv[3];',
@@ -184,39 +239,47 @@ read(3, gate, 0, 1, null, (error, bytesRead) => {
       '  renameSync(temporary, identityPath);',
       '}',
       'beat();',
-      'writeSync(3, Buffer.from([0x52]));',
-      'closeSync(3);',
-      'setInterval(() => { try { beat(); } catch { process.exit(79); } }, ${IDENTITY_HEARTBEAT_MS});',
+      'setInterval(() => {',
+      '  try { beat(); }',
+      '  catch {',
+      '    try { process.kill(-targetPid, "SIGKILL"); }',
+      '    catch { try { process.kill(targetPid, "SIGKILL"); } catch {} }',
+      '    process.exit(79);',
+      '  }',
+      '}, ${IDENTITY_HEARTBEAT_MS});',
     ].join("\n");
     const sidecar = spawn(process.execPath, ["-e", sidecarSource, String(process.pid), token, startMarker, identityPath, String(sequence)], {
       detached: false,
-      stdio: ["ignore", "ignore", "ignore", "pipe"],
+      stdio: "ignore",
       windowsHide: true,
     });
     sidecar.unref();
-    const ready = sidecar.stdio[3];
-    let sidecarReady = false;
-    const execProvider = (chunk) => {
-      if (sidecarReady) return;
-      sidecarReady = true;
-      if (!chunk || chunk[0] !== 0x52) {
-        return failBeforeLaunch(new Error("Process identity sidecar failed to start"));
+    const sidecarDeadline = Date.now() + 3000;
+    let sidecarFailed;
+    sidecar.once("error", (error) => { sidecarFailed = error; });
+    const execWhenSidecarReady = () => {
+      if (sidecarFailed || sidecar.exitCode !== null) {
+        return failBeforeLaunch(sidecarFailed ?? new Error("Process identity sidecar exited before startup"));
       }
       try {
-        process.execve(invocation.command, [invocation.command, ...invocation.args], process.env);
-      } catch (execError) {
-        console.error(execError instanceof Error ? execError.message : String(execError));
-        cleanup();
-        return process.exit(127);
+        const lease = JSON.parse(readFileSync(identityPath, "utf8"));
+        if (lease.pid === process.pid && lease.token === token && lease.startMarker === startMarker && lease.sequence > sequence) {
+          try {
+            process.execve(invocation.command, [invocation.command, ...invocation.args], process.env);
+          } catch (execError) {
+            console.error(execError instanceof Error ? execError.message : String(execError));
+            cleanup();
+            return process.exit(127);
+          }
+          return;
+        }
+      } catch {}
+      if (Date.now() >= sidecarDeadline) {
+        return failBeforeLaunch(new Error("Process identity sidecar failed to establish its lease"));
       }
+      setTimeout(execWhenSidecarReady, 10);
     };
-    ready.once("data", execProvider);
-    ready.once("error", failBeforeLaunch);
-    ready.once("end", () => {
-      if (!sidecarReady) {
-        failBeforeLaunch(new Error("Process identity sidecar closed before startup"));
-      }
-    });
+    execWhenSidecarReady();
     return;
   }
 
@@ -241,7 +304,24 @@ read(3, gate, 0, 1, null, (error, bytesRead) => {
   process.stdin.on("error", () => {});
   child.stdin.on("error", () => {});
   process.stdin.pipe(child.stdin);
-});
+}
+
+function waitForRelease() {
+  if (process.ppid !== supervisorPid) {
+    return failBeforeLaunch(new Error("Supervisor exited before releasing the provider"));
+  }
+  try {
+    const gate = readFileSync(gatePath, "utf8");
+    if (gate !== token) return failBeforeLaunch(new Error("Provider release gate is invalid"));
+    try { unlinkSync(gatePath); } catch {}
+    return launchProvider();
+  } catch (error) {
+    if (error?.code !== "ENOENT") return failBeforeLaunch(error);
+  }
+  setTimeout(waitForRelease, 10);
+}
+
+waitForRelease();
 `;
 
 function errorWithCode(error: unknown): error is Error & { code?: string } {
@@ -295,54 +375,56 @@ function sendPosixGroupSignal(pid: number, signal: NodeJS.Signals): void {
   }
 }
 
-function readLauncherIdentity(
-  stream: Readable,
+async function waitForLauncherIdentity(
   pid: number,
   token: string,
   path: string,
 ): Promise<ProcessIdentity> {
-  return new Promise((resolve, reject) => {
-    let value = "";
-    let settled = false;
-    const finish = (error?: Error, identity?: ProcessIdentity) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      stream.removeAllListeners();
-      if (error) reject(error);
-      else if (identity) resolve(identity);
-    };
-    const timer = setTimeout(
-      () => finish(new Error(`Timed out establishing process identity for PID ${pid}`)),
-      3_000,
-    );
-    stream.setEncoding("utf8");
-    stream.on("data", (chunk: string) => {
-      value += chunk;
-      if (value.length > 4_096) {
-        finish(new Error(`Invalid process identity response for PID ${pid}`));
-        return;
+  // A cold PowerShell startup is needed to establish a Windows process start
+  // marker and can exceed three seconds on otherwise healthy CI/user machines.
+  const deadline = Date.now() + IDENTITY_STARTUP_TIMEOUT_MS;
+  for (;;) {
+    const lease = await readIdentityLease(path);
+    if (
+      lease &&
+      lease.pid === pid &&
+      lease.token === token &&
+      lease.startMarker &&
+      isProcessAlive(pid)
+    ) {
+      const actualStartMarker = processStartMarker(pid);
+      if (actualStartMarker && actualStartMarker !== lease.startMarker) {
+        throw new Error(`Process identity marker does not match PID ${pid}`);
       }
-      const newline = value.indexOf("\n");
-      if (newline < 0) return;
-      try {
-        const parsed = JSON.parse(value.slice(0, newline)) as { startMarker?: unknown };
-        if (typeof parsed.startMarker !== "string" || !parsed.startMarker) {
-          throw new Error("invalid identity fields");
-        }
-        finish(undefined, { pid, token, path, startMarker: parsed.startMarker });
-      } catch {
-        finish(new Error(`Invalid process identity response for PID ${pid}`));
-      }
-    });
-    stream.once("error", (error) => finish(error));
-    stream.once("end", () => {
-      if (!settled) finish(new Error(`Process identity stream closed for PID ${pid}`));
-    });
-  });
+      return { pid, token, path, startMarker: lease.startMarker };
+    }
+    if (!isProcessAlive(pid)) {
+      throw new Error(`Gated process ${pid} exited before establishing its identity`);
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out establishing process identity for PID ${pid}`);
+    }
+    await sleep(10);
+  }
 }
 
-async function readIdentityLease(path: string): Promise<IdentityLease | undefined> {
+async function writeReleaseGate(path: string, token: string): Promise<void> {
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  const handle = await open(temporary, "wx", 0o600);
+  try {
+    await handle.writeFile(token, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await link(temporary, path);
+  } finally {
+    await unlink(temporary).catch(() => undefined);
+  }
+}
+
+async function readIdentityLeaseOnce(path: string): Promise<IdentityLease | undefined> {
   const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
@@ -367,12 +449,40 @@ async function readIdentityLease(path: string): Promise<IdentityLease | undefine
   }
 }
 
+async function readIdentityLease(path: string): Promise<IdentityLease | undefined> {
+  const attempts = process.platform === "win32" ? 4 : 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const lease = await readIdentityLeaseOnce(path);
+    if (lease) return lease;
+    if (attempt + 1 < attempts) await sleep(5);
+  }
+  return undefined;
+}
+
 function leaseMatches(lease: IdentityLease, identity: ProcessIdentity): boolean {
   return (
     lease.pid === identity.pid &&
     lease.token === identity.token &&
     lease.startMarker === identity.startMarker
   );
+}
+
+async function unlinkOwnedIdentityLease(
+  path: string,
+  pid: number,
+  token: string,
+  startMarker?: string,
+): Promise<void> {
+  const lease = await readIdentityLease(path);
+  if (
+    !lease ||
+    lease.pid !== pid ||
+    lease.token !== token ||
+    (startMarker !== undefined && lease.startMarker !== startMarker)
+  ) {
+    return;
+  }
+  await unlink(path).catch(() => undefined);
 }
 
 export async function matchesProcessIdentity(identity: ProcessIdentity): Promise<boolean> {
@@ -428,7 +538,7 @@ export async function inspectProcessIdentity(
   if (!actualStartMarker && !identity.startMarker.startsWith("lease:")) return "unverifiable";
   const first = await readIdentityLease(identity.path);
   if (!first || !leaseMatches(first, identity)) return "unverifiable";
-  await Bun.sleep(IDENTITY_HEARTBEAT_MS + 75);
+  await sleep(IDENTITY_HEARTBEAT_MS + 75);
   if (!isProcessAlive(identity.pid)) return "dead";
   const second = await readIdentityLease(identity.path);
   return second && leaseMatches(second, identity) && second.sequence > first.sequence
@@ -451,7 +561,14 @@ export async function terminateProcessTree(
   if (process.platform === "win32") {
     await runTaskkill(pid);
     if (isProcessAlive(pid)) throw new Error(`Process tree ${pid} survived taskkill`);
-    if (expectedIdentity) await unlink(expectedIdentity.path).catch(() => undefined);
+    if (expectedIdentity) {
+      await unlinkOwnedIdentityLease(
+        expectedIdentity.path,
+        expectedIdentity.pid,
+        expectedIdentity.token,
+        expectedIdentity.startMarker,
+      );
+    }
     return;
   }
 
@@ -460,16 +577,23 @@ export async function terminateProcessTree(
   // termination signal can run before escalation.
   sendPosixGroupSignal(pid, "SIGCONT");
   const deadline = Date.now() + Math.max(0, graceMs);
-  while (isProcessGroupAlive(pid) && Date.now() < deadline) await Bun.sleep(50);
+  while (isProcessGroupAlive(pid) && Date.now() < deadline) await sleep(50);
   if (isProcessGroupAlive(pid)) {
     sendPosixGroupSignal(pid, "SIGKILL");
     const killDeadline = Date.now() + 2_000;
-    while (isProcessGroupAlive(pid) && Date.now() < killDeadline) await Bun.sleep(25);
+    while (isProcessGroupAlive(pid) && Date.now() < killDeadline) await sleep(25);
   }
   if (isProcessGroupAlive(pid)) {
     throw new Error(`Process group ${pid} survived SIGKILL`);
   }
-  if (expectedIdentity) await unlink(expectedIdentity.path).catch(() => undefined);
+  if (expectedIdentity) {
+    await unlinkOwnedIdentityLease(
+      expectedIdentity.path,
+      expectedIdentity.pid,
+      expectedIdentity.token,
+      expectedIdentity.startMarker,
+    );
+  }
 }
 
 /** Spawn an argv-safe child in its own POSIX process group. */
@@ -483,6 +607,7 @@ export function spawnProcess(options: SpawnProcessOptions): ManagedProcess {
     if (process.platform !== "win32") chmodSync(identityDirectory, 0o700);
   }
   const identityPath = token ? join(identityDirectory, `${token}.json`) : undefined;
+  const gatePath = token ? join(identityDirectory, `${token}.gate`) : undefined;
   const payload = gated
     ? Buffer.from(
         JSON.stringify({ command: options.command, args: [...(options.args ?? [])] }),
@@ -492,14 +617,21 @@ export function spawnProcess(options: SpawnProcessOptions): ManagedProcess {
   const child = spawn(
     gated ? process.execPath : options.command,
     gated
-      ? ["-e", LAUNCHER_SOURCE, token as string, payload as string, identityPath as string]
+      ? [
+          "-e",
+          LAUNCHER_SOURCE,
+          token as string,
+          payload as string,
+          identityPath as string,
+          gatePath as string,
+        ]
       : [...(options.args ?? [])],
     {
       cwd: options.cwd,
       env: options.env,
       detached: process.platform !== "win32",
       shell: false,
-      stdio: gated ? ["pipe", "pipe", "pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     },
   );
@@ -510,8 +642,6 @@ export function spawnProcess(options: SpawnProcessOptions): ManagedProcess {
     throw new Error(`Unable to start process: ${options.command}`);
   }
   const processId: number = pid;
-  const control = gated ? (child.stdio[3] as Writable | null) : undefined;
-  const identityStream = gated ? (child.stdio[4] as Readable | null) : undefined;
 
   let settled = false;
   let leaderClosed = false;
@@ -534,7 +664,10 @@ export function spawnProcess(options: SpawnProcessOptions): ManagedProcess {
             spawnError ??= error instanceof Error ? error : new Error(String(error));
           }
         }
-        if (identityPath) await unlink(identityPath).catch(() => undefined);
+        if (identityPath && token) {
+          await unlinkOwnedIdentityLease(identityPath, processId, token);
+        }
+        if (gatePath) await unlink(gatePath).catch(() => undefined);
         settled = true;
         options.signal?.removeEventListener("abort", abort);
         resolveCompletion({ exitCode, signal, error: spawnError, cancelled });
@@ -543,14 +676,11 @@ export function spawnProcess(options: SpawnProcessOptions): ManagedProcess {
   });
 
   const identity =
-    token && identityStream && identityPath
-      ? readLauncherIdentity(identityStream, processId, token, identityPath)
-      : undefined;
+    token && identityPath ? waitForLauncherIdentity(processId, token, identityPath) : undefined;
 
   async function terminate(): Promise<void> {
     if (settled) return;
     if (leaderClosed) return await completion.then(() => undefined);
-    control?.destroy();
     await terminateProcessTree(processId, options.cancelGraceMs ?? 1_000);
     if (!settled && process.platform === "win32") child.kill("SIGKILL");
     await completion;
@@ -575,12 +705,14 @@ export function spawnProcess(options: SpawnProcessOptions): ManagedProcess {
   async function release(): Promise<void> {
     if (released) return;
     options.signal?.throwIfAborted();
-    if (settled || !control) throw new Error(`Gated process ${processId} exited before release`);
-    await new Promise<void>((resolve, reject) => {
-      control.end(Buffer.from([0x47]), (error?: Error | null) =>
-        error ? reject(error) : resolve(),
-      );
-    });
+    if (settled || !gatePath || !token) {
+      throw new Error(`Gated process ${processId} exited before release`);
+    }
+    await writeReleaseGate(gatePath, token);
+    if (settled) {
+      await unlink(gatePath).catch(() => undefined);
+      throw new Error(`Gated process ${processId} exited before release`);
+    }
     released = true;
     child.stdin?.end(options.stdin ?? "");
   }

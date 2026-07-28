@@ -1,0 +1,6 @@
+# Keep formatter and test input identical on every development and CI platform.
+* text=auto eol=lf
+
+# Preserve the native line ending for Windows command scripts.
+*.bat text eol=crlf
+*.cmd text eol=crlf

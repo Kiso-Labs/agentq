@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, test } from "bun:test";
 import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentQApp } from "../src/app.ts";
 import type { AgentQPaths } from "../src/core/types.ts";
+import { runCommand } from "../src/git/command.ts";
 import { DelegatedTaskIntake, submitDelegatedTask } from "../src/intake/delegated-tasks.ts";
+import { afterEach, describe, expect, test } from "./support/test.ts";
 
 const roots: string[] = [];
 
@@ -24,9 +25,31 @@ async function setup() {
     locksDir: join(stateDir, "locks"),
   };
   const app = await AgentQApp.create(paths);
-  const queue = app.store.createQueue({ name: "intake", repoPath: join(root, "repo") });
+  const repoPath = join(root, "repo");
+  await mkdir(repoPath, { recursive: true });
+  await git(repoPath, "init", "--initial-branch=main");
+  await writeFile(join(repoPath, "README.md"), "# Intake fixture\n");
+  await git(repoPath, "add", "--all");
+  await git(
+    repoPath,
+    "-c",
+    "user.name=AgentQ Intake Tests",
+    "-c",
+    "user.email=agentq-intake@example.invalid",
+    "commit",
+    "-m",
+    "Initial fixture",
+  );
+  const queue = await app.createQueue({ name: "intake", repoPath, baseRef: "main" });
   const parent = app.store.addTask({ queue: queue.id, title: "Parent" });
   return { app, parent, queue, stateDir };
+}
+
+async function git(cwd: string, ...args: string[]): Promise<void> {
+  const result = await runCommand("git", args, { cwd });
+  if (result.exitCode !== 0) {
+    throw new Error(result.stderr.trim() || result.stdout.trim() || `git ${args[0]} failed`);
+  }
 }
 
 async function waitUntil(predicate: () => Promise<boolean>): Promise<void> {
@@ -157,6 +180,25 @@ describe.skipIf(process.platform === "win32")("DelegatedTaskIntake", () => {
 
     await intake.cleanup(runId);
     expect(await Bun.file(join(directory, "unknown-0000")).exists()).toBe(true);
+    app.close();
+  });
+
+  test("serializes cleanup with concurrent supervisor drains", async () => {
+    const { app, parent, queue } = await setup();
+    const intake = new DelegatedTaskIntake(app);
+    const runId = "run_cleanup_race";
+    const directory = await intake.register(runId, queue.id, parent.id);
+    for (let index = 0; index < 256; index += 1) {
+      await writeFile(
+        join(directory, `response-${index.toString(16).padStart(32, "0")}.json`),
+        "{}",
+      );
+    }
+
+    await expect(
+      Promise.all([intake.drain(), intake.cleanup(runId), intake.drain()]),
+    ).resolves.toHaveLength(3);
+    expect(await exists(directory)).toBe(false);
     app.close();
   });
 });

@@ -60,7 +60,7 @@ export abstract class CliExecutor implements AgentExecutor {
       name: this.binaryName,
       envVar: this.binaryEnvironmentVariable,
       env: environment,
-      from: import.meta.dir,
+      from: import.meta.dirname,
     });
   }
 

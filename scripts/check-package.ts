@@ -1,6 +1,8 @@
+import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveBinary, resolveNpmCommandInvocation } from "../src/process/resolve-binary.ts";
 
 interface PackResult {
   files?: { path?: string }[];
@@ -8,17 +10,34 @@ interface PackResult {
 
 const cache = await mkdtemp(join(tmpdir(), "agentq-npm-cache-"));
 try {
-  const child = Bun.spawn(["npm", "pack", "--json", "--dry-run", "--ignore-scripts"], {
-    cwd: join(import.meta.dir, ".."),
-    env: { ...process.env, npm_config_cache: cache },
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-    child.exited,
+  const npm = resolveBinary({ name: "npm", envVar: "AGENTQ_NPM_BIN", from: import.meta.dirname });
+  if (!npm) throw new Error("npm is required to verify the package contents");
+  const invocation = resolveNpmCommandInvocation(npm, [
+    "pack",
+    "--json",
+    "--dry-run",
+    "--ignore-scripts",
   ]);
+  const child = spawn(invocation.command, invocation.args, {
+    cwd: join(import.meta.dirname, ".."),
+    env: { ...process.env, npm_config_cache: cache },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  const exitCode = await new Promise<number>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => resolve(code ?? 1));
+  });
   if (exitCode !== 0) throw new Error(stderr || stdout || `npm pack exited ${exitCode}`);
   const result = (JSON.parse(stdout) as PackResult[])[0];
   const files = new Set(result?.files?.flatMap((file) => (file.path ? [file.path] : [])) ?? []);
