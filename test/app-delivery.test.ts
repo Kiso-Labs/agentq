@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentQApp } from "../src/app.ts";
 import type { AgentQPaths, Queue, Task } from "../src/core/types.ts";
 import { runCommand } from "../src/git/command.ts";
+import { afterEach, describe, expect, test } from "./support/test.ts";
 
 interface DeliveryFixture {
   root: string;

@@ -1,8 +1,9 @@
-import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { AgentQError } from "../core/errors.ts";
+import { sleep } from "../core/runtime.ts";
+import { Database, sqliteBusy } from "../store/sqlite.ts";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_STALE_MS = 120_000;
@@ -33,11 +34,6 @@ function secureMode(path: string, mode: number): void {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-}
-
-function sqliteBusy(error: unknown): boolean {
-  const code = (error as { code?: unknown }).code;
-  return typeof code === "string" && code.startsWith("SQLITE_BUSY");
 }
 
 /**
@@ -96,7 +92,7 @@ export async function withRepoLock<T>(
             "REPO_LOCK_TIMEOUT",
           );
         }
-        await Bun.sleep(10);
+        await sleep(10);
       }
     }
 

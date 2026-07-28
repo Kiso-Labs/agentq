@@ -57,7 +57,7 @@ Turn agentq from a parallel branch producer into a durable engineering workflow 
 - **Context:** `Supervisor.finalizeSuccessfulOrFailed`, `WorktreeManager.verify`, prompts, run events.
 - **Instructions:** Evaluate changed files against the immutable snapshot before commit; run queue gates plus task gates; persist each result; only mark verified after all gates pass; policy violations are permanent; test regressions resume implementation; stale bases replan/rebase; dependency waits spend no attempt.
 - **Expansion:** Add a reusable policy evaluator and precise failure messages with offending paths.
-- **Reuse check:** Before implementing glob matching, compare a small maintained matcher with Bun/standard ecosystem APIs; adopt a dependency only if packaging remains simple.
+- **Reuse check:** Before implementing glob matching, compare a small maintained matcher with Node.js/standard ecosystem APIs; adopt a dependency only if packaging remains simple.
 - **Acceptance:** Denied/out-of-scope/excess-file changes fail before commit; no gate can be skipped; clean-tree is proven after auto-commit; retry disposition matches failure class.
 - **Validation:** Policy unit vectors plus supervisor integration tests with real changed files and commands.
 - **Dependencies:** T1; can proceed alongside T2 after snapshot types stabilize.
@@ -107,7 +107,7 @@ Turn agentq from a parallel branch producer into a durable engineering workflow 
 - **Context:** All previous subtasks, `docs/architecture.md`, `docs/security.md`, `.github/workflows/ci.yml`.
 - **Instructions:** Audit deletion/integration crash windows, Git ref scope, shell-free command construction, glob/path traversal, dependency cycles, lease recovery, and JSON compatibility.
 - **Acceptance:** Full local gate and all three CI jobs green; no unresolved P0/P1 review findings; README example from the request works end-to-end.
-- **Validation:** `bun run check`, packed CLI smoke tests, real repository demo, CI.
+- **Validation:** `npm run check`, packed CLI smoke tests, real repository demo, CI.
 - **Dependencies:** T1–T6.
 - **Handoff:** Production-ready branch and PR evidence.
 

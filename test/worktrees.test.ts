@@ -1,4 +1,3 @@
-import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,6 +6,7 @@ import type { AgentQPaths, Queue, Task } from "../src/core/types.ts";
 import { runCommand } from "../src/git/command.ts";
 import { withRepoLock } from "../src/git/repo-lock.ts";
 import { WorktreeManager } from "../src/git/worktrees.ts";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "./support/test.ts";
 
 const roots: string[] = [];
 
@@ -26,7 +26,7 @@ async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "agentq-worktree-"));
   roots.push(root);
   const repo = join(root, "repo");
-  await Bun.$`mkdir -p ${repo}`.quiet();
+  await mkdir(repo, { recursive: true });
   await runCommand("git", ["init", "-b", "main", repo]);
   await writeFile(join(repo, "README.md"), "hello\n");
   await runCommand("git", ["-C", repo, "add", "README.md"]);
@@ -61,15 +61,15 @@ function lockWorker(
 ) {
   return Bun.spawn({
     cmd: [
-      Bun.which("bun") ?? "bun",
-      join(import.meta.dir, "fixtures", "repo-lock-worker.ts"),
+      process.execPath,
+      join(import.meta.dirname, "fixtures", "repo-lock-worker.ts"),
       locksDir,
       repoPath,
       enteredPath,
       releasePath,
       String(staleMs),
     ],
-    cwd: join(import.meta.dir, ".."),
+    cwd: join(import.meta.dirname, ".."),
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",

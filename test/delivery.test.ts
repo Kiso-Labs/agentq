@@ -1,4 +1,3 @@
-import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import {
   chmod,
   mkdtemp,
@@ -22,6 +21,7 @@ import {
   resolveCommit,
   snapshotChangedFiles,
 } from "../src/git/delivery.ts";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "./support/test.ts";
 
 const roots: string[] = [];
 

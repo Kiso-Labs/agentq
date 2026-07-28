@@ -1,6 +1,6 @@
-import { describe, expect, test } from "bun:test";
 import type { TaskEvent } from "../src/core/types.ts";
 import { activityEntries } from "../src/ui/activity.ts";
+import { describe, expect, test } from "./support/test.ts";
 
 const event = (
   id: number,

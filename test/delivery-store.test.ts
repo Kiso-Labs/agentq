@@ -1,10 +1,10 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentQError } from "../src/core/errors.ts";
 import type { Queue, Task, TaskArtifact } from "../src/core/types.ts";
 import { AgentQStore } from "../src/store/index.ts";
+import { afterEach, beforeEach, describe, expect, test } from "./support/test.ts";
 
 const BASE_SHA = "1".repeat(40);
 

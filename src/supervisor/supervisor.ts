@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { AgentQApp } from "../app.ts";
 import { AgentQError, errorMessage } from "../core/errors.ts";
 import { buildImplementationPrompt, buildPlanningPrompt } from "../core/prompt.ts";
+import { sleep } from "../core/runtime.ts";
 import { evaluateScopePolicy, resolveEffectiveScopePolicy } from "../core/scope-policy.ts";
 import type {
   ExecutionPhase,
@@ -198,7 +199,7 @@ export class Supervisor {
 
         if (options.once && !claimed && !delivered && this.active.size === 0) break;
         await Promise.race([
-          Bun.sleep(pollIntervalMs),
+          sleep(pollIntervalMs),
           ...[...this.active.values()].map(({ promise }) => promise),
         ]);
       }

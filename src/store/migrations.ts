@@ -1,7 +1,6 @@
-import type { Database } from "bun:sqlite";
 import { AgentQError } from "../core/errors.ts";
 import { isoNow } from "../core/paths.ts";
-import { selectOne } from "./sqlite.ts";
+import { type Database, selectOne } from "./sqlite.ts";
 
 interface Migration {
   version: number;

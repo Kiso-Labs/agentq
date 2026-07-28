@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentQStore } from "../src/store/index.ts";
+import { afterEach, describe, expect, test } from "./support/test.ts";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -13,7 +13,7 @@ afterEach(async () => {
   );
 });
 
-const projectRoot = join(import.meta.dir, "..");
+const projectRoot = join(import.meta.dirname, "..");
 const cliEntry = join(projectRoot, "src", "cli.tsx");
 
 async function cli(
@@ -22,9 +22,9 @@ async function cli(
   stdin?: string,
   cwd = projectRoot,
   env: NodeJS.ProcessEnv = {},
-) {
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const process = Bun.spawn({
-    cmd: [Bun.which("bun") ?? "bun", cliEntry, "--state-dir", stateDir, ...args],
+    cmd: [globalThis.process.execPath, cliEntry, "--state-dir", stateDir, ...args],
     cwd,
     stdin: stdin === undefined ? "ignore" : new Blob([stdin]),
     stdout: "pipe",
@@ -69,7 +69,7 @@ async function repository(prefix: string): Promise<string> {
 }
 
 async function executable(path: string, body: string): Promise<void> {
-  await writeFile(path, `#!/usr/bin/env bun\n${body}`);
+  await writeFile(path, `#!/usr/bin/env node\n${body}`);
   await chmod(path, 0o755);
 }
 
@@ -77,7 +77,7 @@ describe("agentq CLI", () => {
   test("creates a queue and accepts idempotent JSON tasks", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-"));
     roots.push(stateDir);
-    const repository = join(import.meta.dir, "..");
+    const repository = join(import.meta.dirname, "..");
     const created = await cli(stateDir, [
       "queue",
       "create",
@@ -255,7 +255,7 @@ describe("agentq CLI", () => {
   test("accepts the documented --title form for manual tasks", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-title-"));
     roots.push(stateDir);
-    const repository = join(import.meta.dir, "..");
+    const repository = join(import.meta.dirname, "..");
     await cli(stateDir, ["queue", "create", "docs", "--repo", repository, "--json"]);
 
     const result = await cli(stateDir, [
@@ -352,7 +352,7 @@ describe("agentq CLI", () => {
   test("returns JSON for automation mutations and sanitizes only human output", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "agentq-cli-mutations-"));
     roots.push(stateDir);
-    const repository = join(import.meta.dir, "..");
+    const repository = join(import.meta.dirname, "..");
     await cli(stateDir, ["queue", "create", "work", "--repo", repository, "--json"]);
     await cli(stateDir, ["queue", "create", "empty", "--repo", repository, "--json"]);
 

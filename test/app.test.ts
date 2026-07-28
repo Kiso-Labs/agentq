@@ -1,4 +1,3 @@
-import { afterEach, describe, expect, test } from "bun:test";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +6,7 @@ import type { AgentQError } from "../src/core/errors.ts";
 import type { AgentQPaths, Queue, Task } from "../src/core/types.ts";
 import { runCommand } from "../src/git/command.ts";
 import { resolveRepositoryContext } from "../src/git/repository.ts";
+import { afterEach, describe, expect, test } from "./support/test.ts";
 
 interface Fixture {
   root: string;

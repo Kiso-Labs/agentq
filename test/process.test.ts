@@ -1,4 +1,3 @@
-import { afterEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,6 +12,7 @@ import {
   resolveNpmCommandInvocation,
   spawnProcess,
 } from "../src/process/index.ts";
+import { afterEach, describe, expect, test } from "./support/test.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -68,7 +68,7 @@ describe("BoundedAsyncQueue", () => {
       for await (const _value of queue) {
         // The failure is raised by the iterator.
       }
-    }).toThrow("stream failed");
+    }).rejects.toThrow("stream failed");
   });
 });
 
@@ -231,11 +231,12 @@ describe("resolveBinary", () => {
 describe("spawnProcess", () => {
   test("preserves argument boundaries, streams output, and closes stdin", async () => {
     const directory = await temporaryDirectory();
-    const script = join(directory, "child.ts");
+    const script = join(directory, "child.mts");
     await writeFile(
       script,
       [
-        "const input = await Bun.stdin.text();",
+        'let input = "";',
+        "for await (const chunk of process.stdin) input += chunk;",
         "console.log(JSON.stringify({ args: process.argv.slice(2), input }));",
         'console.error("diagnostic");',
       ].join("\n"),
@@ -264,7 +265,6 @@ describe("spawnProcess", () => {
       stderrPromise,
       child.completion,
     ]);
-
     expect(JSON.parse(stdout[0] ?? "{}")).toEqual({
       args: ["one argument", "two"],
       input: "hello",
@@ -276,8 +276,11 @@ describe("spawnProcess", () => {
   test("gates provider startup behind a live, unforgeable process identity", async () => {
     const directory = await temporaryDirectory();
     const sentinel = join(directory, "started.txt");
-    const script = join(directory, "gated.ts");
-    await writeFile(script, `await Bun.write(${JSON.stringify(sentinel)}, "started");\n`);
+    const script = join(directory, "gated.mts");
+    await writeFile(
+      script,
+      `import { writeFile } from "node:fs/promises"; await writeFile(${JSON.stringify(sentinel)}, "started");\n`,
+    );
 
     const child = spawnProcess({
       command: process.execPath,
@@ -308,8 +311,11 @@ describe("spawnProcess", () => {
 
   test("publishes concurrent provider release gates only after their tokens are complete", async () => {
     const directory = await temporaryDirectory();
-    const script = join(directory, "released.ts");
-    await writeFile(script, `await Bun.write(process.argv[2], "released");\n`);
+    const script = join(directory, "released.mts");
+    await writeFile(
+      script,
+      'import { writeFile } from "node:fs/promises"; await writeFile(process.argv[2], "released");\n',
+    );
     const sentinels = Array.from({ length: 8 }, (_, index) =>
       join(directory, `released-${index}.txt`),
     );
@@ -351,10 +357,13 @@ describe("spawnProcess", () => {
       const directory = await temporaryDirectory();
       const identities = join(directory, "identities");
       const pidFile = join(directory, "provider.pid");
-      const script = join(directory, "identity-failure.ts");
+      const script = join(directory, "identity-failure.mts");
       await writeFile(
         script,
-        `await Bun.write(${JSON.stringify(pidFile)}, String(process.pid)); await Bun.sleep(30_000);\n`,
+        `import { writeFile } from "node:fs/promises";
+         import { setTimeout as wait } from "node:timers/promises";
+         await writeFile(${JSON.stringify(pidFile)}, String(process.pid));
+         await wait(30_000);\n`,
       );
 
       const child = spawnProcess({

@@ -1,6 +1,6 @@
-import { describe, expect, test } from "bun:test";
 import { buildImplementationPrompt, buildPlanningPrompt } from "../src/core/prompt.ts";
 import type { Queue, Task } from "../src/core/types.ts";
+import { describe, expect, test } from "./support/test.ts";
 
 const now = "2026-07-22T12:00:00.000Z";
 

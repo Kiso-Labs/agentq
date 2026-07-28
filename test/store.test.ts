@@ -1,10 +1,10 @@
-import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentQError } from "../src/core/errors.ts";
 import { AgentQStore } from "../src/store/index.ts";
+import { Database } from "../src/store/sqlite.ts";
+import { afterEach, beforeEach, describe, expect, test } from "./support/test.ts";
 
 interface PragmaTextRow {
   journal_mode: string;
@@ -12,6 +12,10 @@ interface PragmaTextRow {
 
 interface PragmaNumberRow {
   foreign_keys: number;
+}
+
+interface BusyTimeoutRow {
+  timeout: number;
 }
 
 interface CountRow {
@@ -208,6 +212,18 @@ describe("AgentQStore", () => {
       await Bun.sleep(10);
     }
   }
+
+  test("configures SQLite busy timeouts explicitly", () => {
+    const database = new Database(":memory:", { timeout: 275 });
+    try {
+      expect(database.query<BusyTimeoutRow, []>("PRAGMA busy_timeout").get()?.timeout).toBe(275);
+    } finally {
+      database.close();
+    }
+    expect(() => new Database(":memory:", { timeout: -1 })).toThrow(
+      "SQLite timeout must be a non-negative safe integer",
+    );
+  });
 
   test("creates and migrates a WAL database idempotently", () => {
     const first = open();

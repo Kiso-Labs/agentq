@@ -6,7 +6,7 @@
 
 <p>
   <a href="https://github.com/Kiso-Labs/agentq/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Kiso-Labs/agentq/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="https://bun.sh"><img alt="Bun 1.3+" src="https://img.shields.io/badge/Bun-1.3%2B-14151a?logo=bun&logoColor=white"></a>
+  <a href="https://nodejs.org"><img alt="Node.js 24.15+" src="https://img.shields.io/badge/Node.js-24.15%2B-339933?logo=nodedotjs&logoColor=white"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2563eb"></a>
 </p>
 
@@ -51,10 +51,9 @@ This is AgentQ's workflow, not either provider's built-in plan mode. The planner
 
 ## Installation
 
-AgentQ requires [Bun](https://bun.sh/) 1.3 or newer. The package includes the official Codex and Claude Code CLI dependencies.
+AgentQ requires [Node.js](https://nodejs.org/) 24.15 or newer and works with the npm bundled with Node. The package includes the official Codex and Claude Code CLI dependencies.
 
 ```bash
-npm install -g bun
 npm install -g agentq
 ```
 
@@ -73,9 +72,9 @@ Install from source:
 ```bash
 git clone https://github.com/Kiso-Labs/agentq.git
 cd agentq
-bun install --frozen-lockfile
-bun run check
-bun link
+npm ci
+npm run check
+npm link
 ```
 
 ## Quick start
@@ -92,8 +91,8 @@ agentq queue create app \
   --concurrency 4 \
   --allow-path "src/**" \
   --allow-path "tests/**" \
-  --verify "bun test" \
-  --verify "bun run typecheck" \
+  --verify "npm test" \
+  --verify "npm run typecheck" \
   --land-strategy merge-train \
   --file-concurrency enforced
 ```
@@ -108,7 +107,7 @@ agentq task add \
   --invariant "Existing response schemas remain unchanged" \
   --expected-path "src/services/**" \
   --deny-path "src/api/**" \
-  --verify "bun test tests/services" \
+  --verify "npm test -- tests/services" \
   --accept "The regression test fails before the fix and passes after it"
 ```
 
@@ -166,8 +165,8 @@ agentq queue edit app \
   --implement-instructions "Follow the handoff and preserve compatibility" \
   --concurrency 4 \
   --max-attempts 3 \
-  --verify "bun test" \
-  --verify "bun run typecheck" \
+  --verify "npm test" \
+  --verify "npm run typecheck" \
   --allow-path "src/**" \
   --deny-path "src/generated/**" \
   --max-changed-files 20 \
@@ -232,7 +231,7 @@ agentq task edit task_456 \
   --allow-path "src/services/**" \
   --deny-path "src/api/**" \
   --max-changed-files 12 \
-  --verify "bun test test/services.test.ts" \
+  --verify "npm test -- test/services.test.ts" \
   --checkpoint after-plan \
   --base-drift replan \
   --land-strategy stack \
@@ -262,7 +261,7 @@ printf '%s' '{
   "expectedPaths": ["src/checkout/**", "tests/checkout/**"],
   "deniedPaths": ["src/api/**"],
   "maxChangedFiles": 10,
-  "verifyCommands": ["bun test tests/checkout.test.ts"],
+  "verifyCommands": ["npm test -- tests/checkout.test.ts"],
   "approvalCheckpoints": ["after-plan"],
   "baseDriftPolicy": "replan",
   "landStrategy": "stack",
@@ -613,12 +612,12 @@ See [docs/security.md](docs/security.md) for exact trust boundaries.
 ## Development
 
 ```bash
-bun install
-bun run typecheck
-bun run lint
-bun run test
-bun run build
-bun run check
+npm ci
+npm run typecheck
+npm run lint
+npm test
+npm run build
+npm run check
 ```
 
 ## License

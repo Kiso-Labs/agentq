@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { AgentQApp } from "../src/app.ts";
 import type { AgentQError } from "../src/core/errors.ts";
 import type { AgentQPaths } from "../src/core/types.ts";
@@ -9,6 +9,7 @@ import { runCommand } from "../src/git/command.ts";
 import { DelegatedTaskIntake } from "../src/intake/delegated-tasks.ts";
 import { spawnProcess } from "../src/process/index.ts";
 import { Supervisor } from "../src/supervisor/supervisor.ts";
+import { afterEach, describe, expect, test } from "./support/test.ts";
 
 const roots: string[] = [];
 const originalCodex = process.env.AGENTQ_CODEX_BIN;
@@ -63,7 +64,13 @@ async function setup() {
 }
 
 async function executable(path: string, source: string): Promise<void> {
-  await writeFile(path, `#!/usr/bin/env bun\n${source}`, "utf8");
+  const modulePath = `${path}.mjs`;
+  await writeFile(modulePath, source, "utf8");
+  await writeFile(
+    path,
+    `#!/usr/bin/env node\nimport(${JSON.stringify(pathToFileURL(modulePath).href)}).catch((error) => { console.error(error); process.exitCode = 1; });\n`,
+    "utf8",
+  );
   await chmod(path, 0o755);
 }
 
@@ -341,9 +348,9 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
       const provider = ${JSON.stringify(provider)};
       ${provider === "codex" ? codexPlanningGate() : claudePlanningGate()}
       await Bun.write(join(process.cwd(), \`done-\${provider}.txt\`), provider);
-      await Bun.write(join(process.env.AGENTQ_TEST_BARRIER!, provider), "ready");
+      await Bun.write(join(process.env.AGENTQ_TEST_BARRIER, provider), "ready");
       const deadline = Date.now() + 3000;
-      while ((await readdir(process.env.AGENTQ_TEST_BARRIER!)).length < 2) {
+      while ((await readdir(process.env.AGENTQ_TEST_BARRIER)).length < 2) {
         if (Date.now() > deadline) { console.error("parallel barrier timed out"); process.exit(7); }
         await Bun.sleep(20);
       }
@@ -379,6 +386,9 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     await new Supervisor(app, { maxConcurrency: 2, pollIntervalMs: 20 }).run({ once: true });
 
     const tasks = app.store.listTasks({ queue: queue.id });
+    if (tasks.some((item) => item.status !== "succeeded")) {
+      throw new Error(JSON.stringify(app.store.listRuns({ queue: queue.id }), null, 2));
+    }
     expect(tasks.map((item) => item.status)).toEqual(["succeeded", "succeeded"]);
     const runs = app.store.listRuns({ queue: queue.id });
     expect(new Set(runs.map((run) => run.worktreePath)).size).toBe(2);
@@ -1302,7 +1312,7 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
 
   test("verifies an orphan provider identity before recovering and killing its tree", async () => {
     const { root, repo, app } = await setup();
-    const orphanScript = join(root, "orphan-provider.ts");
+    const orphanScript = join(root, "orphan-provider.mts");
     const orphanPidFile = join(root, "orphan-provider.pid");
     await writeFile(
       orphanScript,
@@ -1423,7 +1433,7 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
       if (agentqPrompt.includes("Title: Parent task")) {
         const child = Bun.spawn([
           process.execPath,
-          process.env.AGENTQ_TEST_CLI!,
+          process.env.AGENTQ_TEST_CLI,
           "task", "add", "Delegated child",
           "--instructions", "Created by the parent agent",
           "--idempotency-key", "delegated-child",
@@ -1447,6 +1457,9 @@ describe.skipIf(process.platform === "win32")("Supervisor", () => {
     await new Supervisor(app, { pollIntervalMs: 20 }).run({ once: true });
 
     const tasks = app.store.listTasks({ queue: queue.id });
+    if (tasks.length !== 2) {
+      throw new Error(JSON.stringify(app.store.listRuns({ taskId: parent.id }), null, 2));
+    }
     expect(tasks).toHaveLength(2);
     expect(tasks.find((task) => task.title === "Delegated child")).toMatchObject({
       status: "succeeded",

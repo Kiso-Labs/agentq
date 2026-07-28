@@ -276,7 +276,7 @@ export function resolveBinary(options: ResolveBinaryOptions): string | undefined
     return firstExecutable(pathCandidates(override, environmentValue(env, "PATH")), env);
   }
 
-  const from = options.from ?? import.meta.dir;
+  const from = options.from ?? import.meta.dirname;
   return (
     firstExecutable(bundledCandidates(options.name, from), env) ??
     firstExecutable(pathCandidates(options.name, environmentValue(env, "PATH")), env)

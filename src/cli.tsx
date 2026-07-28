@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 
 import { resolve } from "node:path";
 import { Command, CommanderError, InvalidArgumentError } from "commander";
@@ -11,6 +11,7 @@ import {
 } from "./app.ts";
 import { AgentQError, errorMessage } from "./core/errors.ts";
 import { resolvePaths } from "./core/paths.ts";
+import { readStdin, sleep } from "./core/runtime.ts";
 import {
   type AddTaskInput,
   BASE_DRIFT_POLICIES,
@@ -822,7 +823,7 @@ task
           events.length === 0
         )
           break;
-        await Bun.sleep(500);
+        await sleep(500);
       } while (options.follow);
     });
   });
@@ -1007,7 +1008,7 @@ const taskJsonSchema = z.object({
 });
 
 async function readTaskJson(): Promise<z.infer<typeof taskJsonSchema>> {
-  const text = await Bun.stdin.text();
+  const text = await readStdin();
   if (!text.trim()) throw new AgentQError("No JSON was provided on stdin", "EMPTY_STDIN", 2);
   try {
     return taskJsonSchema.parse(JSON.parse(text));

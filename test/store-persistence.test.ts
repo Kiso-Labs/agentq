@@ -1,4 +1,3 @@
-import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +11,7 @@ import {
 import { AgentQStoreDeliveryPersistence } from "../src/delivery/store-persistence.ts";
 import { runCommand } from "../src/git/command.ts";
 import { AgentQStore } from "../src/store/store.ts";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "./support/test.ts";
 
 const roots: string[] = [];
 const stores: AgentQStore[] = [];

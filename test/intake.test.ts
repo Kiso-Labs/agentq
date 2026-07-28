@@ -1,4 +1,3 @@
-import { afterEach, describe, expect, test } from "bun:test";
 import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +5,7 @@ import { AgentQApp } from "../src/app.ts";
 import type { AgentQPaths } from "../src/core/types.ts";
 import { runCommand } from "../src/git/command.ts";
 import { DelegatedTaskIntake, submitDelegatedTask } from "../src/intake/delegated-tasks.ts";
+import { afterEach, describe, expect, test } from "./support/test.ts";
 
 const roots: string[] = [];
 

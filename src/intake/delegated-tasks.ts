@@ -15,6 +15,7 @@ import { dirname, join } from "node:path";
 import { z } from "zod";
 import type { AgentQApp } from "../app.ts";
 import { AgentQError, errorMessage } from "../core/errors.ts";
+import { sleep } from "../core/runtime.ts";
 import type { AddTaskInput, Provider, Task } from "../core/types.ts";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -469,7 +470,7 @@ export async function submitDelegatedTask(
         "INTAKE_TIMEOUT",
       );
     }
-    await Bun.sleep(100);
+    await sleep(100);
   }
 }
 

@@ -1,4 +1,3 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, render } from "ink-testing-library";
 import type {
   AddTaskInput,
@@ -14,6 +13,7 @@ import { activityEntries } from "../src/ui/activity.ts";
 import { AgentqApp } from "../src/ui/app.tsx";
 import { sanitizeTerminalText } from "../src/ui/sanitize.ts";
 import type { UiController, UiQueueDelivery, UiTaskPatch } from "../src/ui/types.ts";
+import { afterEach, describe, expect, mock, test } from "./support/test.ts";
 
 const NOW = "2026-07-21T12:00:00.000Z";
 

@@ -18,8 +18,8 @@ case-sensitive and must continue to match this public repository.
 
 ## Publish a version
 
-1. Update `version` in `package.json`. Refresh `bun.lock` only when dependency metadata changes.
-2. Run `bun run check` and inspect `npm pack --dry-run`.
+1. Update `version` in `package.json`. Refresh `package-lock.json` when dependency metadata changes.
+2. Run `npm run check` and inspect `npm pack --dry-run`.
 3. Merge the version change to `main`.
 4. Create a GitHub release whose tag is exactly `v<package version>`.
 

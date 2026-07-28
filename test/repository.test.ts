@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { AgentQError } from "../src/core/errors.ts";
 import { runCommand } from "../src/git/command.ts";
 import { findRepositoryContext, resolveRepositoryContext } from "../src/git/repository.ts";
+import { afterEach, describe, expect, test } from "./support/test.ts";
 
 const temporaryRoots: string[] = [];
 

@@ -1,8 +1,8 @@
-import { Database } from "bun:sqlite";
 import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { AgentQError, errorMessage } from "../core/errors.ts";
 import { isoNow, makeId } from "../core/paths.ts";
+import { sleepSync } from "../core/runtime.ts";
 import { normalizeScopePattern, scopePatternSetsMayOverlap } from "../core/scope-policy.ts";
 import {
   type AddTaskInput,
@@ -57,7 +57,7 @@ import {
   type VerificationResult,
 } from "../core/types.ts";
 import { migrate } from "./migrations.ts";
-import { selectAll, selectOne } from "./sqlite.ts";
+import { Database, selectAll, selectOne, sqliteBusy } from "./sqlite.ts";
 import type {
   AddTaskOptions,
   AdvanceRunToImplementationInput,
@@ -1399,19 +1399,15 @@ function statusValues<T extends string>(status: T | readonly T[] | undefined, fi
 }
 
 function constraint(error: unknown, message: string, code: string): never {
-  const raw = error as { code?: unknown };
-  if (typeof raw.code === "string" && raw.code.startsWith("SQLITE_CONSTRAINT")) {
+  const raw = error as { code?: unknown; errcode?: unknown; message?: unknown };
+  if (
+    raw.errcode === 19 ||
+    (typeof raw.code === "string" && raw.code.includes("SQLITE_CONSTRAINT")) ||
+    (typeof raw.message === "string" && /constraint failed/i.test(raw.message))
+  ) {
     throw new AgentQError(message, code);
   }
   throw error;
-}
-
-function sqliteBusy(error: unknown): boolean {
-  const code = (error as { code?: unknown }).code;
-  return (
-    (typeof code === "string" && code.startsWith("SQLITE_BUSY")) ||
-    /database is (?:locked|busy)/i.test(errorMessage(error))
-  );
 }
 
 function initializeDatabase(database: Database, busyTimeoutMs: number): void {
@@ -1430,7 +1426,7 @@ function initializeDatabase(database: Database, busyTimeoutMs: number): void {
     } catch (error) {
       const remainingMs = deadline - Date.now();
       if (!sqliteBusy(error) || remainingMs <= 0) throw error;
-      Bun.sleepSync(Math.min(retryDelayMs, remainingMs));
+      sleepSync(Math.min(retryDelayMs, remainingMs));
       retryDelayMs = Math.min(retryDelayMs * 2, 50);
     }
   }
@@ -2408,8 +2404,8 @@ export class AgentQStore {
         `,
         [id, id, id, id, id],
       ).changes;
-      // Bun reports cascaded run/event deletions in `changes`, so only zero
-      // means the guarded task row was not removed.
+      // Only zero means the guarded task row was not removed. Some SQLite
+      // drivers include cascaded rows in this count, so do not require exactly one.
       if (changed < 1) {
         throw new AgentQError(`Cannot delete active task ${id}`, "TASK_ACTIVE");
       }

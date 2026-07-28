@@ -1,4 +1,3 @@
-import { dlopen, ptr } from "bun:ffi";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, constants, mkdirSync, readFileSync } from "node:fs";
@@ -6,6 +5,7 @@ import { link, open, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Readable } from "node:stream";
+import { sleep } from "../core/runtime.ts";
 
 export interface SpawnProcessOptions {
   command: string;
@@ -56,16 +56,8 @@ interface IdentityLease {
   updatedAt: number;
 }
 
-interface WindowsJob {
-  close(): void;
-}
-
 const IDENTITY_HEARTBEAT_MS = 250;
 const IDENTITY_STARTUP_TIMEOUT_MS = process.platform === "win32" ? 10_000 : 3_000;
-const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9;
-const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x0000_2000;
-const PROCESS_TERMINATE = 0x0000_0001;
-const PROCESS_SET_QUOTA = 0x0000_0100;
 
 const LAUNCHER_SOURCE = String.raw`
 import { chmodSync, closeSync, ftruncateSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
@@ -209,6 +201,10 @@ function failBeforeLaunch(error) {
 try {
   writeIdentity();
   heartbeat = setInterval(() => {
+    if (process.platform === "win32" && process.ppid !== supervisorPid) {
+      failBeforeLaunch(new Error("Supervisor exited while the provider was running"));
+      return;
+    }
     try { writeIdentity(); } catch (error) { failBeforeLaunch(error); }
   }, ${IDENTITY_HEARTBEAT_MS});
 } catch (error) {
@@ -332,74 +328,6 @@ function errorWithCode(error: unknown): error is Error & { code?: string } {
   return error instanceof Error;
 }
 
-function createWindowsJob(pid: number): WindowsJob | undefined {
-  if (process.platform !== "win32") return undefined;
-  if (process.arch !== "x64" && process.arch !== "arm64") {
-    throw new Error(`Windows process jobs are unsupported on ${process.arch}`);
-  }
-
-  const kernel = dlopen("kernel32.dll", {
-    CreateJobObjectW: { args: ["ptr", "ptr"], returns: "ptr" },
-    SetInformationJobObject: { args: ["ptr", "u32", "ptr", "u32"], returns: "bool" },
-    OpenProcess: { args: ["u32", "bool", "u32"], returns: "ptr" },
-    AssignProcessToJobObject: { args: ["ptr", "ptr"], returns: "bool" },
-    CloseHandle: { args: ["ptr"], returns: "bool" },
-    GetLastError: { args: [], returns: "u32" },
-  } as const);
-  const api = kernel.symbols;
-  const failure = (operation: string) =>
-    new Error(`${operation} failed with Windows error ${api.GetLastError()}`);
-  const job = api.CreateJobObjectW(null, null);
-  if (!job) {
-    const error = failure("CreateJobObjectW");
-    kernel.close();
-    throw error;
-  }
-
-  let processHandle: ReturnType<typeof api.OpenProcess> = null;
-  try {
-    // JOBOBJECT_EXTENDED_LIMIT_INFORMATION is 144 bytes on 64-bit Windows.
-    // LimitFlags is the DWORD at offset 16 in BasicLimitInformation.
-    const limits = new Uint8Array(144);
-    new DataView(limits.buffer).setUint32(16, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, true);
-    if (
-      !api.SetInformationJobObject(
-        job,
-        JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-        ptr(limits),
-        limits.byteLength,
-      )
-    ) {
-      throw failure("SetInformationJobObject");
-    }
-
-    processHandle = api.OpenProcess(PROCESS_TERMINATE | PROCESS_SET_QUOTA, false, pid);
-    if (!processHandle) throw failure("OpenProcess");
-    if (!api.AssignProcessToJobObject(job, processHandle)) {
-      throw failure("AssignProcessToJobObject");
-    }
-    if (!api.CloseHandle(processHandle)) throw failure("CloseHandle(process)");
-    processHandle = null;
-  } catch (error) {
-    if (processHandle) api.CloseHandle(processHandle);
-    api.CloseHandle(job);
-    kernel.close();
-    throw error;
-  }
-
-  let closed = false;
-  return {
-    close() {
-      if (closed) return;
-      closed = true;
-      const succeeded = api.CloseHandle(job);
-      const error = succeeded ? undefined : failure("CloseHandle(job)");
-      kernel.close();
-      if (error) throw error;
-    },
-  };
-}
-
 export function processStartMarker(pid: number): string | undefined {
   if (!Number.isSafeInteger(pid) || pid <= 1) return undefined;
   try {
@@ -476,7 +404,7 @@ async function waitForLauncherIdentity(
     if (Date.now() >= deadline) {
       throw new Error(`Timed out establishing process identity for PID ${pid}`);
     }
-    await Bun.sleep(10);
+    await sleep(10);
   }
 }
 
@@ -526,7 +454,7 @@ async function readIdentityLease(path: string): Promise<IdentityLease | undefine
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const lease = await readIdentityLeaseOnce(path);
     if (lease) return lease;
-    if (attempt + 1 < attempts) await Bun.sleep(5);
+    if (attempt + 1 < attempts) await sleep(5);
   }
   return undefined;
 }
@@ -610,7 +538,7 @@ export async function inspectProcessIdentity(
   if (!actualStartMarker && !identity.startMarker.startsWith("lease:")) return "unverifiable";
   const first = await readIdentityLease(identity.path);
   if (!first || !leaseMatches(first, identity)) return "unverifiable";
-  await Bun.sleep(IDENTITY_HEARTBEAT_MS + 75);
+  await sleep(IDENTITY_HEARTBEAT_MS + 75);
   if (!isProcessAlive(identity.pid)) return "dead";
   const second = await readIdentityLease(identity.path);
   return second && leaseMatches(second, identity) && second.sequence > first.sequence
@@ -649,11 +577,11 @@ export async function terminateProcessTree(
   // termination signal can run before escalation.
   sendPosixGroupSignal(pid, "SIGCONT");
   const deadline = Date.now() + Math.max(0, graceMs);
-  while (isProcessGroupAlive(pid) && Date.now() < deadline) await Bun.sleep(50);
+  while (isProcessGroupAlive(pid) && Date.now() < deadline) await sleep(50);
   if (isProcessGroupAlive(pid)) {
     sendPosixGroupSignal(pid, "SIGKILL");
     const killDeadline = Date.now() + 2_000;
-    while (isProcessGroupAlive(pid) && Date.now() < killDeadline) await Bun.sleep(25);
+    while (isProcessGroupAlive(pid) && Date.now() < killDeadline) await sleep(25);
   }
   if (isProcessGroupAlive(pid)) {
     throw new Error(`Process group ${pid} survived SIGKILL`);
@@ -714,14 +642,6 @@ export function spawnProcess(options: SpawnProcessOptions): ManagedProcess {
     throw new Error(`Unable to start process: ${options.command}`);
   }
   const processId: number = pid;
-  let windowsJob: WindowsJob | undefined;
-  try {
-    windowsJob = gated ? createWindowsJob(processId) : undefined;
-  } catch (error) {
-    child.once("error", () => {});
-    child.kill("SIGKILL");
-    throw error;
-  }
 
   let settled = false;
   let leaderClosed = false;
@@ -737,13 +657,6 @@ export function spawnProcess(options: SpawnProcessOptions): ManagedProcess {
     child.once("close", (exitCode, signal) => {
       leaderClosed = true;
       void (async () => {
-        if (windowsJob) {
-          try {
-            windowsJob.close();
-          } catch (error) {
-            spawnError ??= error instanceof Error ? error : new Error(String(error));
-          }
-        }
         if (process.platform !== "win32" && isProcessGroupAlive(processId)) {
           try {
             await terminateProcessTree(processId, Math.min(options.cancelGraceMs ?? 250, 1_000));

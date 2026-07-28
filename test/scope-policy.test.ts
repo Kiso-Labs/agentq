@@ -1,4 +1,3 @@
-import { describe, expect, test } from "bun:test";
 import { AgentQError } from "../src/core/errors.ts";
 import {
   evaluateScopePolicy,
@@ -8,6 +7,7 @@ import {
   scopePatternSetsMayOverlap,
   scopePatternsMayOverlap,
 } from "../src/core/scope-policy.ts";
+import { describe, expect, test } from "./support/test.ts";
 
 describe("scope policy patterns", () => {
   test("accepts canonical repository-relative gitignore patterns", () => {
